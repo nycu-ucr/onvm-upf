@@ -1081,23 +1081,23 @@ Status UpfN4HandleSessionEstablishmentRequest(UpfSession *session, PfcpXact *pfc
     if (request->createBAR.presence) {
         // TODO
     }
-    if (request->createQER[0].presence) {
-        // TODO
-        for(int i=0;i<2;i++){
-            status = UpfN4HandleCreateQer(session, &request->createQER[i]);
-            UTLT_Assert(status == STATUS_OK, cause = PFCP_CAUSE_REQUEST_REJECTED,
-                    "Create QER error");
-        }
-        
-    } else {
-        // TODO: This is hardcode
-        if (session->upfSeid > 1) {
-            UpfSession *s1 = UpfSessionFindBySeid(1);  // Get first creates session
-            UpfQER *upfQer = UpfQERFindByID(s1, 1);    // Always search QERID=1
+	for(int i=0;i<4;i++){
+		if (request->createQER[i].presence) {
+			// TODO
+				status = UpfN4HandleCreateQer(session, &request->createQER[i]);
+				UTLT_Assert(status == STATUS_OK, cause = PFCP_CAUSE_REQUEST_REJECTED,
+						"Create QER error");
+			
+		} else {
+			// TODO: This is hardcode
+			if (session->upfSeid > 1) {
+				UpfSession *s1 = UpfSessionFindBySeid(1);  // Get first creates session
+				UpfQER *upfQer = UpfQERFindByID(s1, 1);    // Always search QERID=1
 
-            UTLT_Assert(UpfQERRegisterToSession(session, upfQer), return STATUS_ERROR, "UpfQERRegisterToSession failed, seid=%d", session->upfSeid);
-        }
-    }
+				UTLT_Assert(UpfQERRegisterToSession(session, upfQer), return STATUS_ERROR, "UpfQERRegisterToSession failed, seid=%d", session->upfSeid);
+			}
+		}
+	}
 
     // The order of PDF should be the lastest
     if (request->createPDR[0].presence) {
