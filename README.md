@@ -18,11 +18,11 @@ We've provided two scripts to install required dependencies, and configure your 
 From the `onvm-upf` folder, run the following two commands:
 
 ```text
-sudo ./scripts/install.sh
+./scripts/install.sh
 ```
 
 ```text
-sudo ./scripts/setup_runtime.sh
+./scripts/setup_runtime.sh
 ```
 
 > If you are using `Ubuntu 20.04`, you will need to perform [additional setup](./MANUAL_INSTALL.md#additional-setups-on-ubuntu-2004).
@@ -32,6 +32,7 @@ sudo ./scripts/setup_runtime.sh
 We use the [Meson][meson] build system to compile all components, including dpdk. From the `onvm-upf` parent folder run the following to setup build:
 
 ```text
+source ~/.bashrc
 ./scripts/build.sh
 ```
 
@@ -44,6 +45,11 @@ ldconfig
 ```
 
 ### Running onvm_mgr
+
+Bind NIC to `igb_uio` (replace `<pci_id>` | `<eth_if_id>` with the actual PCI address | eth interface ID)
+```bash
+sudo python <dpdk>/usertools/dpdk-devbind.py --bind=igb_uio <pci_id> | <eth_if_id>
+```
 
 You can use our provided [startup script](scripts/start.sh) to launch onvm_mgr. This scripts assumes the `onvm-upf` folder is your working directory.
 

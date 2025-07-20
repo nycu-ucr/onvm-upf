@@ -53,7 +53,7 @@ for CPU_PATH in /sys/devices/system/cpu/cpu[0-9]*; do
         CPU="$(echo "$CPU_PATH" | tr -cd "0-9")"
         echo "$CPUS_TO_SKIP" | grep " $CPU " > /dev/null
         if [ $? -ne 0 ]; then
-            echo 0 > "$CPU_PATH"/online
+            sudo sh -c "echo 0 > "$CPU_PATH"/online"
         fi
 done
 
