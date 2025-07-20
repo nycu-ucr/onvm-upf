@@ -69,15 +69,15 @@ onvm_pkt_process_rx_batch(struct queue_mgr *rx_mgr, struct rte_mbuf *pkts[], uin
                 return;
 
         for (i = 0; i < rx_count; i++) {
-                meta = (struct onvm_pkt_meta *)&(((struct rte_mbuf *)pkts[i])->udata64);
+                meta = onvm_get_pkt_meta(pkts[i], onvm_config->dynfield_offset);
                 meta->src = 0;
                 meta->chain_index = 0;
 #ifdef FLOW_LOOKUP
                 ret = onvm_flow_dir_get_pkt(pkts[i], &flow_entry);
                 if (ret >= 0) {
                         sc = flow_entry->sc;
-                        meta->action = onvm_sc_next_action(sc, pkts[i]);
-                        meta->destination = onvm_sc_next_destination(sc, pkts[i]);
+                        meta->action = onvm_sc_next_action(sc, pkts[i], onvm_config->dynfield_offset);
+                        meta->destination = onvm_sc_next_destination(sc, pkts[i], onvm_config->dynfield_offset);
                 } else {
 #endif
                         eth_hdr = rte_pktmbuf_mtod(pkts[i], struct rte_ether_hdr *);
@@ -87,9 +87,9 @@ onvm_pkt_process_rx_batch(struct queue_mgr *rx_mgr, struct rte_mbuf *pkts[], uin
                                 meta->action = ONVM_NF_ACTION_TONF;
                                 meta->destination = ARP_NF_ID;
                         } else {
-                                meta->action = onvm_sc_next_action(default_chain, pkts[i]);
-                                meta->destination = onvm_sc_next_destination(default_chain, pkts[i]);
-			}
+                                meta->action = onvm_sc_next_action(default_chain, pkts[i], onvm_config->dynfield_offset);
+                                meta->destination = onvm_sc_next_destination(default_chain, pkts[i], onvm_config->dynfield_offset);
+                        }
 #ifdef FLOW_LOOKUP
                 }
 #endif

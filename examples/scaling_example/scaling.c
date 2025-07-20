@@ -150,7 +150,7 @@ parse_app_args(int argc, char *argv[], const char *progname) {
         }
 
         if (!dst_flag) {
-                RTE_LOG(INFO, APP, "Destination id not passed, running default example funcitonality.\n");
+                RTE_LOG(INFO, APP, "Destination id not passed, running default example functionality.\n");
                 return -1;
         }
 
@@ -184,15 +184,15 @@ nf_setup(__attribute__((unused)) struct onvm_nf_local_ctx *nf_local_ctx) {
                 ehdr = (struct rte_ether_hdr *)rte_pktmbuf_append(pkt, packet_size);
 
                 /* Using manager mac addr for source*/
-                if (onvm_get_macaddr(0, &ehdr->s_addr) == -1) {
-                        onvm_get_fake_macaddr(&ehdr->s_addr);
+                if (onvm_get_macaddr(0, &ehdr->src_addr) == -1) {
+                        onvm_get_fake_macaddr(&ehdr->src_addr);
                 }
                 for (j = 0; j < RTE_ETHER_ADDR_LEN; ++j) {
-                        ehdr->d_addr.addr_bytes[j] = d_addr_bytes[j];
+                        ehdr->dst_addr.addr_bytes[j] = d_addr_bytes[j];
                 }
                 ehdr->ether_type = LOCAL_EXPERIMENTAL_ETHER;
 
-                pmeta = onvm_get_pkt_meta(pkt);
+                pmeta = onvm_get_pkt_meta(pkt, nf_local_ctx->nf->dynfield_offset);
                 pmeta->destination = destination;
                 pmeta->action = ONVM_NF_ACTION_TONF;
                 pkt->hash.rss = i;
@@ -229,7 +229,7 @@ packet_handler_with_scaling(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta,
         while (spawned_nfs < num_children) {
                 struct onvm_nf_scale_info *scale_info = onvm_nflib_get_empty_scaling_config(nf_local_ctx->nf);
                 /* Sets service id of child */
-                scale_info->nf_init_cfg->service_id = destination;
+                scale_info->nf_init_cfg->service_id = nf_local_ctx->nf->service_id;
                 scale_info->function_table = onvm_nflib_init_nf_function_table();
                 /* Run the setup function to generate packets */
                 scale_info->function_table->setup = &nf_setup;
@@ -367,12 +367,12 @@ thread_main_loop(struct onvm_nf_local_ctx *nf_local_ctx) {
                 }
                 /* Process all the packets */
                 for (i = 0; i < nb_pkts; i++) {
-                        meta = onvm_get_pkt_meta((struct rte_mbuf *)pkts[i]);
+                        meta = onvm_get_pkt_meta((struct rte_mbuf *)pkts[i], nf->dynfield_offset);
                         packet_handler_fwd((struct rte_mbuf *)pkts[i], meta, nf_local_ctx);
                         pktsTX[tx_batch_size++] = pkts[i];
                 }
                 /* Process all packet actions */
-                onvm_pkt_process_tx_batch(nf->nf_tx_mgr, pktsTX, tx_batch_size, nf);
+                onvm_pkt_process_tx_batch(nf->nf_tx_mgr, pktsTX, nf->dynfield_offset, tx_batch_size, nf);
                 if (tx_batch_size < PACKET_READ_SIZE) {
                         onvm_pkt_flush_all_nfs(nf->nf_tx_mgr, nf);
                 }

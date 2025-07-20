@@ -3,9 +3,9 @@ Pktgen Installation
 
 #### Welcome to the installation guide for [Pktgen](https://pktgen-dpdk.readthedocs.io/en/latest/getting_started.html). Pktgen is a high performance traffic generator app built on [DPDK](http://dpdk.org/).
 
-This guide assumes that you already have openNetVM installed on your machine. If you do not, please follow the [ONVM installation guide](https://github.com/sdnfv/openNetVM/blob/master/docs/Install.md). 
+This guide assumes that you already have DPDK installed on your machine. If you do not, please follow the [ONVM installation guide](https://github.com/sdnfv/openNetVM/blob/master/docs/Install.md). 
 
-For further information regarding Pktgen configuration or set up, please refer to the [ONVM Pktgen Wiki page](https://github.com/sdnfv/openNetVM/wiki/Packet-generation-using-Pktgen).
+For further information regarding Pktgen configuration or set up, please refer to the [Pktgen Wiki page](https://pktgen.github.io/Pktgen-DPDK/).
 
 ----------
 
@@ -65,59 +65,113 @@ Please refer to the troubleshooting section of the ONVM Install Guide for instru
 pcap: `sudo apt-get install libpcap-dev`   
 readline: `sudo apt-get install libreadline-dev` 
 
-#### Install Lua
+#### Install Lua (Optional)
 
 To install the latest version, you will need to download, extract and build the package from [Lua](https://www.lua.org/download.html).   
 From your root directory:
 ```
 cd ~/
-curl -R -O http://www.lua.org/ftp/lua-5.3.5.tar.gz             
-tar -zxf lua-5.3.5.tar.gz
-cd lua-5.3.5
+curl -R -O https://www.lua.org/ftp/lua-5.4.8.tar.gz
+tar -zxf lua-5.4.8.tar.gz
+cd lua-5.4.8
 make linux test
 sudo make install
 ```
 To make sure the installation was successful, run `lua` in the command line. The output should be similar to 
 ```
 $ lua
-Lua 5.3.5, Copyright (C)1994-2017 Lua.org, PUC Rico
+Lua 5.4.8  Copyright (C) 1994-2025 Lua.org, PUC-Rio
 >
 ```
-***Note:*** *Lua 5.3.5 may not be the latest version. Please visit [Lua](https://www.lua.org/download.html) for more information.*
+***Note:*** *Lua 5.4.8 may not be the latest version. Please visit [Lua](https://www.lua.org/download.html) for more information.*
 
 2.2 Build Pktgen Application
 ------------- 
 
 Enter working directory, and compile the application
 
-`$cd tools/Pktgen/pktgen-dpdk/`
+```bash
+cd tools/Pktgen/pktgen-dpdk/
 
-`$make`   
-
-***Note:*** *Compilation of Pktgen may display errors regarding installation location of Lua. Please ignore.*
-
-Test pktgen by running:
-
-`$sudo ./app/x86_64-native-linuxapp-gcc/pktgen -c 3 -n 1`
-
-Updating configuration for pktgen, three servers are set up for observing the traffic flow: web client ----> port 0 - ONVM - port 1----> web server
-
+meson setup build
+ninja -C build
+```
 
 2.3 Configure Pktgen for openNetVM
 ------------- 
-1. Run the ONVM manager and retrieve the MAC address being used.
+1. Create your own pktgen-dpdk config file.
 
-Pktgen script files are located in `openNetVM-Scripts`, found in the `tools/Pktgen` directory.   
+Sample Pktgen config files are located in `cfg`, found in the `tools/Pktgen/pktgen-dpdk/` directory.
 
-2. In the `pktgen-config.lua` file, modify the MAC address to match that being used by the ONVM manager. Optionally, you may want to modify the src/dest ip as well. 
+2. In the created `*.cfg` file, modify the `devices` PCIe address in `setup` section to match that being used by the NIC ports. Optionally, you may want to modify the `uio` as well. You may also configure `cores`, `nrank`, and `map` based on your server hardware.
 
-Further guidance on Pktgen configuration for ONVM can be found in [ONVM's Pktgen Wiki page](https://github.com/sdnfv/openNetVM/wiki/Packet-generation-using-Pktgen). 
+Further guidance on Pktgen configuration can be found in [Pktgen's Wiki page](https://pktgen.github.io/Pktgen-DPDK/).
+
+```python
+description = 'A Pktgen default simple configuration'
+
+# Setup configuration
+setup = {
+    'exec': (
+        'sudo', '-E'
+        ),
+
+    'devices': (
+            '06:00.0', '06:00.1',
+            ),
+    # UIO module type, igb_uio, vfio-pci or uio_pci_generic
+    'uio': 'igb_uio'
+    }
+
+# Run command and options
+run = {
+    'exec': (
+        'sudo', '-E'
+        ),
+
+    # Application name and use app_path to help locate the app
+    'app_name': 'pktgen',
+
+    # using (sdk) or (target) for specific variables
+    # add (app_name) of the application
+    # Each path is tested for the application
+    'app_path': (
+        './usr/local/bin/%(app_name)s',
+        '/usr/local/bin/%(app_name)s'
+        ),
+
+        'cores': '0-2',
+        'nrank': '1',
+        'proc': 'auto',
+        'log': '7',
+        'prefix': 'pg',
+
+        'blocklist': (
+                #'81:00.0', '83:00.0',
+                '85:00.0', '85:00.1', '85:00.2', '85:00.3',
+                ),
+
+        'opts': (
+                '-v',
+                '-T',
+                '-P',
+                ),
+        'map': (
+                '[1].0',
+                '[2].1',
+                ),
+
+        'theme': 'themes/black-yellow.theme'
+        }
+```
 
 2.4 Run pktgen
 ------------- 
 
-```sh
-./openNetVM-Scripts/run-pktgen.sh 1
+```bash
+cd tools/Pktgen/pktgen-dpdk/
+
+./tools/run.py <config-file>
 ```   
 
 If you got your result as below, then you are all set
@@ -220,7 +274,7 @@ Src MAC Address :  90:e2:ba:5a:f7:90  90:e2:ba:5a:f7:91
 
 Run `start all` to start sending packets.  
 
-Please use `pktgen> quit` for existing. 
+Please use `pktgen> exit` for existing. 
 
 Licensing
 -------------

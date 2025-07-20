@@ -59,6 +59,7 @@
 #include <rte_fbk_hash.h>
 #include <rte_malloc.h>
 #include <rte_memcpy.h>
+#include <rte_mbuf_dyn.h>
 #ifdef RTE_LIBRTE_PDUMP
 #include <rte_pdump.h>
 #endif
@@ -79,8 +80,6 @@
 
 #define MBUF_CACHE_SIZE 512
 #define MBUF_OVERHEAD (sizeof(struct rte_mbuf) + RTE_PKTMBUF_HEADROOM)
-#define RX_MBUF_DATA_SIZE 4096
-#define MBUF_SIZE (RX_MBUF_DATA_SIZE + MBUF_OVERHEAD)
 
 #define NF_INFO_SIZE sizeof(struct onvm_nf_init_cfg)
 
@@ -126,6 +125,7 @@ extern uint8_t global_verbosity_level;
 /* Custom flags for onvm */
 extern struct onvm_configuration *onvm_config;
 extern uint8_t ONVM_NF_SHARE_CORES;
+extern uint8_t ONVM_USE_JUMBO_FRAMES;
 
 /* For handling shared core logic */
 extern struct nf_wakeup_info *nf_wakeup_infos;

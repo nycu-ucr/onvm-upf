@@ -125,6 +125,13 @@ static FILE *json_events_out;
 /* Holds current timestamp, might want to make this not global */
 char buffer[20];
 
+cJSON* onvm_json_root;
+cJSON* onvm_json_port_stats_obj;
+cJSON* onvm_json_nf_stats_obj;
+cJSON* onvm_json_port_stats[RTE_MAX_ETHPORTS];
+cJSON* onvm_json_nf_stats[MAX_NFS];
+cJSON* onvm_json_events_arr;
+
 /****************************Interfaces***************************************/
 
 void
@@ -455,10 +462,21 @@ onvm_stats_display_nfs(unsigned difftime, uint8_t verbosity_level) {
                 const uint64_t act_next = nfs[i].stats.act_next;
                 const uint64_t act_buffer = nfs[i].stats.tx_buffer;
                 const uint64_t act_returned = nfs[i].stats.tx_returned;
+
+                /* On onvm_stats_clear_nf, subtraction causes underflow */
+                if (unlikely(rx == 0))
+                        nf_rx_last[i] = 0;
                 const uint64_t rx_pps = (rx - nf_rx_last[i]) / difftime;
+                if (unlikely(tx == 0))
+                        nf_tx_last[i] = 0;
                 const uint64_t tx_pps = (tx - nf_tx_last[i]) / difftime;
-                const uint64_t tx_drop_rate = (tx_drop - nf_tx_drop_last[i]) / difftime;
+                if (unlikely(rx_drop == 0))
+                        nf_rx_drop_last[i] = 0;
                 const uint64_t rx_drop_rate = (rx_drop - nf_rx_drop_last[i]) / difftime;
+                if (unlikely(tx_drop == 0))
+                        nf_tx_drop_last[i] = 0;
+                const uint64_t tx_drop_rate = (tx_drop - nf_tx_drop_last[i]) / difftime;
+
                 const uint64_t num_wakeups = nf_wakeup_infos[i].num_wakeups;
                 const uint64_t prev_num_wakeups = nf_wakeup_infos[i].prev_num_wakeups;
                 const uint64_t wakeup_rate = (num_wakeups - prev_num_wakeups) / difftime;
@@ -571,7 +589,6 @@ onvm_stats_display_nfs(unsigned difftime, uint8_t verbosity_level) {
                 fprintf(stats_out, "-----------------\n");
                 onvm_stats_display_client_wakeup_thread_context(difftime);
         }
-
 }
 
 /***************************Helper functions**********************************/
