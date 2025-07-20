@@ -1,43 +1,20 @@
 #! /bin/bash
 
-#                        openNetVM
-#                https://sdnfv.github.io
+# Copyright 2025 University of California, Riverside and National Yang Ming Chiao Tung University
 #
-# OpenNetVM is distributed under the following BSD LICENSE:
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
 #
-# Copyright(c)
-#       2015-2024 George Washington University
-#       2015-2017 University of California Riverside
-# All rights reserved.
+#      http://www.apache.org/licenses/LICENSE-2.0
 #
-# Redistribution and use in source and binary forms, with or without
-# modification, are permitted provided that the following conditions
-# are met:
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 #
-# * Redistributions of source code must retain the above copyright
-#   notice, this list of conditions and the following disclaimer.
-# * Redistributions in binary form must reproduce the above copyright
-#   notice, this list of conditions and the following disclaimer in
-#   the documentation and/or other materials provided with the
-#   distribution.
-# * The name of the author may not be used to endorse or promote
-#   products derived from this software without specific prior
-#   written permission.
-#
-# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
-# "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
-# LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
-# A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
-# OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
-# SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
-# LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
-# DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
-# THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
-# (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
-# OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
-#
-# A script to install required linux packages and perform initial developer 
-# environment setup actions.
+# SPDX-License-Identifier: Apache-2.0
 
 packages=("build-essential" \
           "python3" \
@@ -49,7 +26,9 @@ packages=("build-essential" \
           "pkg-config" \
           "libnuma-dev" \
           "libpcap-dev" \
-          "libsystemd-dev")
+          "libyaml-dev" \
+          "libsystemd-dev" \
+          "libbsd-dev")
 install_packages=true
 
 pypackages=("meson" \
@@ -122,3 +101,21 @@ meson build
 ninja -C build
 ninja -C build install
 sudo ldconfig
+
+# (6)
+# Install Golang 1.21 (the following assume that your shell is bash)
+sudo rm -rf /usr/local/go
+sudo rm -rf ~/go
+
+mkdir -p ~/go/{bin,pkg,src}
+
+wget https://dl.google.com/go/go1.21.8.linux-amd64.tar.gz
+sudo tar -C /usr/local -zxf go1.21.8.linux-amd64.tar.gz
+
+echo 'export GOPATH=$HOME/go' >> ~/.bashrc
+echo 'export GOROOT=/usr/local/go' >> ~/.bashrc
+echo 'export PATH=$PATH:$GOPATH/bin:$GOROOT/bin' >> ~/.bashrc
+echo 'export GO111MODULE=auto' >> ~/.bashrc
+source ~/.bashrc
+
+rm go1.21.8.linux-amd64.tar.gz
