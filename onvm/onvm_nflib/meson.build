@@ -19,8 +19,8 @@ libonvm_deps = [
 ]
 
 libonvm = library(
-    'libonvm', 
-    sources, 
+    'onvm',
+    sources,
     include_directories : libonvm_includes,
     dependencies : libonvm_deps,
     pic: true,

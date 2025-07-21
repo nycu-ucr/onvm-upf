@@ -3,7 +3,7 @@ sources = files('cJSON.c')
 libonvmhelper_includes = include_directories('.')
 
 libonvmhelper = library(
-    'libonvmhelper', 
+    'onvmhelper',
     sources,
     include_directories : libonvmhelper_includes,
     install: true,

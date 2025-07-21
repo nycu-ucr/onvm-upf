@@ -1,4 +1,4 @@
-project('openNetVM', 'c')
+project('openNetVM', 'c', default_options: ['default_library=both'])
 
 add_global_arguments('-msse4', language : 'c')
 
