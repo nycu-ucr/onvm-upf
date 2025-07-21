@@ -109,11 +109,15 @@ parseIpv4Address(const char *addrStr) {
 }
 
 void
-parseMAC() {
+parseMAC(const char *config_path) {
     FILE *file;
+    file = fopen(config_path, "r");
+    if (file == NULL) {
+        fprintf(stderr, "Error: failed to open file %s\n", config_path);
+        exit(EXIT_FAILURE);
+    }
 
     char line[256];
-    file = fopen("upf_u.txt", "r");
     int linenum = 0;
     int DNvalues[6];
     int ANvalues[6];
@@ -998,7 +1002,12 @@ msg_handler(void *msg_data, struct onvm_nf_local_ctx *nf_local_ctx) {
 //        meta = ONVM_NF_ACTION_OUT;
 //    }
 //#endif
+
     struct onvm_configuration *onvm_config = onvm_nflib_get_onvm_config();
+    if (onvm_config == NULL) {
+        fprintf(stderr, "Error: onvm_nflib_get_onvm_config() returned NULL\n");
+        exit(EXIT_FAILURE);
+    }
     onvm_pkt_process_tx_batch(nf->nf_tx_mgr, buffer, onvm_config->dynfield_offset, buffer_length, nf);
     onvm_pkt_flush_all_nfs(nf->nf_tx_mgr, nf);
     UTLT_Debug("Sending out %u packets\n", buffer_length);
@@ -1070,7 +1079,12 @@ main(int argc, char *argv[]) {
         rte_exit(EXIT_FAILURE, "Cannot get MAC address: err=%d, port=%u\n", ret, 1);
 
     // Parse DN & AN MAC address from upf_u.txt
-    parseMAC();
+    const char *config_path = "upf_u.txt";  // default
+    if (argc > arg_offset + 1) {
+        config_path = argv[arg_offset + 1];
+    }
+    printf("Using config path: %s\n", config_path);  // print the path
+    parseMAC(config_path);
 
     // 8c:dc:d4:ac:6c:7d
     dn_eth.addr_bytes[0] = DnMac[0];
