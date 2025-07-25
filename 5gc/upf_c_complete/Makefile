@@ -74,6 +74,40 @@ LDFLAGS += $(ONVM_HOME)/onvm/utlt/$(RTE_TARGET)/lib/libutlt.a -lrt
 LDFLAGS += $(ONVM_HOME)/onvm/logger/liblogger.a -lm
 LDFLAGS += $(ONVM_HOME)/onvm/updk/$(RTE_TARGET)/lib/libupdk.a -lyaml
 
+
+## Changes for PDR Lookup... Will optimize later
+
+CLS_BACKEND ?= PS
+
+ifeq ($(CLS_BACKEND),PS)
+  CFLAGS   += -DCLS_BACKEND_PS
+else ifeq ($(CLS_BACKEND),TSS)
+  CFLAGS   += -DCLS_BACKEND_TSS
+else ifeq ($(CLS_BACKEND),PTSS)
+  CFLAGS   += -DCLS_BACKEND_PTSS
+else
+  $(error Unknown CLS_BACKEND=$(CLS_BACKEND))
+endif
+
+# adapter .cpp
+SRCS-y  += $(SRCDIR)/../classifiers/upf_cls_adapter.cpp
+
+# headers for adapter + back-end libraries
+CFLAGS  += -I$(SRCDIR)/../classifiers \
+           -I$(SRCDIR)/../classifiers/PartitionSort \
+           -I$(SRCDIR)/../classifiers/TupleSpaceSearch \
+           -I$(SRCDIR)/../classifiers/PriorityTupleSpaceSearch
+
+# C++17 for the adapter
+CXXFLAGS += -std=c++17
+CFLAGS   += -std=c++17
+
+# link libstdc++ because rte.extapp links with $(CC) (C compiler)
+LDFLAGS  += -lstdc++
+
+### Changes for PDR Lookup ends
+
+
 # workaround for a gcc bug with noreturn attribute
 # http://gcc.gnu.org/bugzilla/show_bug.cgi?id=12603
 ifeq ($(CONFIG_RTE_TOOLCHAIN_GCC),y)

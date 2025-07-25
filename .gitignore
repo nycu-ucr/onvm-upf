@@ -52,3 +52,9 @@ _preinstall
 **cscope.files
 
 **.csv
+
+.idea/
+
+**/.DS_Store
+
+.vscode/
