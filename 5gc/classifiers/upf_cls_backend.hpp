@@ -1,5 +1,5 @@
 #pragma once
-#include "classifier_wrapper.h"          /* cls_create(), insert/delete …   */
+#include "classifier_wrapper.h"
 
 // compile-time back-end selection
 #if   defined(CLS_BACKEND_TSS)
@@ -13,6 +13,6 @@ constexpr cls_backend_t kBackend = CLS_BACKEND_PS;
 // singleton handle ==== thread-safe
 inline cls_handle_t *cls_global()
 {
-    static cls_handle_t *handle = cls_create(kBackend);   /* thread-safe C++11  */
+    static cls_handle_t *handle = cls_create(kBackend);
     return handle;
 }

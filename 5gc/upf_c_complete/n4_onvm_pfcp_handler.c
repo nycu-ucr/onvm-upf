@@ -20,6 +20,8 @@
 #include "updk/rule_far.h"
 #include "updk/rule_qer.h"
 
+#include "../classifiers/upf_cls_adapter.h"
+
 /*
  * Note: When apply a IE from PDR or FAR, you should check all
  * "_Convert*TlvToRule" if they need to be modified.
@@ -260,9 +262,19 @@ Status UpfN4HandleCreatePdr(UpfSession *session, CreatePDR *createPdr) {
 
     // Register PDR to Session
     UTLT_Assert(UpfPDRRegisterToSession(session, upfPdr),
+                rte_free(upfPdr);
                 return STATUS_ERROR,
                 "UpfPDRRegisterToSession failed");
+
+    if (upf_cls_add_pdr(upfPdr) != 0) {
+        UTLT_Error("Classifier insert failed for PDRId=%u", upfPdr->pdrId);
+        UpfPDRDeregisterToSessionByID(session, upfPdr->pdrId);
+        rte_free(upfPdr); 
+        return STATUS_ERROR;
+    }
+
     return STATUS_OK;
+
 }
 
 Status _ConvertCreateFARTlvToRule(UpfFAR *upfFar, CreateFAR *createFar) {
@@ -1006,11 +1018,24 @@ Status UpfN4HandleRemovePdr(UpfSession *session, uint16_t nPDRID) {
 
     //TODO(vivek): remove buffered packets
 
-    // Deregister PDR to Session
-    UTLT_Assert(UpfPDRDeregisterToSessionByID(session, pdrID) == STATUS_OK,
-                return STATUS_ERROR,
-                "UpfPDRDeregisterToSessionBy failed");
 
+    // Deregister PDR to Session
+    /* UTLT_Assert(UpfPDRDeregisterToSessionByID(session, pdrID) == STATUS_OK,
+                return STATUS_ERROR,
+                "UpfPDRDeregisterToSessionBy failed"); */
+
+    UpfDeregResult d = UpfPDRDeregisterToSessionByIDEx(session, pdrID);
+    UTLT_Assert(d.status == STATUS_OK,
+                return STATUS_ERROR,
+                "UpfPDRDeregisterToSessionByIDEx failed for PDR[%u]", pdrID);
+
+    UpfPDR *upfPdr = d.pdr;   /* pointer to the removed PDR */
+    
+    if (upf_cls_del_pdr(upfPdr) != 0) {
+        UTLT_Warn("Classifier delete failed (not found) for PDRId=%u", pdrID);      
+    }
+
+    rte_free(upfPdr);
     return STATUS_OK;
 }
 

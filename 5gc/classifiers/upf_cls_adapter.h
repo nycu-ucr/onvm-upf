@@ -16,6 +16,11 @@ int upf_cls_add_pdr(const UPDK_PDR *pdr);
  * Returns 0 on success, -1 if not found.                                   */
 int upf_cls_del_pdr(const UPDK_PDR *pdr);
 
+
+/* Fast-path classifier */
+const struct UPDK_PDR *upf_cls_lookup(const ps_packet_t *pkt);
+
+
 #ifdef __cplusplus
 }
 #endif

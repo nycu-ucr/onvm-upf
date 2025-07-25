@@ -120,6 +120,37 @@ Status UpfPDRDeregisterToSessionByID(UpfSession *session, uint16_t id) {
     return STATUS_OK;
 }
 
+
+UpfDeregResult UpfPDRDeregisterToSessionByIDEx(UpfSession *session, uint16_t id) {
+    
+    UpfDeregResult  res = { 
+        .status = STATUS_ERROR,
+        .pdr = NULL
+    };
+
+    UTLT_Assert(session, return res, "session not found");
+    UTLT_Assert(session->pdr_list, return res, "PDR list not initialized");
+
+    list_node_t *node = NULL;
+    list_iterator_t *it = list_iterator_new(session->pdr_list, LIST_HEAD);
+    
+    while ((node = list_iterator_next(it))) {
+        UpfPDR *p = (UpfPDR *)node->val;
+        if (p->pdrId == id) {
+            res.pdr = p;      // stash it
+            break;
+        }
+    }
+    list_iterator_destroy(it);
+
+    UTLT_Assert(node, return res, "PDR ID[%u] does NOT exist", id);
+    list_remove(session->pdr_list, node);
+    res.status = STATUS_OK;
+    return res;
+}
+
+
+
 Status UpfFARDeregisterToSessionByID(UpfSession *session, uint16_t id) {
     UTLT_Assert(session, return STATUS_ERROR, "session not found error");
     UTLT_Assert(session->far_list, return STATUS_ERROR, "FAR list not initialized");

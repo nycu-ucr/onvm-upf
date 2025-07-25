@@ -142,6 +142,13 @@ typedef struct _UpfSession {
     bool srr_flag;
 } UpfSession;
 
+typedef struct {
+    Status  status;
+    UpfPDR  *pdr;
+} UpfDeregResult;
+
+
+
 UpfContext *Self();
 Status UpfContextInit();
 Status UpfContextTerminate();
@@ -180,6 +187,8 @@ UpfQER *UpfQERFindByID(UpfSession *session, uint16_t id);//implement//V
 Status UpfPDRDeregisterToSessionByID(UpfSession *session, uint16_t id);
 Status UpfFARDeregisterToSessionByID(UpfSession *session, uint16_t id);
 Status UpfQERDeregisterToSessionByID(UpfSession *session, uint16_t id);//implement//V
+
+UpfDeregResult UpfPDRDeregisterToSessionByIDEx(UpfSession *session, uint16_t id)
 
 #ifdef __cplusplus
 }

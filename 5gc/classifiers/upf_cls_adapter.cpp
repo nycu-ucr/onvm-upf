@@ -65,25 +65,27 @@ static pdr_t updk_pdr_to_cls_rule(const UPDK_PDR *in)
     return out;
 }
 
-/* ──────────────────────────────────────────────────────────────────── */
-/* Public C helpers                                                    */
-/* ──────────────────────────────────────────────────────────────────── */
+
 extern "C"
 int upf_cls_add_pdr(const UPDK_PDR *pdr)
 {
     if (!pdr) return -1;
-
     pdr_t rule = updk_pdr_to_cls_rule(pdr);
-    rule.descriptor = reinterpret_cast<uintptr_t>(pdr);      /* key = pointer */
+    rule.descriptor = reinterpret_cast<uintptr_t>(pdr);
 
-    return cls_insert_rule_return_descriptor(cls_global(), &rule,
-                                             rule.descriptor);
+    return cls_insert_rule_return_descriptor(
+        cls_global(),
+        &rule,
+        rule.descriptor
+    );
 }
 
 extern "C"
 int upf_cls_del_pdr(const UPDK_PDR *pdr)
 {
     if (!pdr) return -1;
-    return cls_delete_rule_by_descriptor(cls_global(),
-                                         reinterpret_cast<uintptr_t>(pdr));
+    return cls_delete_rule_by_descriptor(
+        cls_global(),
+        reinterpret_cast<uintptr_t>(pdr)
+    );
 }

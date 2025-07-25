@@ -9,7 +9,7 @@
 extern "C" {
 #endif
 
-/* ========= constants & helpers =================================== */
+
 #define PDI_MAX_FLD  12        /* 0…11 dimensions in the Rule / Packet */
 
 #define ANY32 0xFFFFFFFFu      /* wildcard sentinels */
@@ -55,12 +55,12 @@ typedef struct {
 
 typedef struct {
     uint16_t  pdr_id;
-    uint32_t  precedence;          /*  lower → higher priority */
+    uint32_t  precedence;          
     pdi_t     pdi;
-    uintptr_t descriptor;          /* opaque handle (TEID, etc.) */
+    uintptr_t descriptor;
 } pdr_t;
 
-typedef struct {                   /* packet presented to classifier */
+typedef struct {
     uint32_t ue_ip;
     uint32_t src_ip;
     uint32_t dst_ip;
@@ -75,7 +75,7 @@ typedef struct {                   /* packet presented to classifier */
     uint32_t ni_hash;
 } ps_packet_t;
 
-/* ========= runtime backend switch ================================ */
+
 typedef enum {
     CLS_BACKEND_PS,    /* PartitionSort        */
     CLS_BACKEND_TSS,    /* Tuple Space Search   */
@@ -84,7 +84,7 @@ typedef enum {
 
 typedef struct cls_handle_t cls_handle_t;
 
-/* ========= public C API ========================================= */
+
 cls_handle_t *cls_create (cls_backend_t which);
 void          cls_destroy(cls_handle_t *);
 
