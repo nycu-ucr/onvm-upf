@@ -46,18 +46,18 @@ sudo sh -c "echo 0 > /proc/sys/kernel/randomize_va_space"
 
 # (2)
 # Disable hyperthreading
-echo "- Disabling hyperthreading"
+# echo "- Disabling hyperthreading"
 
-CPUS_TO_SKIP=" $(cat /sys/devices/system/cpu/cpu*/topology/thread_siblings_list | sed 's/[^0-9].*//' | sort | uniq | tr "\r\n" "  ") "
-for CPU_PATH in /sys/devices/system/cpu/cpu[0-9]*; do
-        CPU="$(echo "$CPU_PATH" | tr -cd "0-9")"
-        echo "$CPUS_TO_SKIP" | grep " $CPU " > /dev/null
-        if [ $? -ne 0 ]; then
-            sudo sh -c "echo 0 > "$CPU_PATH"/online"
-        fi
-done
+# CPUS_TO_SKIP=" $(cat /sys/devices/system/cpu/cpu*/topology/thread_siblings_list | sed 's/[^0-9].*//' | sort | uniq | tr "\r\n" "  ") "
+# for CPU_PATH in /sys/devices/system/cpu/cpu[0-9]*; do
+#         CPU="$(echo "$CPU_PATH" | tr -cd "0-9")"
+#         echo "$CPUS_TO_SKIP" | grep " $CPU " > /dev/null
+#         if [ $? -ne 0 ]; then
+#             sudo sh -c "echo 0 > "$CPU_PATH"/online"
+#         fi
+# done
 
-lscpu | grep -i -E  "^CPU\(s\):|core|socket" 
+# lscpu | grep -i -E  "^CPU\(s\):|core|socket" 
 
 
 # (3)
