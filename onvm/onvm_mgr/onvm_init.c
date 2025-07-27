@@ -123,7 +123,7 @@ static const struct rte_eth_conf port_conf = {
         },
     .rx_adv_conf = {
             .rss_conf = {
-                    .rss_key = rss_symmetric_key, .rss_key_len = sizeof(rss_symmetric_key), .rss_hf = RTE_ETH_RSS_IP | RTE_ETH_RSS_UDP | RTE_ETH_RSS_TCP | RTE_ETH_RSS_L2_PAYLOAD,
+                    .rss_key = rss_symmetric_key, .rss_hf = RTE_ETH_RSS_IP | RTE_ETH_RSS_UDP | RTE_ETH_RSS_TCP | RTE_ETH_RSS_L2_PAYLOAD,
                 },
         },
     .txmode = {.mq_mode = RTE_ETH_MQ_TX_NONE,
@@ -387,6 +387,7 @@ init_port(uint8_t port_num) {
                     "requested:%#" PRIx64 " configured:%#" PRIx64 "\n",
                     port_num, port_conf.rx_adv_conf.rss_conf.rss_hf, local_port_conf.rx_adv_conf.rss_conf.rss_hf);
         }
+        local_port_conf.rx_adv_conf.rss_conf.rss_key_len = dev_info.hash_key_size;
 
         if (ONVM_USE_JUMBO_FRAMES) {
                 local_port_conf.rxmode.mtu = MAX_MTU;
