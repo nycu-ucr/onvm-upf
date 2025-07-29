@@ -147,7 +147,7 @@ onvm_nflib_parse_args(int argc, char *argv[], struct onvm_nf_init_cfg *nf_init_c
  */
 static inline uint16_t
 onvm_nflib_dequeue_packets(void **pkts, struct onvm_nf_local_ctx *nf_local_ctx,
-                           nf_pkt_handler_fn handler) __attribute__((always_inline));
+                           nf_pkt_handler_fn handler, int pkt_meta_offset) __attribute__((always_inline));
 
 /*
  * Check if there is a message available for this NF and process it
@@ -533,7 +533,7 @@ onvm_nflib_start_nf(struct onvm_nf_local_ctx *nf_local_ctx, struct onvm_nf_init_
 
         RTE_LOG(INFO, APP, "Using Instance ID %d\n", nf->instance_id);
         RTE_LOG(INFO, APP, "Using Service ID %d\n", nf->service_id);
-        RTE_LOG(INFO, APP, "Running on core %d\n", nf->thread_info.core);
+        RTE_LOG(INFO, APP, "Running on Socket %d, Core %d\n", rte_socket_id(), nf->thread_info.core);
 
         if (nf->flags.time_to_live)
                 RTE_LOG(INFO, APP, "Time to live set to %u\n", nf->flags.time_to_live);
@@ -603,15 +603,15 @@ onvm_nflib_thread_main_loop(void *arg) {
                 }
 
                 nb_pkts_added =
-                        onvm_nflib_dequeue_packets((void **)pkts, nf_local_ctx, nf->function_table->pkt_handler);
+                        onvm_nflib_dequeue_packets((void **)pkts, nf_local_ctx, nf->function_table->pkt_handler, onvm_config->dynfield_offset);
 
+                /* TODO: Fix up the segment fault caused by timeout trigger */
                 if (likely(nb_pkts_added > 0)) {
-                        onvm_pkt_process_tx_batch(nf->nf_tx_mgr, pkts, nb_pkts_added, nf);
+                        onvm_pkt_process_tx_batch(nf->nf_tx_mgr, pkts, onvm_config->dynfield_offset, nb_pkts_added, nf);
                         init_timeout = 1;
                         last_time_get_pkt = rte_get_tsc_cycles();
-                }else if(nb_pkts_added == 0){
-                        if (init_timeout && unlikely((rte_get_tsc_cycles() - last_time_get_pkt) * TIME_TTL_MULTIPLIER * 1000000000 / rte_get_timer_hz() >= 20000))
-                        {
+                } else if(nb_pkts_added == 0) {
+                        if (init_timeout && unlikely((rte_get_tsc_cycles() - last_time_get_pkt) * TIME_TTL_MULTIPLIER * 1000000000 / rte_get_timer_hz() >= 20000)) {
                                 // printf("Force to trigger timeout\n");
                                 (*nf->function_table->pkt_handler)(NULL, NULL, nf_local_ctx);
                         }
@@ -737,16 +737,14 @@ onvm_nflib_send_msg_to_nf(uint16_t dest, void *msg_data) {
         msg->msg_type = MSG_FROM_NF;
         msg->msg_data = msg_data;
 
-        //return rte_ring_enqueue(nfs[dest].msg_q, (void*)msg);
-
-        ret = rte_ring_enqueue(nfs[dest].msg_q, (void*)msg);
-        if(ret != 0){
-                RTE_LOG(INFO, APP, "Destination NF ring is full! Unable to enqueue msg to ring\n");
+        uint16_t instance_id = onvm_sc_service_to_nf_map(dest, NULL);
+        ret = rte_ring_enqueue(nfs[instance_id].msg_q, (void*)msg);
+        if (ret != 0) {
+                RTE_LOG(WARNING, APP, "Destination NF ring is full! Unable to enqueue msg to ring\n");
                 rte_mempool_put(nf_msg_pool, (void*)msg);
                 return ret;
         }
         return 0;
-
 }
 
 void
@@ -977,7 +975,7 @@ onvm_nflib_parse_config(struct onvm_configuration *config) {
 }
 
 static inline uint16_t
-onvm_nflib_dequeue_packets(void **pkts, struct onvm_nf_local_ctx *nf_local_ctx, nf_pkt_handler_fn  handler) {
+onvm_nflib_dequeue_packets(void **pkts, struct onvm_nf_local_ctx *nf_local_ctx, nf_pkt_handler_fn handler, int pkt_meta_offset) {
         struct onvm_nf *nf;
         struct onvm_pkt_meta *meta;
         uint16_t i, nb_pkts;
@@ -997,7 +995,7 @@ onvm_nflib_dequeue_packets(void **pkts, struct onvm_nf_local_ctx *nf_local_ctx, 
 
         /* Give each packet to the user proccessing function */
         for (i = 0; i < nb_pkts; i++) {
-                meta = onvm_get_pkt_meta((struct rte_mbuf *)pkts[i]);
+                meta = onvm_get_pkt_meta((struct rte_mbuf *)pkts[i], pkt_meta_offset);
                 ret_act = (*handler)((struct rte_mbuf *)pkts[i], meta, nf_local_ctx);
                 /* NF returns 0 to return packets or 1 to buffer */
                 if (likely(ret_act == 0)) {
@@ -1340,7 +1338,7 @@ onvm_nflib_stats_summary_output(uint16_t id) {
         const char clr[] = {27, '[', '2', 'J', '\0'};
         const char topLeft[] = {27, '[', '1', ';', '1', 'H', '\0'};
         const char *csv_suffix = "_stats.csv";
-        const char *csv_stats_headers = "NF tag, NF instance ID, NF service ID, NF assigned core, RX total,"
+        const char *csv_stats_headers = "NF tag, NF instance ID, NF service ID, NF assigned socket, NF assigned core, RX total,"
                                         "RX total dropped, TX total, TX total dropped, NF sent out, NF sent to NF,"
                                         "NF dropped, NF next, NF tx buffered, NF tx buffered, NF tx returned";
         const uint64_t rx = nfs[id].stats.rx;
@@ -1367,6 +1365,7 @@ onvm_nflib_stats_summary_output(uint16_t id) {
         printf("NF tag: %s\n", nf_tag);
         printf("NF instance ID: %d\n", instance_id);
         printf("NF service ID: %d\n", service_id);
+        printf("NF assigned socket: %d\n", rte_socket_id());
         printf("NF assigned core: %d\n", core);
         printf("----------------------------------------------------\n");
         printf("RX total: %ld\n", rx);
@@ -1409,6 +1408,7 @@ onvm_nflib_stats_summary_output(uint16_t id) {
         fprintf(csv_fp, "\n%s", nf_tag);
         fprintf(csv_fp, ", %d", instance_id);
         fprintf(csv_fp, ", %d", service_id);
+        fprintf(csv_fp, ", %d", rte_socket_id());
         fprintf(csv_fp, ", %d", core);
         fprintf(csv_fp, ", %ld", rx);
         fprintf(csv_fp, ", %ld", rx_drop);

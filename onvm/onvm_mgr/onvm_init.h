@@ -59,6 +59,7 @@
 #include <rte_fbk_hash.h>
 #include <rte_malloc.h>
 #include <rte_memcpy.h>
+#include <rte_mbuf_dyn.h>
 #ifdef RTE_LIBRTE_PDUMP
 #include <rte_pdump.h>
 #endif
@@ -126,6 +127,7 @@ extern uint8_t global_verbosity_level;
 /* Custom flags for onvm */
 extern struct onvm_configuration *onvm_config;
 extern uint8_t ONVM_NF_SHARE_CORES;
+extern uint8_t ONVM_USE_JUMBO_FRAMES;
 
 /* For handling shared core logic */
 extern struct nf_wakeup_info *nf_wakeup_infos;

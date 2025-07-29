@@ -117,18 +117,17 @@ check_all_ports_link_status(uint8_t port_num, uint32_t port_mask);
 
 static const struct rte_eth_conf port_conf = {
     .rxmode = {
-            .mq_mode = ETH_MQ_RX_RSS,
-            .max_rx_pkt_len = RTE_ETHER_MAX_LEN,
-            .split_hdr_size = 0,
-            .offloads = DEV_RX_OFFLOAD_CHECKSUM,
+            .mq_mode = RTE_ETH_MQ_RX_RSS,
+            .mtu = RTE_ETHER_MAX_LEN,
+            .offloads = RTE_ETH_RX_OFFLOAD_CHECKSUM,
         },
     .rx_adv_conf = {
             .rss_conf = {
-                    .rss_key = rss_symmetric_key, .rss_hf = ETH_RSS_IP | ETH_RSS_UDP | ETH_RSS_TCP | ETH_RSS_L2_PAYLOAD,
+                    .rss_key = rss_symmetric_key, .rss_hf = RTE_ETH_RSS_IP | RTE_ETH_RSS_UDP | RTE_ETH_RSS_TCP | RTE_ETH_RSS_L2_PAYLOAD,
                 },
         },
-    .txmode = {.mq_mode = ETH_MQ_TX_NONE,
-               .offloads = (DEV_TX_OFFLOAD_IPV4_CKSUM | DEV_TX_OFFLOAD_UDP_CKSUM | DEV_TX_OFFLOAD_TCP_CKSUM)},
+    .txmode = {.mq_mode = RTE_ETH_MQ_TX_NONE,
+               .offloads = (RTE_ETH_TX_OFFLOAD_IPV4_CKSUM | RTE_ETH_TX_OFFLOAD_UDP_CKSUM | RTE_ETH_TX_OFFLOAD_TCP_CKSUM)},
 };
 
 /*********************************Interfaces**********************************/
@@ -209,6 +208,13 @@ init(int argc, char *argv[]) {
         if (retval != 0)
                 return -1;
 
+        /* register onvm_pkt_meta dynfield with DPDK (must be done before init_mbuf_pools) */
+        static const struct rte_mbuf_dynfield onvm_pkt_meta_dynfield_desc = {
+                .name = "onvm_pkt_meta_dynfield",
+                .size = sizeof(onvm_pkt_meta_t),
+                .align = alignof(onvm_pkt_meta_t)
+        };
+
         /* initialise mbuf pools */
         retval = init_mbuf_pools();
         if (retval != 0)
@@ -225,6 +231,11 @@ init(int argc, char *argv[]) {
         if (retval != 0) {
                 rte_exit(EXIT_FAILURE, "Cannot create nf message pool: %s\n", rte_strerror(rte_errno));
         }
+
+        /* initialize onvm_pkt_meta dynfield offset, and load to onvm_config */
+        onvm_config->dynfield_offset = rte_mbuf_dynfield_register(&onvm_pkt_meta_dynfield_desc);
+        if(onvm_config->dynfield_offset < 0)
+                rte_exit(EXIT_FAILURE, "Cannot register onvm_pkt_meta mbuf field\n");
 
         /* now initialise the ports we will use */
         for (i = 0; i < ports->num_ports; i++) {
@@ -280,6 +291,7 @@ init(int argc, char *argv[]) {
 static void
 set_default_config(struct onvm_configuration *config) {
         config->flags.ONVM_NF_SHARE_CORES = ONVM_NF_SHARE_CORES_DEFAULT;
+        config->dynfield_offset = -1; 
 }
 
 /**
@@ -288,9 +300,17 @@ set_default_config(struct onvm_configuration *config) {
  */
 static int
 init_mbuf_pools(void) {
+        uint16_t mbuf_size;
+
+        if (ONVM_USE_JUMBO_FRAMES)
+                mbuf_size = 9600 + RTE_ETHER_CRC_LEN + RTE_ETHER_HDR_LEN + MBUF_OVERHEAD;
+        else
+                mbuf_size = RTE_MBUF_DEFAULT_DATAROOM + MBUF_OVERHEAD;
+
         /* don't pass single-producer/single-consumer flags to mbuf create as it
          * seems faster to use a cache instead */
         printf("Creating mbuf pool '%s' [%u mbufs] ...\n", PKTMBUF_POOL_NAME, NUM_MBUFS);
+        /* NOTE: override MBUF_SIZE */
         pktmbuf_pool = rte_mempool_create(PKTMBUF_POOL_NAME, NUM_MBUFS, MBUF_SIZE, MBUF_CACHE_SIZE,
                                           sizeof(struct rte_pktmbuf_pool_private), rte_pktmbuf_pool_init, NULL,
                                           rte_pktmbuf_init, NULL, rte_socket_id(), NO_FLAGS);
@@ -358,14 +378,19 @@ init_port(uint8_t port_num) {
         /* Standard DPDK port initialisation - config port, then set up
          * rx and tx rings */
         rte_eth_dev_info_get(port_num, &dev_info);
-        if (dev_info.tx_offload_capa & DEV_TX_OFFLOAD_MBUF_FAST_FREE)
-                local_port_conf.txmode.offloads |= DEV_TX_OFFLOAD_MBUF_FAST_FREE;
+        if (dev_info.tx_offload_capa & RTE_ETH_TX_OFFLOAD_MBUF_FAST_FREE)
+                local_port_conf.txmode.offloads |= RTE_ETH_TX_OFFLOAD_MBUF_FAST_FREE;
         local_port_conf.rx_adv_conf.rss_conf.rss_hf &= dev_info.flow_type_rss_offloads;
         if (local_port_conf.rx_adv_conf.rss_conf.rss_hf != port_conf.rx_adv_conf.rss_conf.rss_hf) {
                 printf(
                     "Port %u modified RSS hash function based on hardware support,"
                     "requested:%#" PRIx64 " configured:%#" PRIx64 "\n",
                     port_num, port_conf.rx_adv_conf.rss_conf.rss_hf, local_port_conf.rx_adv_conf.rss_conf.rss_hf);
+        }
+        local_port_conf.rx_adv_conf.rss_conf.rss_key_len = dev_info.hash_key_size;
+
+        if (ONVM_USE_JUMBO_FRAMES) {
+                local_port_conf.rxmode.mtu = MAX_MTU;
         }
 
         if ((retval = rte_eth_dev_configure(port_num, rx_rings, tx_rings, &local_port_conf)) != 0)
@@ -489,7 +514,7 @@ check_all_ports_link_status(uint8_t port_num, uint32_t port_mask) {
                                             "Port %d Link Up - speed %u "
                                             "Mbps - %s\n",
                                             ports->id[portid], (unsigned)link.link_speed,
-                                            (link.link_duplex == ETH_LINK_FULL_DUPLEX) ? ("full-duplex")
+                                            (link.link_duplex == RTE_ETH_LINK_FULL_DUPLEX) ? ("full-duplex")
                                                                                        : ("half-duplex\n"));
                                 else
                                         printf("Port %d Link Down\n", (uint8_t)ports->id[portid]);

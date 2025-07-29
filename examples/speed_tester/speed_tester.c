@@ -310,6 +310,7 @@ nf_setup(struct onvm_nf_local_ctx *nf_local_ctx) {
         const u_char *packet;
         struct pcap_pkthdr header;
         char errbuf[PCAP_ERRBUF_SIZE];
+        uint32_t max_elt_size;
 
         if (pcap_filename != NULL) {
                 printf("Replaying %s pcap file\n", pcap_filename);
@@ -326,9 +327,23 @@ nf_setup(struct onvm_nf_local_ctx *nf_local_ctx) {
 
                 i = 0;
 
+                /* 
+                 * max_elt_size is the maximum preallocated memory size permitted for each packet, 
+                 * adjusted for the memory offset of the rte_mbuf struct and header/tail lengths
+                 */
+                
+                max_elt_size = pktmbuf_pool->elt_size - sizeof(struct rte_mbuf) - pktmbuf_pool->header_size - pktmbuf_pool->trailer_size;
+
                 while (((packet = pcap_next(pcap, &header)) != NULL) && (i < packet_number)) {
                         struct onvm_pkt_meta *pmeta;
                         struct onvm_ft_ipv4_5tuple key;
+
+                        /* Length of the packet cannot exceed preallocated storage size */
+                        if (header.caplen > max_elt_size) {
+                                nf_local_ctx->nf->stats.tx_drop++;
+                                nf_local_ctx->nf->stats.act_drop++;
+                                continue;
+                        }
 
                         pkt = rte_pktmbuf_alloc(pktmbuf_pool);
                         if (pkt == NULL)
@@ -355,7 +370,7 @@ nf_setup(struct onvm_nf_local_ctx *nf_local_ctx) {
                 onvm_nflib_return_pkt_bulk(nf_local_ctx->nf, pkts, pkts_generated);
         } else {
 #endif
-                /*  use default number of initial packets if -c has not been used */
+                /* Use default number of initial packets if -c has not been used */
                 packet_number = (use_custom_pkt_count ? packet_number : DEFAULT_PKT_NUM);
                 struct rte_mbuf *pkts[packet_number];
 
@@ -378,16 +393,16 @@ nf_setup(struct onvm_nf_local_ctx *nf_local_ctx) {
                         /*using manager mac addr for source
                         *using input string for dest addr
                         */
-                        if (onvm_get_macaddr(0, &ehdr->s_addr) == -1) {
+                        if (onvm_get_macaddr(0, &ehdr->src_addr) == -1) {
                                 RTE_LOG(INFO, APP, "Using fake MAC address\n");
-                                onvm_get_fake_macaddr(&ehdr->s_addr);
+                                onvm_get_fake_macaddr(&ehdr->src_addr);
                         }
                         for (j = 0; j < RTE_ETHER_ADDR_LEN; ++j) {
-                                ehdr->d_addr.addr_bytes[j] = d_addr_bytes[j];
+                                ehdr->dst_addr.addr_bytes[j] = d_addr_bytes[j];
                         }
                         ehdr->ether_type = LOCAL_EXPERIMENTAL_ETHER;
 
-                        pmeta = onvm_get_pkt_meta(pkt);
+                        pmeta = onvm_get_pkt_meta(pkt, nf_local_ctx->nf->dynfield_offset);
                         pmeta->destination = destination;
                         pmeta->action = ONVM_NF_ACTION_TONF;
                         pmeta->flags = ONVM_SET_BIT(0, SPEED_TESTER_BIT);

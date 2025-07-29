@@ -1,94 +1,99 @@
-[openNetVM][onvm]
-==
+# [L<sup>2</sup>5GC<sup>+</sup> UPF][onvm-upf]
 
-_Please let us know if you use OpenNetVM in your research by [emailing us](mailto:timwood@gwu.edu) or completing this [short survey](https://goo.gl/forms/oxcnGO45Kxq1Zyyi2)._
+UPF in L<sup>2</sup>5GC<sup>+</sup> is developed on top of OpenNetVM, a high performance NFV platform based on [DPDK][dpdk] and [Docker][docker] containers.
 
-_Want to get started quickly?_ Try using our NSF CloudLab profile: https://www.cloudlab.us/p/GWCloudLab/onvm
+The [next][next] branch tracks experimental builds (active development) whereas the [opensource][opensou] branch tracks verified stable releases.
 
+## Design of UPF in L<sup>2</sup>5GC<sup>+</sup>
 
-Notes
---
+<img src="docs/images/upf-arch.png" alt="UPF architecture" style="width:70%; height:auto;">
 
-We have updated our DPDK submodule to point to a new version, v20.05.  If you have already cloned this repository, please update your DPDK submodule by running:
+L<sup>2</sup>5GC<sup>+</sup> disaggregates the UPF into two complementary NFs: [UPF-C][upfc] and [UPF-U][upfu]. The UPF-C acts as the N4 interface endpoint that communicates with the SMF to receive and update PDR rules and user session contexts. UPF-C and UPF-U share the PDRs and user session state, residing in OpenNetVM's shared memory. As a result, the N4 communication overhead is minimized and UPF-U can access PDRs at minimal cost.
+This disaggregation allows for rapid updates to PDRs and session state without impacting the user plane performance.
 
-```
-git submodule sync
-git submodule update --init
-```
+## Getting Started
 
-And then rebuild DPDK using the [install guide][install] or running these commands:
+We've provided two scripts to install required dependencies, and configure your machine to run OpenNetVM. Required dependencies are installed by [`scripts/install.sh`](/scripts/install.sh), and configuration is done by [`scripts/setup_runtime.sh`](/scripts/setup_runtime.sh).
 
-```
-cd dpdk
-make config T=$RTE_TARGET
-make T=$RTE_TARGET -j 8
-make install T=$RTE_TARGET -j 8
+From the `onvm-upf` folder, run the following two commands:
+
+```text
+./scripts/install.sh
 ```
 
-The current OpenNetVM version is 20.10. Please see our [release](docs/Releases.md) document for more information.
-
-About
---
-openNetVM is a high performance NFV platform based on [DPDK][dpdk] and [Docker][docker] containers.  openNetVM provides a flexible framework for deploying network functions and interconnecting them to build service chains.
-
-openNetVM is an open source version of the NetVM platform described in our [NSDI 2014][nsdi14] and [HotMiddlebox 2016][hotmiddlebox16] papers, released under the [BSD][license] license.  
-
-The [develop][dev] branch tracks experimental builds (active development) whereas the [master][mast] branch tracks verified stable releases.  Please read our [releases][rels] document for more information about our releases and release cycle.
-
-You can find information about research projects building on [OpenNetVM][onvm] at the [UCR/GW SDNFV project site][sdnfv]. OpenNetVM is supported in part by NSF grants CNS-1422362 and CNS-1522546.
-
-Installing
---
-To install openNetVM, please see the [openNetVM Installation][install] guide for a thorough walkthrough.
-
-Using openNetVM
---
-openNetVM comes with several sample network functions.  To get started with some examples, please see the [Example Uses][examples] guide
-
-Creating NFs
---
-The [NF Development][nfs] guide will provide what you need to start creating your own NFs.
-
-Dockerize NFs
---
-NFs can be run inside docker containers, with the NF being automatically or hand started. For more informations, see our [Docker guide][docker-nf].
-
-TCP Stack
---
-openNetVM can run mTCP applications as NFs. For more information, visit [mTCP][mtcp].
-
-Citing OpenNetVM
---
-If you use OpenNetVM in your work, please cite our paper:
-```
-@inproceedings{zhang_opennetvm:_2016,
-	title = {{OpenNetVM}: {A} {Platform} for {High} {Performance} {Network} {Service} {Chains}},
-	booktitle = {Proceedings of the 2016 {ACM} {SIGCOMM} {Workshop} on {Hot} {Topics} in {Middleboxes} and {Network} {Function} {Virtualization}},
-	publisher = {ACM},
-	author = {Zhang, Wei and Liu, Guyue and Zhang, Wenhui and Shah, Neel and Lopreiato, Phillip and Todeschi, Gregoire and Ramakrishnan, K.K. and Wood, Timothy},
-	month = aug,
-	year = {2016},
-}
+```text
+./scripts/setup_runtime.sh
 ```
 
-_Please let us know if you use OpenNetVM in your research by [emailing us](mailto:timwood@gwu.edu) or completing this [short survey](https://goo.gl/forms/oxcnGO45Kxq1Zyyi2)._
+> If you are using `Ubuntu 20.04`, you will need to perform [additional setup](./MANUAL_INSTALL.md#additional-setups-on-ubuntu-2004).
 
+### Building
 
+We use the [Meson][meson] build system to compile all components, including dpdk. From the `onvm-upf` parent folder run the following to setup build:
 
+```text
+source ~/.bashrc
+./scripts/build.sh
+```
 
+This will take care of the Meson build setup, compilation, and installation of onvm shared libriaries.
 
-[onvm]: http://sdnfv.github.io/onvm/
-[sdnfv]: http://sdnfv.github.io/
+Afterwards you may need to run the following comand to update the linker.
+
+```text
+ldconfig
+```
+
+### Running onvm_mgr
+
+Bind NIC to `igb_uio` (replace `<pci_id>` | `<eth_if_id>` with the actual PCI address | eth interface ID)
+```bash
+sudo python <dpdk>/usertools/dpdk-devbind.py --bind=igb_uio <pci_id> | <eth_if_id>
+```
+
+You can use our provided [startup script](scripts/start.sh) to launch onvm_mgr. This scripts assumes the `onvm-upf` folder is your working directory.
+
+```text
+./scripts/start.sh  -k PORTMASK -n NF-COREMASK [-m MANAGER CORES] [-r NUM-SERVICES] [-d DEFAULT-SERVICE] [-s STATS-OUTPUT] [-p WEB-PORT-NUMBER] [-z STATS-SLEEP-TIME]
+```
+
+## Manual Installation
+We provide step-by-step instructions for [manual installation](./MANUAL_INSTALL.md).
+
+## Tested OS Distributions
+
+| OS Distribution | Status                        | Notes                                                                                |
+| --------------- | ----------------------------- | ------------------------------------------------------------------------------------ |
+| Ubuntu 24.04    | ⚠️ Untested                   | All dependencies available via `apt` or `pip` |
+| Ubuntu 22.04    | ✅ Works out of the box        | All dependencies available via `apt` or `pip`                                        |
+| Ubuntu 20.04    | ⚠️ Requires extra setup       | `numa.pc` must be manually added for Meson; may require newer GCC or Meson from pip  |
+| Ubuntu 18.04    | ⚠️ Untested                   | Likely requires upgrading GCC, Python, and installing recent Meson manually |
+
+> 💡 For Ubuntu 20.04: See [MANUAL_INSTALL.md](./MANUAL_INSTALL.md#additional-setups-on-ubuntu-2004) to install a `pkg-config` file for `libnuma` and upgrade `meson`.
+
+---
+
+## Dependency Versions
+
+| Component       | Version          | Installation Notes                               |
+| --------------- | ---------------- | ------------------------------------------------ |
+| **DPDK**        | `24.07.0`        | Built from source using Meson                    |
+| **Pktgen-DPDK** | `24.07.0`        | Compatible with the same DPDK version            |
+| **dpdk-kmods**  | `commit@9b182be` | Required only for `igb_uio` (optional)           |
+| **Meson**       | `>=0.58.0`       | Recommended: `0.61.2+`; use `pip3 install meson` |
+| **Ninja**       | `>=1.10.0`       | Usually installed via `apt`                      |
+
+---
+
+[onvm-upf]: https://github.com/nycu-ucr/onvm-upf
+[opensou]: https://github.com/nycu-ucr/onvm-upf/tree/opensource
+[next]: https://github.com/nycu-ucr/onvm-upf/tree/next
+[upfc]: 5gc/upf_c_complete/
+[upfu]: 5gc/upf_u_complete/
 [license]: LICENSE
 [dpdk]: http://dpdk.org
 [docker]: https://www.docker.com/
-[nsdi14]: http://faculty.cs.gwu.edu/timwood/papers/14-NSDI-netvm.pdf
-[hotmiddlebox16]: http://faculty.cs.gwu.edu/timwood/papers/16-HotMiddlebox-onvm.pdf
-[install]: docs/Install.md
-[examples]: docs/Examples.md
-[nfs]: docs/NF_Dev.md
-[docker-nf]: docs/Docker.md
-[dev]: https://github.com/sdnfv/openNetVM/tree/develop
-[mast]: https://github.com/sdnfv/openNetVM/tree/master
+[examples]: https://opennetvm.readthedocs.io/en/develop/examples/index.html
+[docker-nf]: https://opennetvm.readthedocs.io/en/develop/docker/index.html
 [rels]: docs/Releases.md
-[mtcp]: https://github.com/eunyoung14/mtcp
+[meson]: https://mesonbuild.com/

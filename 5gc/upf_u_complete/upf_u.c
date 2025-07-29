@@ -1,41 +1,20 @@
-/*********************************************************************
- *             openNetVM
- *          https://sdnfv.github.io
- *
- *   BSD LICENSE
- *
- *   Copyright(c)
- *        2015-2019 George Washington University
- *        2015-2019 University of California Riverside
- *   All rights reserved.
- *
- *   Redistribution and use in source and binary forms, with or without
- *   modification, are permitted provided that the following conditions
- *   are met:
- *
- *     * Redistributions of source code must retain the above copyright
- *       notice, this list of conditions and the following disclaimer.
- *     * Redistributions in binary form must reproduce the above copyright
- *       notice, this list of conditions and the following disclaimer in
- *       the documentation and/or other materials provided with the
- *       distribution.
- *     * The name of the author may not be used to endorse or promote
- *       products derived from this software without specific prior
- *       written permission.
- *
- *   THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
- *   "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
- *   LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
- *   A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
- *   OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
- *   SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
- *   LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
- *   DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
- *   THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
- *   (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
- *   OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
- *
- ********************************************************************/
+/*
+# Copyright 2025 University of California, Riverside and National Yang Ming Chiao Tung University
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# SPDX-License-Identifier: Apache-2.0
+*/
 
 #include <errno.h>
 #include <getopt.h>
@@ -199,11 +178,15 @@ parseIpv4Address(const char *addrStr) {
 }
 
 void
-parseMAC() {
+parseMAC(const char *config_path) {
     FILE *file;
+    file = fopen(config_path, "r");
+    if (file == NULL) {
+        fprintf(stderr, "Error: failed to open file %s\n", config_path);
+        exit(EXIT_FAILURE);
+    }
 
     char line[256];
-    file = fopen("upf_u.txt", "r");
     int linenum = 0;
     int DNvalues[6];
     int ANvalues[6];
@@ -952,16 +935,17 @@ AttachL2Header(struct rte_mbuf *pkt, bool is_dl) {
 
     // next hop's mac address
     if (is_dl == true) {
-        rte_ether_addr_copy(&cn_ue_eth, &eth_hdr->s_addr);
-        eth_hdr->d_addr.addr_bytes[0] = AnMac[0];
-        eth_hdr->d_addr.addr_bytes[1] = AnMac[1];
-        eth_hdr->d_addr.addr_bytes[2] = AnMac[2];
-        eth_hdr->d_addr.addr_bytes[3] = AnMac[3];
-        eth_hdr->d_addr.addr_bytes[4] = AnMac[4];
-        eth_hdr->d_addr.addr_bytes[5] = AnMac[5];
-    } else {
-        rte_ether_addr_copy(&cn_dn_eth, &eth_hdr->s_addr);
-        rte_ether_addr_copy(&dn_eth, &eth_hdr->d_addr);
+        rte_ether_addr_copy(&cn_ue_eth, &eth_hdr->src_addr);
+        eth_hdr->dst_addr.addr_bytes[0] = AnMac[0];
+        eth_hdr->dst_addr.addr_bytes[1] = AnMac[1];
+        eth_hdr->dst_addr.addr_bytes[2] = AnMac[2];
+        eth_hdr->dst_addr.addr_bytes[3] = AnMac[3];
+        eth_hdr->dst_addr.addr_bytes[4] = AnMac[4];
+        eth_hdr->dst_addr.addr_bytes[5] = AnMac[5];
+
+    } else { 
+        rte_ether_addr_copy(&cn_dn_eth, &eth_hdr->src_addr);
+        rte_ether_addr_copy(&dn_eth, &eth_hdr->dst_addr);
     }
 
     eth_hdr->ether_type = rte_cpu_to_be_16(RTE_ETHER_TYPE_IPV4);
@@ -1148,17 +1132,23 @@ msg_handler(void *msg_data, struct onvm_nf_local_ctx *nf_local_ctx) {
         return;
     }
 
-    struct onvm_pkt_meta *meta;
-    // #ifdef FIX_BUFFER
-    //     for (i = 0; i < buffer_length; i++) {
-    //  TODO: (@vivek fix it)
-    //    Encap(buffer[i]);
-    //    AttachL2Header(buffer[i], 1); // 1 == Downlink packet
-    //    meta = onvm_get_pkt_meta(buffer[i]);
-    //    meta = ONVM_NF_ACTION_OUT;
-    //    }
-    // #endif
-    onvm_pkt_process_tx_batch(nf->nf_tx_mgr, buffer, buffer_length, nf);
+    // struct onvm_pkt_meta *meta;
+//#ifdef FIX_BUFFER
+//    for (i = 0; i < buffer_length; i++) {
+        // TODO: (@vivek fix it)
+//        Encap(buffer[i]);
+//        AttachL2Header(buffer[i], 1); // 1 == Downlink packet
+//        meta = onvm_get_pkt_meta(buffer[i]);
+//        meta = ONVM_NF_ACTION_OUT;
+//    }
+//#endif
+
+    struct onvm_configuration *onvm_config = onvm_nflib_get_onvm_config();
+    if (onvm_config == NULL) {
+        fprintf(stderr, "Error: onvm_nflib_get_onvm_config() returned NULL\n");
+        exit(EXIT_FAILURE);
+    }
+    onvm_pkt_process_tx_batch(nf->nf_tx_mgr, buffer, onvm_config->dynfield_offset, buffer_length, nf);
     onvm_pkt_flush_all_nfs(nf->nf_tx_mgr, nf);
     UTLT_Debug("Sending out %u packets\n", buffer_length);
     buffer_length = 0;
@@ -1229,7 +1219,12 @@ main(int argc, char *argv[]) {
         rte_exit(EXIT_FAILURE, "Cannot get MAC address: err=%d, port=%u\n", ret, 1);
 
     // Parse DN & AN MAC address from upf_u.txt
-    parseMAC();
+    const char *config_path = "upf_u.txt";  // default
+    if (argc > arg_offset + 1) {
+        config_path = argv[arg_offset + 1];
+    }
+    printf("Using config path: %s\n", config_path);  // print the path
+    parseMAC(config_path);
 
     // 8c:dc:d4:ac:6c:7d
     dn_eth.addr_bytes[0] = DnMac[0];

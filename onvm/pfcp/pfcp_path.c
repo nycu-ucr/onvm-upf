@@ -8,7 +8,6 @@
 #include "utlt_buff.h"
 
 #include "pfcp_node.h"
-
 #include "pfcp_path.h"
 
 #include "onvm_nflib.h"
@@ -85,7 +84,6 @@ SockAddr *PfcpLocalAddrFirst(ListHead *list) {
 
 Status PfcpSend(PfcpNode *node, Bufblk *bufBlk) {
     Sock *sock = NULL;
-    SockAddr *addr = NULL;
 
     UTLT_Assert(node, return STATUS_ERROR, "No PfcpNode");
     UTLT_Assert(bufBlk, return STATUS_ERROR, "No Bufblk");
@@ -142,18 +140,19 @@ Status PfcpSend(PfcpNode *node, Bufblk *bufBlk) {
     // Prepending IPv4 Header
     ethHdr = (struct rte_ether_hdr *)rte_pktmbuf_prepend(pkt, RTE_ETHER_HDR_LEN);
 
-    if (onvm_get_macaddr(0, &ethHdr->s_addr) == -1) {
-        onvm_get_fake_macaddr(&ethHdr->s_addr);
+    if (onvm_get_macaddr(0, &ethHdr->src_addr) == -1) {
+        onvm_get_fake_macaddr(&ethHdr->src_addr);
     }
 
     for (i = 0; i < RTE_ETHER_ADDR_LEN; ++i) {
-        ethHdr->d_addr.addr_bytes[i] = i;
+        ethHdr->dst_addr.addr_bytes[i] = i;
     }
 
     ethHdr->ether_type = rte_cpu_to_be_16(RTE_ETHER_TYPE_IPV4);
 
     // Fill out the meta data of the packet
-    pmeta = onvm_get_pkt_meta(pkt);
+    struct onvm_configuration *onvm_config = onvm_nflib_get_onvm_config();
+    pmeta = onvm_get_pkt_meta(pkt, onvm_config->dynfield_offset);
     pmeta->destination = 3; // serviceId; // TODO: This is hardcode
     pmeta->action = ONVM_NF_ACTION_TONF;
     pkt->pkt_len = bufferLength + sizeof(struct rte_ether_hdr) + 20 + sizeof(struct rte_udp_hdr);  //???
