@@ -1,0 +1,6 @@
+option('cls_backend',
+  type: 'combo',
+  choices: ['PS', 'TSS', 'PTSS'],
+  value: 'PS',
+  description: 'Which classifier backend to compile'
+)

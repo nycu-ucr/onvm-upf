@@ -1,4 +1,11 @@
-project('openNetVM', 'c', default_options: ['default_library=both'])
+# project('openNetVM', 'c', default_options: ['default_library=both'])
+
+project('openNetVM',
+        ['c', 'cpp'],
+        default_options: [
+          'default_library=both',
+          'cpp_std=c++17'
+        ])
 
 add_global_arguments('-msse4', language : 'c')
 

@@ -1,3 +1,9 @@
+project('5gc', 'c')
+
+
+subdir('classifiers')
+
+
 l25gc_nfs = [
     'upf_u_complete',
     'upf_c_complete'
@@ -14,7 +20,7 @@ foreach nf : l25gc_nfs
         name,
         sources,
         include_directories: includes,
-        dependencies: [onvm_dpdk_dep, onvm_nflib_dep, onvm_l25gc_dep],
+        dependencies: [onvm_dpdk_dep, onvm_nflib_dep, onvm_l25gc_dep, classifier_dep],
         install: true,
         install_tag: 'onvm',
         install_dir: onvm_output_dir + '/nf/' + nf
