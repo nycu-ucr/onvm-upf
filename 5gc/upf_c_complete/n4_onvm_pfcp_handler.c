@@ -265,13 +265,15 @@ Status UpfN4HandleCreatePdr(UpfSession *session, CreatePDR *createPdr) {
                 rte_free(upfPdr);
                 return STATUS_ERROR,
                 "UpfPDRRegisterToSession failed");
+    
+    uintptr_t desc = upf_cls_add_pdr(upfPdr);
 
-    if (upf_cls_add_pdr(upfPdr) != 0) {
+    if (desc == 0) {
         UTLT_Error("Classifier insert failed for PDRId=%u", upfPdr->pdrId);
         UpfPDRDeregisterToSessionByID(session, upfPdr->pdrId);
-        rte_free(upfPdr); 
+        rte_free(upfPdr);
         return STATUS_ERROR;
-    }
+    }   
 
     return STATUS_OK;
 

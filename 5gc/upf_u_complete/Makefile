@@ -98,7 +98,7 @@ CFLAGS  += -I$(SRCDIR)/../classifiers \
 
 # C++17 for the adapter
 CXXFLAGS += -std=c++17
-CFLAGS   += -std=c++17           # some DPDK rules look only at CFLAGS
+CFLAGS   += -std=c++17
 
 # link libstdc++ because rte.extapp links with $(CC) (C compiler)
 LDFLAGS  += -lstdc++

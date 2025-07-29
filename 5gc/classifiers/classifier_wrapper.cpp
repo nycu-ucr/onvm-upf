@@ -1,73 +1,11 @@
+#include <climits>
+#include <cinttypes>
+
 #include "classifier_wrapper.h"
 #include "ElementaryClasses.h"
 #include "PartitionSort/PartitionSort.h"
 #include "TupleSpaceSearch/TupleSpaceSearch.h"
 #include "../../onvm/updk/updk/rule_pdr.h"
-
-#include <climits>
-#include <cinttypes>
-
-#define SRC_IF_ANY  ((source_interface_t)ANY8)
-
-cls_handle_t *g_classifier = nullptr;
-
-
-static void init_wildcard(pdr_t *r)
-{
-    memset(r, 0, sizeof(*r));
-    r->pdi.src_port = ANY16;
-    r->pdi.dst_port = ANY16;
-    r->pdi.spi      = ANY32;
-    r->pdi.flow_label = ANY32;
-    r->pdi.teid     = ANY32;
-    r->pdi.source_if= SRC_IF_ANY;
-    r->pdi.ni_hash  = 0;          // 0 == wildcard for NI
-}
-
-/* ------------  PFCP-to-classifier adapter  ----------------- */
-bool updk_pdr_to_cls_rule(const UPDK_PDR *in, pdr_t *out)
-{
-    if (!in || !out) return false;
-    init_wildcard(out);
-
-    /* PDR-level IDs */
-    if (in->flags.pdrId)      out->pdr_id    = in->pdrId;
-    if (in->flags.precedence) out->precedence= in->precedence;
-    out->descriptor = out->pdr_id;           /* reuse pdrId */
-
-    if (in->flags.pdi) {
-        const UPDK_PDI *p = &in->pdi;
-
-        /* UE-IPv4 prefix */
-        if (p->flags.ueIpAddress && p->ueIpAddress.flags.v4) {
-            out->pdi.ue_ip   = p->ueIpAddress.ipv4;
-            out->pdi.ue_pref = p->ueIpAddress.ipv6PrefixDelegationBit ?
-                               p->ueIpAddress.ipv6PrefixDelegationBit : 32;
-        }
-
-        /* TEID match (outer GTP-U header) */
-        if (p->flags.fTeid && p->fTeid.flags.v4)
-            out->pdi.teid = ntohl(p->fTeid.teid);
-
-        /* optional ToS / SPI / Flow-Label from SDF filter */
-        if (p->flags.sdfFilter) {
-            if (p->sdfFilter.flags.ttc)
-                out->pdi.tos_tc = p->sdfFilter.tosTrafficClass;
-            if (p->sdfFilter.flags.spi)
-                out->pdi.spi    = p->sdfFilter.securityParameterIndex;
-            if (p->sdfFilter.flags.fl) {
-                uint32_t fl = 0;
-                memcpy(((uint8_t*)&fl)+1, p->sdfFilter.flowLabel, 3);
-                out->pdi.flow_label = ntohl(fl);
-            }
-        }
-
-        /* QFI → repurpose proto field for now */
-        if (p->flags.qfi)
-            out->pdi.proto = p->qfi;
-    }
-    return true;
-}
 
 
 
@@ -121,9 +59,10 @@ static Rule to_cpp_rule(const pdr_t *in)
 
     /* TEID / SourceIF / NI-hash ----------------------------------------- */
     R.range[9]  = {{ in->pdi.teid,      in->pdi.teid }};
-    R.range[10] = {{ in->pdi.source_if, in->pdi.source_if }};
+    R.range[10] = {{ (uint8_t)in->pdi.source_if, (uint8_t)in->pdi.source_if }};
     R.range[11] = {{ in->pdi.ni_hash,   in->pdi.ni_hash }};
-    R.prefix_length[9]  = R.prefix_length[10] = R.prefix_length[11] = 32;
+    R.range[12] = {{ in->pdi.qfi, in->pdi.qfi }};
+    R.prefix_length[9]  = R.prefix_length[10] = R.prefix_length[11] = R.prefix_length[12] = 32;
 
     /* metadata ----------------------------------------------------------- */
     R.priority   = INT32_MAX - (int)in->precedence;   /* lower wins */
@@ -147,6 +86,7 @@ static Packet to_cpp_pkt(const ps_packet_t *p)
     P[9]  = p->teid;
     P[10] = p->source_if;
     P[11] = p->ni_hash;
+    P[12]  = p->qfi;
     return P;
 }
 
@@ -394,64 +334,4 @@ void cls_print_all_rules(cls_handle_t *h)
     }
 }
 
-
-// void cls_print_all_rules(cls_handle_t *h)
-// {
-//     if (!h) return;
-
-//     switch (h->which) {
-//       case CLS_BACKEND_PS:
-//         h->ps->PrintAllRules();
-//         break;
-
-//       case CLS_BACKEND_TSS: {
-//         auto rules = h->tss->SerializeIntoRules();
-//         printf("=== TupleSpaceSearch: %zu rules ===\n", rules.size());
-//         for (size_t i = 0; i < rules.size(); ++i) {
-//             const Rule &r = rules[i];
-//             printf(
-//               "Rule[%2zu] id=%u  desc=0x%" PRIxPTR
-//               "  prec=%u  UE=%u–%u/%u  SRC=%u–%u/%u  DST=%u–%u/%u\n",
-//               i,
-//               r.id,
-//               r.descriptor,
-//               (uint32_t)(INT32_MAX - r.priority),
-//               r.range[0][LowDim], r.range[0][HighDim], r.prefix_length[0],
-//               r.range[1][LowDim], r.range[1][HighDim], r.prefix_length[1],
-//               r.range[2][LowDim], r.range[2][HighDim], r.prefix_length[2]
-//             );
-//         }
-//         puts("=== end of rules ===");
-//         break;
-//       }
-
-//       case CLS_BACKEND_PTSS: {
-//         auto rules = h->ptss->SerializeIntoRules();
-//         printf("=== PriorityTupleSearch: %zu rules ===\n", rules.size());
-//         for (size_t i = 0; i < rules.size(); ++i) {
-//             const Rule &r = rules[i];
-//             printf(
-//               "Rule[%2zu] id=%u  desc=0x%" PRIxPTR
-//               "  prec=%u  UE=%u–%u/%u  SRC=%u–%u/%u  DST=%u–%u/%u\n",
-//               i,
-//               r.id,
-//               r.descriptor,
-//               (uint32_t)(INT32_MAX - r.priority),
-//               r.range[0][LowDim], r.range[0][HighDim], r.prefix_length[0],
-//               r.range[1][LowDim], r.range[1][HighDim], r.prefix_length[1],
-//               r.range[2][LowDim], r.range[2][HighDim], r.prefix_length[2]
-//             );
-//         }
-//         puts("=== end of rules ===");
-//         break;
-//       }
-
-//       default:
-//         break;
-//     }
-// }
-
-
-
-
-} /* extern "C" */
+}
