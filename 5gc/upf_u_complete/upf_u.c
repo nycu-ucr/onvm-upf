@@ -45,6 +45,7 @@
 #include "list.h"
 
 #include "../classifiers/upf_cls_adapter.h"
+#include "../classifiers/classifier_wrapper.h"
 
 
 #define NF_TAG "upf_u"
@@ -69,6 +70,7 @@
 #define IP_MASKED(BIGENDIINT, LEN) (BIGENDIINT & (0xFFFFFFFF << (32-LEN)))
 #define MAX_UE 256 // Max number of UEs
 #define MIN(x, y) (((x) < (y)) ? (x) : (y))
+#define MAX_OF_BUFFER_PACKET_SIZE 30000
 
 /* mask for 20-bit IPv6 flow label */
 #ifndef IPV6_FLOWLABEL_MASK
@@ -83,6 +85,63 @@ uint8_t DnMac[RTE_ETHER_ADDR_LEN];
 uint8_t AnMac[RTE_ETHER_ADDR_LEN];
 int SELF_IP;
 
+struct rte_meter_trtcm_profile app_trtcm_profile;
+struct rte_meter_trtcm_profile app_flow_trtcm_profile;
+struct rte_meter_trtcm app_flows[APP_FLOWS_MAX];
+
+struct rte_mbuf *buffer[MAX_OF_BUFFER_PACKET_SIZE];
+uint32_t buffer_length = 0;
+
+/* trTCM */
+struct rte_meter_trtcm_params app_trtcm_params = {
+	.cir = 125000,    // bytes per secs
+	.pir = 625000,    // bytes per secs
+	.cbs = 2048,
+	.pbs = 2048
+};
+
+
+/* Flow Separation*/
+struct flow_entry {
+    uint32_t subnet;  // (Network & Mask_bits)
+    int flow_idx;     // maps to trTCM flows table
+    bool in_use;      // to track if the slot is occupied
+}typedef flow_entry_t;
+flow_entry_t iPFlows[APP_FLOWS_MAX];
+uint32_t iPFlowsLen = 0;
+uint32_t trTCMidx = 0; 
+
+
+bool ftAddEntry(uint32_t subnet, int flow_idx) {
+    if (iPFlowsLen >= APP_FLOWS_MAX) {
+        printf("Error: Maximum flow entries reached.\n");
+        return false;
+    }
+
+    if (ftSearch(subnet) != -1) {
+        printf("Error: Subnet %u already exists.\n", subnet);
+        return false;
+    }
+
+    int index = hashFunc(subnet);
+    while (iPFlows[index].in_use) {         // Linear Probing
+        index = (index + 1) % APP_FLOWS_MAX;
+    }
+
+    // Insert the entry
+    iPFlows[index].subnet = subnet;
+    iPFlows[index].flow_idx = flow_idx;
+    iPFlows[index].in_use = true;
+    iPFlowsLen++;
+    
+    return true;
+}
+
+const char *ip4(uint32_t host_ip) {
+    static char buf[16];
+    struct in_addr a = { .s_addr = htonl(host_ip) };
+    return inet_ntop(AF_INET, &a, buf, sizeof(buf)) ? buf : "<err>";
+}
 
 static inline void
 ConfigureQerFlows(UpfSession *session,
@@ -234,9 +293,6 @@ parseMAC(const char *config_path) {
     fclose(file);
 };
 
-#define MAX_OF_BUFFER_PACKET_SIZE 30000
-struct rte_mbuf *buffer[MAX_OF_BUFFER_PACKET_SIZE];
-uint32_t buffer_length = 0;
 
 
 static inline int SourceInterfaceToPort(source_interface_t srcIf) {
@@ -272,16 +328,7 @@ static inline source_interface_t PortToSourceInterface(uint8_t port) {
 }
 
 
-/* trTCM */
-struct rte_meter_trtcm_params app_trtcm_params = {
-	.cir = 125000,    // bytes per secs
-	.pir = 625000,    // bytes per secs
-	.cbs = 2048,
-	.pbs = 2048
-};
-struct rte_meter_trtcm_profile app_trtcm_profile;
-struct rte_meter_trtcm_profile app_flow_trtcm_profile;
-struct rte_meter_trtcm app_flows[APP_FLOWS_MAX];
+
 
 static int
 trtcmConfigFlowTables(void){
@@ -356,16 +403,6 @@ trtcmPolicer(struct onvm_pkt_meta *meta, int color_result){
     return 0;
 }
 
-/* Flow Separation*/
-struct flow_entry {
-    uint32_t subnet;  // (Network & Mask_bits)
-    int flow_idx;     // maps to trTCM flows table
-    bool in_use;      // to track if the slot is occupied
-}typedef flow_entry_t;
-flow_entry_t iPFlows[APP_FLOWS_MAX];
-uint32_t iPFlowsLen = 0;
-uint32_t trTCMidx = 0; 
-
 uint32_t charStr2MaskedIP(char *str, uint32_t *prefix_val){
     char ip_str[INET_ADDRSTRLEN];
     uint32_t prefix_len, subnet;
@@ -400,30 +437,7 @@ int ftSearch(uint32_t subnet) {
     return -1;  // Not found
 }
 
-bool ftAddEntry(uint32_t subnet, int flow_idx) {
-    if (iPFlowsLen >= APP_FLOWS_MAX) {
-        printf("Error: Maximum flow entries reached.\n");
-        return false;
-    }
 
-    if (ftSearch(subnet) != -1) {
-        printf("Error: Subnet %u already exists.\n", subnet);
-        return false;
-    }
-
-    int index = hashFunc(subnet);
-    while (iPFlows[index].in_use) {         // Linear Probing
-        index = (index + 1) % APP_FLOWS_MAX;
-    }
-
-    // Insert the entry
-    iPFlows[index].subnet = subnet;
-    iPFlows[index].flow_idx = flow_idx;
-    iPFlows[index].in_use = true;
-    iPFlowsLen++;
-    
-    return true;
-}
 
 void ftInit() {
     for (int i = 0; i < APP_FLOWS_MAX; i++) {
@@ -585,10 +599,12 @@ GetPdrByUeIpAddress(struct rte_mbuf *pkt, uint32_t ue_ip)
     key.source_if = PortToSourceInterface(pkt->port);
 
 
+    // not printing key.ue_pref
+
     UTLT_Debug("DL key → teid=%u UE_IP=%s/%u sport=%u dport=%u proto=%u "
                "spi=%u flow_label=%u ni=0x%08x qfi=%u srcIf=%u",
         key.teid,
-        ip4(key.ue_ip), key.ue_pref,
+        ip4(key.ue_ip), 
         key.src_port, key.dst_port,
         key.proto,
         key.spi,
@@ -604,7 +620,7 @@ GetPdrByUeIpAddress(struct rte_mbuf *pkt, uint32_t ue_ip)
     if (!pdr) return NULL;
 
     /* ── 3) QER processing ───────────────────────────────────── */
-    UpfSession *session = UpfSessionFindByUeIp(ue_ip);
+    UpfSession *session = UpfSessionFindByUeIP(ue_ip);
     if (session) {
         ConfigureQerFlows(session, pdr, pkt->port, key.ue_ip, false);
     }
@@ -702,7 +718,7 @@ GetPdrByTeid(struct rte_mbuf *pkt, uint32_t td)
     key.qfi = 0;  // default: wildcard
 
     // If GTP-U Extension Headers are present, walk the chain looking for type 0x85
-    if (gh->flags & GTPU_EXT_HDR_FLAG) {
+    if (gh->e) {
         // start parsing right after the fixed GTP-U header... extp now points to the first extension header
         uint8_t *extp = (uint8_t *)gh + sizeof(struct rte_gtp_hdr); 
         uint8_t *pkt_end = rte_pktmbuf_mtod(pkt, uint8_t *) + pkt->data_len;  // end of the packet buffer
@@ -738,14 +754,17 @@ GetPdrByTeid(struct rte_mbuf *pkt, uint32_t td)
     /* Source Interface */
     key.source_if = PortToSourceInterface(pkt->port);
 
+
+    // not printing - key.ue_pref, key.src_pref, key.dst_pref,
     UTLT_Debug("UL key → teid=%u UE_IP=%s/%u SRC_IP=%s/%u DST_IP=%s/%u "
                "sport=%u dport=%u proto=%u tos=%u spi=%u flow_label=%u "
                "ni=0x%08x qfi=%u srcIf=%u",
         key.teid,
-        ip4(key.ue_ip),   key.ue_pref,
-        ip4(key.src_ip),  key.src_pref,
-        ip4(key.dst_ip),  key.dst_pref,
-        key.src_port,     key.dst_port,
+        ip4(key.ue_ip),   
+        ip4(key.src_ip),  
+        ip4(key.dst_ip),  
+        key.src_port,
+        key.dst_port,
         key.proto,
         key.tos_tc,
         key.spi,

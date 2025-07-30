@@ -6,8 +6,8 @@
 #define HashMult 33
 
 
-#ifndef hash_add
-static inline uint32_t hash_add(uint32_t h, uint32_t v)
+#ifndef tss_hash_add
+static inline uint32_t tss_hash_add(uint32_t h, uint32_t v)
 {  /* tiny Bernstein mix, identical to OVS helpers */
     h += v;  h += (h << 10);  h ^= (h >> 6);
     return h;
@@ -153,7 +153,7 @@ bool inline Tuple::IsPacketMatchToRule(const Packet& p, const Rule& r) {
 uint32_t inline Tuple::HashRule(const Rule& r) const {
 	uint32_t hash = 0;
 	for (size_t i = 0; i < dims.size(); i++) {
-		hash = hash_add(hash, r.range[dims[i]][LowDim]);
+		hash = tss_hash_add(hash, r.range[dims[i]][LowDim]);
 	}
 	return hash_finish(hash, 16);
 
@@ -173,7 +173,7 @@ uint32_t inline Tuple::HashPacket(const Packet& p) const {
 
 	for (size_t i = 0; i < dims.size(); i++) {
 		uint32_t mask = lengths[i] != 32 ? ~(max_uint >> lengths[i]) : max_uint;
-		hash = hash_add(hash, p[dims[i]] & mask);
+		hash = tss_hash_add(hash, p[dims[i]] & mask);
 	}
 	return hash_finish(hash, 16);
 

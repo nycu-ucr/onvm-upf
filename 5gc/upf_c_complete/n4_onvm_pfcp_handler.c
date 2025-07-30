@@ -1052,7 +1052,7 @@ Status UpfN4HandleRemovePdr(UpfSession *session, uint16_t nPDRID) {
     UpfPDR *upfPdr = d.pdr;   /* pointer to the removed PDR */
     
     if (upf_cls_del_pdr(upfPdr) != 0) {
-        UTLT_Warn("Classifier delete failed (not found) for PDRId=%u", pdrID);      
+        UTLT_Warning("Classifier delete failed (not found) for PDRId=%u", pdrID);      
     }
 
     rte_free(upfPdr);

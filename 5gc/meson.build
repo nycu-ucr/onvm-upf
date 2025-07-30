@@ -1,6 +1,3 @@
-project('5gc', 'c')
-
-
 subdir('classifiers')
 
 

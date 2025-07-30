@@ -1,5 +1,3 @@
-# project('openNetVM', 'c', default_options: ['default_library=both'])
-
 project('openNetVM',
         ['c', 'cpp'],
         default_options: [

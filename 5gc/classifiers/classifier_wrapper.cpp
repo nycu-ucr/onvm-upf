@@ -1,28 +1,47 @@
 #include <climits>
 #include <cinttypes>
+#include <cstdio>
+#include <arpa/inet.h>
 
 #include "classifier_wrapper.h"
 #include "ElementaryClasses.h"
+
 #include "PartitionSort/PartitionSort.h"
 #include "TupleSpaceSearch/TupleSpaceSearch.h"
-#include "../../onvm/updk/updk/rule_pdr.h"
 
+/*────────────────── Handle definition (compile-time variant) ─────────────*/
+#if CLS_SELECTED_BACKEND == CLS_BACKEND_PS
+struct cls_handle_t { PartitionSort *ps; };
+#elif CLS_SELECTED_BACKEND == CLS_BACKEND_TSS
+struct cls_handle_t { TupleSpaceSearch *tss; };
+#else /* CLS_BACKEND_PTSS */
+struct cls_handle_t { PriorityTupleSpaceSearch *ptss; };
+#endif
 
+/*────────────────── Construction ─────────────────────────────────────────*/
+cls_handle_t *cls_create(cls_backend_t)
+{
+    static cls_handle_t h;
+#if CLS_SELECTED_BACKEND == CLS_BACKEND_PS
+    h.ps  = new PartitionSort();
+#elif CLS_SELECTED_BACKEND == CLS_BACKEND_TSS
+    h.tss = new TupleSpaceSearch();
+#else
+    h.ptss = new PriorityTupleSpaceSearch();
+#endif
+    return &h;
+}
 
-struct cls_handle_t{
-    cls_backend_t which;                  /* which engine is active  */
-    PartitionSort            *ps  = nullptr;
-    TupleSpaceSearch         *tss = nullptr;
-    PriorityTupleSpaceSearch *ptss= nullptr;
-};
-
+/*────────────────── Helpers ------------------------------------------------*/
 static inline std::pair<uint32_t,uint32_t>
-ip_range(uint32_t ip, uint8_t len) {
-    uint32_t mask = len ? (len == 32 ? 0xFFFFFFFFu
-                                     : 0xFFFFFFFFu << (32-len))
+ip_range(uint32_t ip, uint8_t len)
+{
+    uint32_t mask = len ? (len == 32
+                           ? 0xFFFFFFFFu
+                           : 0xFFFFFFFFu << (32 - len))
                         : 0;
-    uint32_t low  = ip & mask;
-    return {low, low | ~mask};
+    uint32_t lo = ip & mask;
+    return {lo, lo | ~mask};
 }
 
 static Rule to_cpp_rule(const pdr_t *in)
@@ -71,6 +90,9 @@ static Rule to_cpp_rule(const pdr_t *in)
     return R;
 }
 
+
+
+
 static Packet to_cpp_pkt(const ps_packet_t *p)
 {
     Packet P(PDI_MAX_FLD);
@@ -90,187 +112,80 @@ static Packet to_cpp_pkt(const ps_packet_t *p)
     return P;
 }
 
-/*------------------------------------------------------------------*/
-/*  Opaque handle                                                   */
-/*------------------------------------------------------------------*/
-// struct cls_handle_t {
-//     cls_backend_t which;
-//     PartitionSort            *ps  = nullptr;
-//     TupleSpaceSearch         *tss = nullptr;
-//     PriorityTupleSpaceSearch *ptss= nullptr;
-// };
-
-/*------------------------------------------------------------------*/
-/*  C API                                                           */
-/*------------------------------------------------------------------*/
+/*────────────────── C API (extern \"C\") ─────────────────────────────────*/
 extern "C" {
 
-// cls_handle_t *cls_create(cls_backend_t w)
-// {
-//     try {
-//         auto *h = new cls_handle_t;
-//         h->which = w;
-//         if (w == CLS_BACKEND_PS)
-//             h->ps  = new PartitionSort();
-//         else
-//             h->tss = new TupleSpaceSearch();
-//         return h;
-//     } catch (...) { return nullptr; }
-// }
-
-cls_handle_t* cls_create(cls_backend_t which)
-{
-    auto *h = new cls_handle_t{};
-    h->which = which;
-    try {
-        if (which == CLS_BACKEND_PS) {
-            h->ps  = new PartitionSort;
-        }
-        else if (which == CLS_BACKEND_TSS) {
-            h->tss = new TupleSpaceSearch;
-        }
-        else {
-            h->ptss = new PriorityTupleSpaceSearch;
-        }
-        return h;
-    } catch (...) { 
-        delete h; 
-        return nullptr; 
-    }
-}
-
-
+/* destroy ----------------------------------------------------------------*/
 void cls_destroy(cls_handle_t *h)
 {
     if (!h) return;
+#if CLS_SELECTED_BACKEND == CLS_BACKEND_PS
     delete h->ps;
+#elif CLS_SELECTED_BACKEND == CLS_BACKEND_TSS
     delete h->tss;
+#else
     delete h->ptss;
-    delete h;
+#endif
 }
 
 uintptr_t cls_insert_rule(cls_handle_t *h, const pdr_t *r)
 {
     if (!h || !r) return 0;
-
     Rule R = to_cpp_rule(r);
-
-    switch (h->which) {
-
-    case CLS_BACKEND_PS:
-        return h->ps->InsertRuleReturnDescriptor(R);
-
-    case CLS_BACKEND_TSS:
-        try {
-            h->tss->InsertRule(R);
-            return R.descriptor;
-        } catch (const std::bad_alloc&) {
-            return 0;
-        }
-
-    case CLS_BACKEND_PTSS:
-        try {
-            h->ptss->InsertRule(R);
-            return R.descriptor;
-        } catch (const std::bad_alloc&) {
-            return 0;
-        }
-
-    default:
-        return 0;
+#if CLS_SELECTED_BACKEND == CLS_BACKEND_PS
+    return h->ps->InsertRuleReturnDescriptor(R);
+#elif CLS_SELECTED_BACKEND == CLS_BACKEND_TSS
+    try { 
+        h->tss->InsertRule(R); 
+    } catch (const std::bad_alloc&) { 
+        return 0; 
     }
+    return R.descriptor;
+#else
+    try {
+        h->ptss->InsertRule(R); 
+    } catch (const std::bad_alloc&) {
+        return 0; 
+    }
+    return R.descriptor;
+#endif
 }
 
 
 int cls_delete_rule_by_descriptor(cls_handle_t *h, uintptr_t d)
 {
     if (!h) return -1;
-
-    if (h->which == CLS_BACKEND_PS)
-        return h->ps->DeleteRuleByDescriptor(d) ? 0 : -1;
-    if (h->which == CLS_BACKEND_TSS)
-        return h->tss->DeleteRuleByDescriptor(d) ? 0 : -1;
-    
+#if CLS_SELECTED_BACKEND == CLS_BACKEND_PS
+    return h->ps->DeleteRuleByDescriptor(d) ? 0 : -1;
+#elif CLS_SELECTED_BACKEND == CLS_BACKEND_TSS
+    return h->tss->DeleteRuleByDescriptor(d) ? 0 : -1;
+#else
     return h->ptss->DeleteRuleByDescriptor(d) ? 0 : -1;
+#endif
 }
-
 
 
 int cls_classify_packet(
-    cls_handle_t *h,
-    const ps_packet_t *p,
-    uint32_t *precedence_out,
-    uintptr_t *descriptor_out
-) {
+        cls_handle_t       *h,
+        const ps_packet_t  *p,
+        uint32_t           *prec_out,
+        uintptr_t          *desc_out)
+{
     if (!h || !p) return -1;
+#if CLS_SELECTED_BACKEND == CLS_BACKEND_PS
+    MatchResult m = h->ps->ClassifyAPacketMod(to_cpp_pkt(p));
+#elif CLS_SELECTED_BACKEND == CLS_BACKEND_TSS
+    MatchResult m = h->tss->ClassifyAPacketMod(to_cpp_pkt(p));
+#else
+    MatchResult m = h->ptss->ClassifyAPacketMod(to_cpp_pkt(p));
+#endif
+    if (m.priority < 0) return 0;          /* no match */
 
-    if (h->which == CLS_BACKEND_PS) {
-        MatchResult m = h->ps->ClassifyAPacketMod(to_cpp_pkt(p));
-        if (m.priority < 0) {
-            return 0;
-        }
-        if (precedence_out) {
-            *precedence_out  = (uint32_t)(INT32_MAX - m.priority);
-        }
-        if (descriptor_out) {
-            *descriptor_out  = m.descriptor;
-        }  
-        return 1;
-
-    } else if (h->which == CLS_BACKEND_TSS) {
-        MatchResult m = h->tss->ClassifyAPacketMod(to_cpp_pkt(p));
-        if (m.priority < 0) return 0;
-        if (precedence_out) *precedence_out = (uint32_t)(INT32_MAX - m.priority);
-        if (descriptor_out) *descriptor_out = m.descriptor;
-        return 1;
-    } else {
-        MatchResult m = h->ptss->ClassifyAPacketMod(to_cpp_pkt(p));
-        if (m.priority < 0) return 0;
-        if (precedence_out) *precedence_out = (uint32_t)(INT32_MAX - m.priority);
-        if (descriptor_out) *descriptor_out = m.descriptor;
-        return 1;
-    }
+    if (prec_out) *prec_out  = (uint32_t)(INT32_MAX - m.priority);
+    if (desc_out) *desc_out  = m.descriptor;
+    return 1;
 }
 
-// void cls_print_all_rules(cls_handle_t *h)
-// {
-//     if (!h) return;
-
-//     switch (h->which) {
-//       case CLS_BACKEND_PS:
-//         h->ps->PrintAllRules();
-//         break;
-
-//       case CLS_BACKEND_TSS: {
-//         auto rules = h->tss->SerializeIntoRules();
-//         printf("=== TupleSpaceSearch: %zu rules ===\n", rules.size());
-//         for (size_t i = 0; i < rules.size(); ++i) {
-//             printf("Rule[%2zu] desc=0x%" PRIxPTR "  prec=%u\n",
-//                    i,
-//                    rules[i].descriptor,
-//                    (uint32_t)(INT32_MAX - rules[i].priority));
-//         }
-//         puts("=== end of rules ===");
-//         break;
-//       }
-
-//       case CLS_BACKEND_PTSS: {
-//         auto rules = h->ptss->SerializeIntoRules();
-//         printf("=== PriorityTupleSearch: %zu rules ===\n", rules.size());
-//         for (size_t i = 0; i < rules.size(); ++i) {
-//             printf("Rule[%2zu] desc=0x%" PRIxPTR "  prec=%u\n",
-//                    i,
-//                    rules[i].descriptor,
-//                    (uint32_t)(INT32_MAX - rules[i].priority));
-//         }
-//         puts("=== end of rules ===");
-//         break;
-//       }
-
-//       default:
-//         break;
-//     }
-// }
 
 
 static void print_cidr(uint32_t host_ip, unsigned prefix) {
@@ -284,16 +199,12 @@ static void print_cidr(uint32_t host_ip, unsigned prefix) {
 }
 
 
-void cls_print_all_rules(cls_handle_t *h)
-{
-    if (!h) return;
-
-    switch (h->which) {
-      case CLS_BACKEND_PS:
-        h->ps->PrintAllRules();
-        break;
-
-      case CLS_BACKEND_TSS: {
+void cls_print_all_rules(cls_handle_t *h) {
+    
+#if CLS_SELECTED_BACKEND == CLS_BACKEND_PS
+    if (h && h->ps)   h->ps->PrintAllRules();
+#elif CLS_SELECTED_BACKEND == CLS_BACKEND_TSS
+    if (h && h->tss) {
         auto rules = h->tss->SerializeIntoRules();
         printf("=== TupleSpaceSearch: %zu rules ===\n", rules.size());
         for (size_t i = 0; i < rules.size(); ++i) {
@@ -309,11 +220,10 @@ void cls_print_all_rules(cls_handle_t *h)
         }
         puts("=== end of rules ===");
         break;
-      }
-
-      case CLS_BACKEND_PTSS: {
+    }
+#else
+    if (h && h->ptss) {
         auto rules = h->ptss->SerializeIntoRules();
-        printf("=== PriorityTupleSearch: %zu rules ===\n", rules.size());
         for (size_t i = 0; i < rules.size(); ++i) {
             const auto &r = rules[i];
             uint32_t prec = (uint32_t)(INT32_MAX - r.priority);
@@ -327,11 +237,9 @@ void cls_print_all_rules(cls_handle_t *h)
         }
         puts("=== end of rules ===");
         break;
-      }
-
-      default:
-        break;
     }
+#endif
 }
 
-}
+
+} /* extern \"C\" */

@@ -188,7 +188,7 @@ Status UpfPDRDeregisterToSessionByID(UpfSession *session, uint16_t id);
 Status UpfFARDeregisterToSessionByID(UpfSession *session, uint16_t id);
 Status UpfQERDeregisterToSessionByID(UpfSession *session, uint16_t id);//implement//V
 
-UpfDeregResult UpfPDRDeregisterToSessionByIDEx(UpfSession *session, uint16_t id)
+UpfDeregResult UpfPDRDeregisterToSessionByIDEx(UpfSession *session, uint16_t id);
 
 #ifdef __cplusplus
 }
