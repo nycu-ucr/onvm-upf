@@ -283,8 +283,32 @@ Status UpfN4HandleCreatePdr(UpfSession *session, CreatePDR *createPdr) {
                 rte_free(upfPdr);
                 return STATUS_ERROR,
                 "UpfPDRRegisterToSession failed");
+
+    bool is_uplink = false;     // default to downlink / CORE 
+
+    if (upfPdr->flags.pdi && upfPdr->pdi.flags.sourceInterface) {
+
+        switch (upfPdr->pdi.source_if) {
+        case 0:        
+            // N3 side (Uplink: UE → UPF)  
+            is_uplink = true;  
+            break;
+        case 1:
+            // N6 side  (Downlink: DN → UE)
+            is_uplink = false;
+            break;
+
+        default:  // unexpected value ⇒ treating as downlink
+            UTLT_Warning("CreatePDR: unexpected SourceInterface=%u – treating as CORE",
+                        upfPdr->pdi.source_if);
+            break;
+        }
+    } else {
+        /* Spec violation: Source-Interface missing – assume downlink */
+        UTLT_Warning("CreatePDR: SourceInterface IE missing – treating as CORE");
+    }
     
-    uintptr_t desc = upf_cls_add_pdr(upfPdr);
+    uintptr_t desc = upf_cls_add_pdr(upfPdr, is_uplink);
 
     if (desc == 0) {
         UTLT_Error("Classifier insert failed for PDRId=%u", upfPdr->pdrId);

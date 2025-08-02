@@ -596,12 +596,14 @@ GetPdrByUeIpAddress(struct rte_mbuf *pkt, uint32_t ue_ip)
     key.ni_hash = 0;    // packet is not GTP‑encapsulated
     key.qfi = 0;        // no QFI in plain-IP downlink path
 
-    key.source_if = PortToSourceInterface(pkt->port);
+    //key.source_if = PortToSourceInterface(pkt->port);
 
+    key.source_if = SRC_IF_CORE;
+    key.is_uplink = false;
 
-    // not printing key.ue_pref
-
-    UTLT_Debug("DL key → teid=%u UE_IP=%s/%u sport=%u dport=%u proto=%u "
+    printf("DBG2: srcIf=%u (port=%u)\n", key.source_if, pkt->port);
+    
+    /* UTLT_Debug("DL key → teid=%u UE_IP=%s/%u sport=%u dport=%u proto=%u "
                "spi=%u flow_label=%u ni=0x%08x qfi=%u srcIf=%u",
         key.teid,
         ip4(key.ue_ip), 
@@ -612,7 +614,7 @@ GetPdrByUeIpAddress(struct rte_mbuf *pkt, uint32_t ue_ip)
         key.ni_hash,
         key.qfi,
         (unsigned)key.source_if
-    );
+    ); */
 
 
     /* ── 2) Classifier lookup ─────────────────────────────────── */
@@ -717,6 +719,8 @@ GetPdrByTeid(struct rte_mbuf *pkt, uint32_t td)
 
     key.qfi = 0;  // default: wildcard
 
+    key.is_uplink = true;
+
     // If GTP-U Extension Headers are present, walk the chain looking for type 0x85
     if (gh->e) {
         // start parsing right after the fixed GTP-U header... extp now points to the first extension header
@@ -752,11 +756,13 @@ GetPdrByTeid(struct rte_mbuf *pkt, uint32_t td)
 
 
     /* Source Interface */
-    key.source_if = PortToSourceInterface(pkt->port);
+    // key.source_if = PortToSourceInterface(pkt->port);
+    key.source_if = SRC_IF_ACCESS;
 
+    printf("DBG: srcIf=%u (port=%u)\n", key.source_if, pkt->port);
 
     // not printing - key.ue_pref, key.src_pref, key.dst_pref,
-    UTLT_Debug("UL key → teid=%u UE_IP=%s/%u SRC_IP=%s/%u DST_IP=%s/%u "
+    /* UTLT_Debug("UL key → teid=%u UE_IP=%s/%u SRC_IP=%s/%u DST_IP=%s/%u "
                "sport=%u dport=%u proto=%u tos=%u spi=%u flow_label=%u "
                "ni=0x%08x qfi=%u srcIf=%u",
         key.teid,
@@ -772,8 +778,7 @@ GetPdrByTeid(struct rte_mbuf *pkt, uint32_t td)
         key.ni_hash,
         key.qfi,
         (unsigned)key.source_if
-    );
-
+    ); */
 
     /* 2) Fast‐path lookup only */
     const UPDK_PDR *pdr = upf_cls_lookup(&key);
@@ -783,6 +788,7 @@ GetPdrByTeid(struct rte_mbuf *pkt, uint32_t td)
 
     /* 3) QER configuration (unchanged) */
     UpfSession *session = UpfSessionFindByTeid(td);
+    printf("DBG: session=%p\n", (void*)session);
     if (session) {
         ConfigureQerFlows(session, pdr, pkt->port, key.ue_ip, true);
     }

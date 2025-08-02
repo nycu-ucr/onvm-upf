@@ -151,7 +151,7 @@ struct cmap_node {
           desc(r.descriptor),
           next(nullptr) {}
     
-    cmap_node() : priority(0), desc(0), rule_ptr(), next(nullptr) {}
+    cmap_node(): key(0), priority(0), rule_ptr(), desc(0), next(nullptr) {}
 
     unsigned          key;
     int               priority;

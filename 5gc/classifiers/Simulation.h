@@ -106,7 +106,7 @@ struct Bookkeeper {
 			return Rule();
 		}
 		Rule to_return = rules[i];
-		if (i != rules.size() - 1) rules[i] = std::move(rules[rules.size() - 1]);
+		if ((size_t)i != rules.size() - 1) rules[i] = std::move(rules[rules.size() - 1]);
 		rules.pop_back();
 		return to_return;
 	}

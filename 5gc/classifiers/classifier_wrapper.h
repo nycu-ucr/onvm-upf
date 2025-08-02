@@ -6,23 +6,24 @@
 
 #include "../../onvm/updk/updk/rule_pdr.h"
 
-/*────────────────── Classifier back-end list & compile-time pick ──────────*/
+
 typedef enum {
     CLS_BACKEND_PS,      /* PartitionSort        */
     CLS_BACKEND_TSS,     /* Tuple-Space-Search   */
     CLS_BACKEND_PTSS     /* Parallel-TSS variant */
 } cls_backend_t;
 
-/* Change here or pass  -DCLS_SELECTED_BACKEND=CLS_BACKEND_TSS  etc. */
+
 #ifndef CLS_SELECTED_BACKEND
 #define CLS_SELECTED_BACKEND CLS_BACKEND_PS
 #endif
 
 /*────────────────── Constants ─────────────────────────────────────────────*/
-#define PDI_MAX_FLD 13
-#define ANY32 0xFFFFFFFFu
+#define PDI_MAX_FLD 14
+
+/* #define ANY32 0xFFFFFFFFu
 #define ANY16 0xFFFFu
-#define ANY8  0xFFu
+#define ANY8  0xFFu */
 
 /*────────────────── Core data types ──────────────────────────────────────*/
 typedef enum {
@@ -56,7 +57,8 @@ typedef struct {
     uint16_t  pdr_id;
     uint32_t  precedence;
     pdi_t     pdi;
-    uintptr_t descriptor;       /* back-pointer to original UPDK_PDR */
+    uintptr_t descriptor;       // back-pointer to original UPDK_PDR
+    bool is_uplink;             // traffic direction flag
 } pdr_t;
 
 /* Flat packet view -------------------------------------------------------*/
@@ -67,6 +69,7 @@ typedef struct {
     uint32_t spi, flow_label;
     uint32_t teid, source_if, ni_hash;
     uint8_t  qfi;
+    uint8_t  is_uplink;
 } ps_packet_t;
 
 /* Opaque classifier handle ----------------------------------------------*/

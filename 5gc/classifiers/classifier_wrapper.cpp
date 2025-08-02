@@ -33,9 +33,15 @@ cls_handle_t *cls_create(cls_backend_t)
 }
 
 /*────────────────── Helpers ------------------------------------------------*/
-static inline std::pair<uint32_t,uint32_t>
-ip_range(uint32_t ip, uint8_t len)
-{
+
+static inline std::string ip4(uint32_t host_ip) {
+    struct in_addr in { htonl(host_ip) };
+    char buf[INET_ADDRSTRLEN];
+    return inet_ntop(AF_INET, &in, buf, sizeof(buf)) ? buf : "<invalid>";
+}
+
+
+static inline std::pair<uint32_t,uint32_t> ip_range(uint32_t ip, uint8_t len) {
     uint32_t mask = len ? (len == 32
                            ? 0xFFFFFFFFu
                            : 0xFFFFFFFFu << (32 - len))
@@ -46,47 +52,134 @@ ip_range(uint32_t ip, uint8_t len)
 
 static Rule to_cpp_rule(const pdr_t *in)
 {
+    
+    printf("=================6======================");
+
+    char ue_buf[INET_ADDRSTRLEN];
+    char src_buf[INET_ADDRSTRLEN];
+    char dst_buf[INET_ADDRSTRLEN];
+
+    struct in_addr tmp;
+
+    /* UE-IP ------------------------------------------------------------ */
+    tmp.s_addr = htonl(in->pdi.ue_ip.s_addr);       /* convert to network order */
+    inet_ntop(AF_INET, &tmp, ue_buf, sizeof(ue_buf));
+
+    /* SRC-IP ----------------------------------------------------------- */
+    tmp.s_addr = htonl(in->pdi.src_ip.s_addr);
+    inet_ntop(AF_INET, &tmp, src_buf, sizeof(src_buf));
+
+    /* DST-IP ----------------------------------------------------------- */
+    tmp.s_addr = htonl(in->pdi.dst_ip.s_addr);
+    inet_ntop(AF_INET, &tmp, dst_buf, sizeof(dst_buf));
+
+    printf(
+    "DBG→to_cpp_rule in: pdr_id=%u  precedence=%u  descriptor=0x%lx\n"
+    "             UE_IP=%s/%u  SRC_IP=%s/%u  DST_IP=%s/%u\n"
+    "             sport=%u  dport=%u  proto=%u  tos=%u\n"
+    "             spi=%u  flow_label=%u\n"
+    "             teid=%u  source_if=%u  ni_hash=0x%08x  qfi=%u\n",
+    in->pdr_id, in->precedence, (unsigned long)in->descriptor,
+    ue_buf,  in->pdi.ue_pref,
+    src_buf, in->pdi.src_pref,
+    dst_buf, in->pdi.dst_pref,
+    in->pdi.src_port, in->pdi.dst_port, in->pdi.proto, in->pdi.tos_tc,
+    in->pdi.spi, in->pdi.flow_label,
+    in->pdi.teid, in->pdi.source_if, in->pdi.ni_hash, in->pdi.qfi
+    );
+    
+
+    
     Rule R(PDI_MAX_FLD);
 
-    /* UE / SRC / DST IPs ------------------------------------------------- */
-    {
-        auto box = ip_range(ntohl(in->pdi.ue_ip.s_addr), in->pdi.ue_pref);
-        R.range[0] = {{ box.first, box.second }};
+    for (int d = 0; d < PDI_MAX_FLD; ++d) {
+        R.range[d]         = {{ 0, 0xFFFFFFFFu }};  // UINT32_MAX
+        R.prefix_length[d] = 0;  // /0 → match any
+    }
+
+
+    if (in->pdi.ue_pref) {
+        auto box = ip_range(in->pdi.ue_ip.s_addr, in->pdi.ue_pref);
+        R.range[0]         = {{ box.first, box.second }};
         R.prefix_length[0] = in->pdi.ue_pref;
     }
-    {
-        auto box = ip_range(ntohl(in->pdi.src_ip.s_addr), in->pdi.src_pref);
-        R.range[1] = {{ box.first, box.second }};
+
+    if (in->pdi.src_pref) {
+        auto box = ip_range(in->pdi.src_ip.s_addr, in->pdi.src_pref);
+        R.range[1]         = {{ box.first, box.second }};
         R.prefix_length[1] = in->pdi.src_pref;
     }
-    {
-        auto box = ip_range(ntohl(in->pdi.dst_ip.s_addr), in->pdi.dst_pref);
-        R.range[2] = {{ box.first, box.second }};
+
+    if (in->pdi.dst_pref) {
+        auto box = ip_range(in->pdi.dst_ip.s_addr, in->pdi.dst_pref);
+        R.range[2]         = {{ box.first, box.second }};
         R.prefix_length[2] = in->pdi.dst_pref;
     }
 
-    /* scalar equals  (src/dst port, proto, tos, spi, flow-label) --------- */
-    const uint32_t scalars[6] = {
-        in->pdi.src_port,  in->pdi.dst_port,
-        in->pdi.proto,     in->pdi.tos_tc,
-        in->pdi.spi,       in->pdi.flow_label
-    };
-    for (int d = 3; d <= 8; ++d) {
-        R.range[d] = {{ scalars[d-3], scalars[d-3] }};
-        R.prefix_length[d] = 32;
+    if (in->pdi.src_port) {
+        R.range[3]         = {{ in->pdi.src_port, in->pdi.src_port }};
+        R.prefix_length[3] = 32;
     }
 
-    /* TEID / SourceIF / NI-hash ----------------------------------------- */
-    R.range[9]  = {{ in->pdi.teid,      in->pdi.teid }};
-    R.range[10] = {{ (uint8_t)in->pdi.source_if, (uint8_t)in->pdi.source_if }};
-    R.range[11] = {{ in->pdi.ni_hash,   in->pdi.ni_hash }};
-    R.range[12] = {{ in->pdi.qfi, in->pdi.qfi }};
-    R.prefix_length[9]  = R.prefix_length[10] = R.prefix_length[11] = R.prefix_length[12] = 32;
+    if (in->pdi.dst_port) {
+        R.range[4]         = {{ in->pdi.dst_port, in->pdi.dst_port }};
+        R.prefix_length[4] = 32;
+    }
+    if (in->pdi.proto) {
+        R.range[5]         = {{ in->pdi.proto, in->pdi.proto }};
+        R.prefix_length[5] = 32;
+    }
+    if (in->pdi.tos_tc) {
+        R.range[6]         = {{ in->pdi.tos_tc, in->pdi.tos_tc }};
+        R.prefix_length[6] = 32;
+    }
+    if (in->pdi.spi) {
+        R.range[7]         = {{ in->pdi.spi, in->pdi.spi }};
+        R.prefix_length[7] = 32;
+    }
+    if (in->pdi.flow_label) {
+        R.range[8]         = {{ in->pdi.flow_label, in->pdi.flow_label }};
+        R.prefix_length[8] = 32;
+    }
 
-    /* metadata ----------------------------------------------------------- */
+    if (in->pdi.teid) {
+        R.range[9]         = {{ in->pdi.teid, in->pdi.teid }};
+        R.prefix_length[9] = 32;
+    }
+    if (in->pdi.source_if) {
+        R.range[10]        = {{ in->pdi.source_if, in->pdi.source_if }};
+        R.prefix_length[10]= 32;
+    }
+    if (in->pdi.ni_hash) {
+        R.range[11]        = {{ in->pdi.ni_hash, in->pdi.ni_hash }};
+        R.prefix_length[11]= 32;
+    }
+    if (in->pdi.qfi) {
+        R.range[12]        = {{ in->pdi.qfi, in->pdi.qfi }};
+        R.prefix_length[12]= 32;
+    }
+
+    uint32_t v = in->is_uplink ? 1u : 0u;
+    R.range[13]         = {{ v, v }};
+    R.prefix_length[13] = 32;
+
     R.priority   = INT32_MAX - (int)in->precedence;   /* lower wins */
     R.descriptor = in->descriptor;
     R.id         = in->pdr_id;
+
+    
+
+
+    printf("DBG→built C++ Rule: dim=%d\n", R.dim);
+    for (int d = 0; d < R.dim; ++d) {
+        unsigned lo  = R.range[d][0];   // low end
+        unsigned hi  = R.range[d][1];   // high end
+        unsigned pfx = R.prefix_length[d];
+        printf("   dim[%2d] = [%10u … %10u]  /%2u\n",
+               d, lo, hi, pfx);
+    }
+
+    printf("=================8======================");
     return R;
 }
 
@@ -109,6 +202,7 @@ static Packet to_cpp_pkt(const ps_packet_t *p)
     P[10] = p->source_if;
     P[11] = p->ni_hash;
     P[12]  = p->qfi;
+    P[13]  = p->is_uplink;
     return P;
 }
 
@@ -132,18 +226,24 @@ uintptr_t cls_insert_rule(cls_handle_t *h, const pdr_t *r)
 {
     if (!h || !r) return 0;
     Rule R = to_cpp_rule(r);
+    printf("=================50======================");
 #if CLS_SELECTED_BACKEND == CLS_BACKEND_PS
-    return h->ps->InsertRuleReturnDescriptor(R);
+    uintptr_t desc = h->ps->InsertRuleReturnDescriptor(R);
+    printf("DBG=>cls_insert_rule: got descriptor=0x%lx for pdr_id=%u\n",
+       (unsigned long)desc, r->pdr_id);
+    printf("=================51======================");
+    cls_print_all_rules(h);
+    return desc;
 #elif CLS_SELECTED_BACKEND == CLS_BACKEND_TSS
     try { 
-        h->tss->InsertRule(R); 
+        h->tss->InsertRule(R);
     } catch (const std::bad_alloc&) { 
         return 0; 
     }
     return R.descriptor;
 #else
     try {
-        h->ptss->InsertRule(R); 
+        h->ptss->InsertRule(R);
     } catch (const std::bad_alloc&) {
         return 0; 
     }

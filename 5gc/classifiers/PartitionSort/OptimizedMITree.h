@@ -119,16 +119,19 @@ public:
 	bool Empty() const { return priorityContainer.empty(); }
 
 	void ReconstructIfNumRulesLessThanOrEqualTo(int threshold = 10) {
+		printf("=================600======================");
 		if (isMature) return;
 		if (numRules >= threshold) {
 			isMature = true;  return;
 		}
 		//global_counter++;
-		std::vector<Rule> serialized_rules = SerializeIntoRules(); 
+		std::vector<Rule> serialized_rules = SerializeIntoRules();
+		printf("=================601======================\n"); 
 		auto result = SortableRulesetPartitioner::FastGreedyFieldSelectionForAdaptive(serialized_rules);
+		printf("=================602======================\n");
 		if (!result.first) return;
 		if (IsIdenticalVector(fieldOrder, result.second)) return;
-
+		printf("=================603======================");
 		Reset();
 
 		fieldOrder = result.second;
@@ -136,6 +139,7 @@ public:
 		for (const auto & r : serialized_rules) {
 			Insertion(r);
 		}
+		printf("=================604======================");
 	}
 	std::vector<Rule> SerializeIntoRules() const {
 		return RBSerializeIntoRules(root, fieldOrder);

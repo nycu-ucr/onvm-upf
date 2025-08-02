@@ -420,7 +420,6 @@ WeightedInterval SortableRulesetPartitioner::MaximumIndependentSetGivenFieldRecu
 }
 
 
-//////////
 std::pair<std::vector<SortableRulesetPartitioner::part>, int> SortableRulesetPartitioner::FastMWISonPartition(const part& apartition, int field) {
 
 	if (apartition.size() == 0) {
@@ -458,7 +457,7 @@ std::pair<std::vector<SortableRulesetPartitioner::part>, int> SortableRulesetPar
 
 
 
-std::pair<std::vector<SortableRulesetPartitioner::part>, int> SortableRulesetPartitioner::FastMWISonEntirePartition(const std::vector<part>& all_partition, int current_field) {
+/* std::pair<std::vector<SortableRulesetPartitioner::part>, int> SortableRulesetPartitioner::FastMWISonEntirePartition(const std::vector<part>& all_partition, int current_field) {
 	std::vector<part> new_entire_partition;
 	int sum_weight = 0;
 	for (const auto& p : all_partition) {
@@ -467,12 +466,40 @@ std::pair<std::vector<SortableRulesetPartitioner::part>, int> SortableRulesetPar
 		new_entire_partition.insert(end(new_entire_partition), begin(pvi.first), end(pvi.first));
 		sum_weight += pvi.second;
 	}
+
 	return std::make_pair(new_entire_partition, sum_weight);
+} */
+
+
+std::pair<std::vector<SortableRulesetPartitioner::part>, int> SortableRulesetPartitioner::FastMWISonEntirePartition(
+        const std::vector<part>& all_partition,
+        int                      current_field
+	)
+{
+    std::vector<part> new_entire_partition;
+    int sum_weight = 0;
+
+    /* Walk partitions with an explicit index so we can log it. */
+    for (size_t idx = 0; idx < all_partition.size(); ++idx) {
+        const part &part_in = all_partition[idx];
+
+        auto pvi = FastMWISonPartition(part_in, current_field);
+
+        new_entire_partition.insert(end(new_entire_partition),
+                                    begin(pvi.first), end(pvi.first));
+        sum_weight += pvi.second;
+    }
+
+
+
+    return {new_entire_partition, sum_weight};
 }
+
+
+
 
 void SortableRulesetPartitioner::FastBestFieldAndConfiguration(std::vector<part>& all_partition, std::vector<int>& current_field, int num_fields)
 {
-
 	std::vector<SortableRulesetPartitioner::part> best_new_partition;
 	int best_so_far_mwis = -1;
 	int current_best_field = -1;
@@ -480,6 +507,7 @@ void SortableRulesetPartitioner::FastBestFieldAndConfiguration(std::vector<part>
 		if (std::find(begin(current_field), end(current_field), j) == end(current_field)) {
 
 			auto mwis = FastMWISonEntirePartition(all_partition, j);
+
 			if (mwis.second >= best_so_far_mwis) {
 				best_so_far_mwis = mwis.second;
 				current_best_field = j;
@@ -487,8 +515,10 @@ void SortableRulesetPartitioner::FastBestFieldAndConfiguration(std::vector<part>
 			}
 		}
 	}
+
 	all_partition = best_new_partition;
 	current_field.push_back(current_best_field);
+
 }
 
 std::pair<bool, std::vector<int>> SortableRulesetPartitioner::FastGreedyFieldSelectionTwoIterations(const std::vector<Rule>& rules) {
@@ -551,11 +581,11 @@ std::pair<bool, std::vector<int>> SortableRulesetPartitioner::FastGreedyFieldSel
 		printf("Warning: GreedyFieldSelection rule size = 0\n ");
 	}
 	int num_fields = rules[0].dim;
-
 	std::vector<int> current_field;
 	std::vector<part> all_partitions;
 
 	all_partitions.push_back(rules);
+
 	for (int i = 0; i < num_fields; i++) {
 		FastBestFieldAndConfiguration(all_partitions, current_field, num_fields);
 	}
@@ -566,5 +596,19 @@ std::pair<bool, std::vector<int>> SortableRulesetPartitioner::FastGreedyFieldSel
 		}
 	}
 
-	return std::make_pair(all_partitions[0].size() == rules.size(), current_field);
+	bool same_size = false;
+
+	if (!all_partitions.empty()) {
+		same_size = (all_partitions[0].size() == rules.size());
+	} else {
+		printf("DBG: all_partitions is EMPTY at return-point!\n");
+	}
+
+	printf("DBG: all_partitions.size() = %zu  -> same_size = %d\n",
+		all_partitions.size(), same_size);
+
+	return std::make_pair(same_size, current_field);
+
+
+	//return std::make_pair(all_partitions[0].size() == rules.size(), current_field);
 }

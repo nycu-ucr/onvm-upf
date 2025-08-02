@@ -39,31 +39,29 @@ void PartitionSort::InsertRule(const Rule& one_rule) {
 }
 
 uintptr_t PartitionSort::InsertRuleReturnDescriptor(const Rule& one_rule) {
+    printf("=================501======================");
     try {
         for (auto* mitree : mitrees) {
             bool pri_change = false;
             if (mitree->TryInsertion(one_rule, pri_change)) {
                 if (pri_change) InsertionSortMITrees();
                 mitree->ReconstructIfNumRulesLessThanOrEqualTo(10);
-
                 rules.emplace_back(one_rule, mitree);
                 descriptorIndexMap[one_rule.descriptor] = rules.size() - 1;
                 return one_rule.descriptor;
             }
         }
-
         auto* tree_ptr = new OptimizedMITree(one_rule);
         bool dummy = false;
         tree_ptr->TryInsertion(one_rule, dummy);
-
         mitrees.push_back(tree_ptr);
         InsertionSortMITrees();
-
         rules.emplace_back(one_rule, tree_ptr);
 
 		// Populating descriptorIndexMap, so that I can delete by descriptor in O(1)
 
         descriptorIndexMap[one_rule.descriptor] = rules.size() - 1;
+        printf("=================512======================");
         return one_rule.descriptor;
 
     } catch (const std::bad_alloc&) {
@@ -144,10 +142,16 @@ void PartitionSort::PrintAllRules() const {
 
         // print ranges
         printf("   ranges: ");
-        for (int d = 0; d < r.dim; ++d) {
-            printf("[%u–%u] ", r.range[d][0], r.range[d][1]);
-        }
 
+        for (int d = 0; d < r.dim; ++d) {
+            if (d == 13) {
+                bool uplink = (r.range[d][0] == 1);
+                printf("[%s] ", uplink ? "UL" : "DL");
+            } else {
+                printf("[%u–%u] ", r.range[d][0], r.range[d][1]);
+            }
+        }
+        
         // print prefix lengths
         printf("\n   prefixes:");
         for (int d = 0; d < r.dim; ++d) {

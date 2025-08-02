@@ -43,7 +43,7 @@ private:
 
 		// initialize original index locations
 		std::vector<int> idx(v.size());
-		for (int i = 0; i != idx.size(); ++i) idx[i] = i;
+		for (int i = 0; i != static_cast<int>(idx.size()); ++i) idx[i] = i;
 
 		// sort indexes based on comparing values in v
 		sort(idx.begin(), idx.end(),

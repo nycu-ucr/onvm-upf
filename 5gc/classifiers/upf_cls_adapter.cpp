@@ -55,7 +55,7 @@ static inline uint32_t fnv1a_hash(const char *s) {
 }
 
 /* Initialise a rule with wildcards */
-static inline void init_wildcard(pdr_t *r)
+/* static inline void init_wildcard(pdr_t *r)
 {
     memset(r, 0, sizeof(*r));
     r->pdi.src_port   = ANY16;
@@ -66,7 +66,7 @@ static inline void init_wildcard(pdr_t *r)
     r->pdi.source_if  = SRC_IF_ANY;
     r->pdi.ni_hash    = ANY32;
     r->pdi.qfi        = ANY8;
-}
+} */
 
 /* Parse “X.Y.Z.W[/P]” into host-order IPv4 + prefix */
 static inline uint32_t parse_ip_prefix(const char *s, uint8_t *pref_out)
@@ -95,39 +95,80 @@ static inline source_interface_t map_src_if(uint8_t pfcp_if)
                                   : SRC_IF_ACCESS;
 }
 
-static pdr_t updk_pdr_to_cls_rule(const UPDK_PDR *in)
+static pdr_t updk_pdr_to_cls_rule(const UPDK_PDR *in, bool is_uplink)
 {
     pdr_t out{};
-    init_wildcard(&out);
+    // init_wildcard(&out);
 
-    if (in->flags.pdrId)      out.pdr_id     = in->pdrId;
-    if (in->flags.precedence) out.precedence = in->precedence;
-    if (!in->flags.pdi)       return out;
+    if (in->flags.pdrId) {
+        out.pdr_id = in->pdrId;
+    }
+    if (in->flags.precedence) { 
+        out.precedence = in->precedence;
+    }
+    if (!in->flags.pdi) {
+        return out;
+    }
 
     const UPDK_PDI &p = in->pdi;
 
-    /* ── UE IP ───────────────────────────────────────────────────────── */
     if (p.flags.ueIpAddress && p.ueIpAddress.flags.v4) {
-        out.pdi.ue_ip.s_addr = ntohl(p.ueIpAddress.ipv4.s_addr);
-        out.pdi.ue_pref      = 32;        /* /32 for a single address */
+         out.pdi.ue_ip.s_addr = ntohl(p.ueIpAddress.ipv4.s_addr);
+         out.pdi.ue_pref      = 32;
+     }
+
+    if (p.flags.fTeid && p.fTeid.flags.v4) {
+        out.pdi.teid = ntohl(p.fTeid.teid);
     }
 
-    /* ── TEID ────────────────────────────────────────────────────────── */
-    if (p.flags.fTeid && p.fTeid.flags.v4)
-        out.pdi.teid = ntohl(p.fTeid.teid);
+    if (p.flags.qfi) {
+        out.pdi.qfi = p.qfi;
+    }
+    if (p.flags.networkInstance) {
+        out.pdi.ni_hash = fnv1a_hash(p.networkInstance);
+    }
+    if (p.flags.sourceInterface)  {
+        out.pdi.source_if = map_src_if(p.sourceInterface);
+    }
 
-    /* ── SDF filter ──────────────────────────────────────────────────── */
+
+    // PDI -> SDF Filter -> Flow Description
+
     if (p.flags.sdfFilter) {
+        
         const auto &f = p.sdfFilter;
-        if (f.flags.ttc) out.pdi.tos_tc = f.tosTrafficClass;
-        if (f.flags.spi) out.pdi.spi    = f.securityParameterIndex;
+
+        if (f.flags.ttc) {
+            out.pdi.tos_tc = f.tosTrafficClass;
+        }
+        if (f.flags.spi) {
+            out.pdi.spi = f.securityParameterIndex;
+        }
+
+        if (f.flags.fl) {
+            out.pdi.flow_label = p.flowLabel;
+        }  
 
         if (f.flags.fd && f.flowDescription) {
             const char *desc = f.flowDescription;
             char token[32];
 
-            /* ─── “from …” ─────────────────────────────────────────── */
-            if (const char *pos = strstr(desc, "from ")) {
+            if (strstr(desc, "from any") && strstr(desc, "to assigned")) {
+                if (is_uplink) {
+                    // uplink: match UE→any
+                    out.pdi.src_ip.s_addr = out.pdi.ue_ip.s_addr;
+                    out.pdi.src_pref      = out.pdi.ue_pref;
+                    out.pdi.dst_ip.s_addr = 0;
+                    out.pdi.dst_pref      = 0;
+                } else {
+                    // downlink: match any→UE
+                    out.pdi.src_ip.s_addr = 0;
+                    out.pdi.src_pref      = 0;
+                    out.pdi.dst_ip.s_addr = out.pdi.ue_ip.s_addr;
+                    out.pdi.dst_pref      = out.pdi.ue_pref;
+                }
+            } else {
+                if (const char *pos = strstr(desc, "from ")) {
                 pos += 5;
                 size_t i = 0;
                 while (pos[i] && !isspace((unsigned char)pos[i]) && i + 1 < sizeof(token)) {
@@ -158,7 +199,7 @@ static pdr_t updk_pdr_to_cls_rule(const UPDK_PDR *in)
             }
 
             /* ─── “to …” ───────────────────────────────────────────── */
-            memset(token, 0, sizeof(token));            /* clear reuse buffer */
+            memset(token, 0, sizeof(token)); 
             
             if (const char *pos = strstr(desc, "to ")) {
                 pos += 3;
@@ -189,13 +230,28 @@ static pdr_t updk_pdr_to_cls_rule(const UPDK_PDR *in)
                     out.pdi.dst_pref      = pf2;
                 }
             }
+            }
+            
         }
     }
 
-    /* ── Remaining PDI fields ───────────────────────────────────────── */
-    if (p.flags.qfi)              out.pdi.qfi       = p.qfi;
-    if (p.flags.networkInstance)  out.pdi.ni_hash   = fnv1a_hash(p.networkInstance);
-    if (p.flags.sourceInterface)  out.pdi.source_if = map_src_if(p.sourceInterface);
+
+    /* if (p.flags.srcPort) {
+        out.pdi.src_port = p.srcPort;
+    }
+    if (p.flags.dstPort) {
+        out.pdi.dst_port = p.dstPort;
+    }      
+    if (p.flags.proto) {
+        out.pdi.proto = p.protocolId;
+    }        
+    if (p.flags.tos_tc) {
+        out.pdi.tos_tc = p.tosTrafficClass;
+    }       
+    if (p.flags.spi) {
+        out.pdi.spi = p.securityParameterIndex;
+    }   */        
+     
 
     log_rule(out);
     return out;
@@ -207,11 +263,14 @@ static pdr_t updk_pdr_to_cls_rule(const UPDK_PDR *in)
 extern "C" {
 
 /* insert */
-uintptr_t upf_cls_add_pdr(const UPDK_PDR *pdr)
+uintptr_t upf_cls_add_pdr(const UPDK_PDR *pdr, bool is_uplink)
 {
     if (!pdr) return 0;
-    pdr_t rule = updk_pdr_to_cls_rule(pdr);
+    printf("=================1======================");
+    pdr_t rule = updk_pdr_to_cls_rule(pdr, is_uplink);
+    printf("=================2======================");
     rule.descriptor = reinterpret_cast<uintptr_t>(pdr);
+    printf("=================3======================");
     return cls_insert_rule(cls_global(), &rule);
 }
 
