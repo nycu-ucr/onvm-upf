@@ -26,24 +26,23 @@ int inline CompareQuery(const box& a, const Packet& q, int level, const std::vec
     int field = fieldOrder[level];
     uint32_t v = q[field];
 
-    // wildcard: treat as overlap/match
     if (v == ANY32 || v == ANY16 || v == ANY8) {
-        TRACE("Level %d field=%s value=0x%x wildcard => OVERLAP\n", level, FieldName(field), v);
-        return 0;
+       printf("DBG CompareQuery: level %d field %s value=0x%x wildcard → OVERLAP\n",
+               level, FieldName(field), v);
+       return 0;
     }
-
     if (a[HIGH] < v) {
-        TRACE("Level %d field=%s value=0x%x interval=[0x%x,0x%x] => RIGHT (compVal=-1)\n",
-              level, FieldName(field), v, a[LOW], a[HIGH]);
+        printf("DBG CompareQuery: level %d field %s value=0x%x interval=[0x%x,0x%x] → RIGHT\n",
+               level, FieldName(field), v, a[LOW], a[HIGH]);
         return -1;
     }
     if (a[LOW] > v) {
-        TRACE("Level %d field=%s value=0x%x interval=[0x%x,0x%x] => LEFT (compVal=1)\n",
-              level, FieldName(field), v, a[LOW], a[HIGH]);
+        printf("DBG CompareQuery: level %d field %s value=0x%x interval=[0x%x,0x%x] → LEFT\n",
+               level, FieldName(field), v, a[LOW], a[HIGH]);
         return 1;
     }
 
-    TRACE("Level %d field=%s value=0x%x interval=[0x%x,0x%x] => MATCH (compVal=0)\n",
+   printf("DBG CompareQuery: level %d field %s value=0x%x interval=[0x%x,0x%x] → MATCH\n",
           level, FieldName(field), v, a[LOW], a[HIGH]);
     return 0;
 }
@@ -991,27 +990,28 @@ MatchResult RBExactQueryIterativeMod(
 
         // 2) singleton chain?
         if (tree->count == 1) {
-    TRACE("SingletonChain: starting at level %d\n", level);
-    for (int i = level; i < static_cast<int>(fieldOrder.size()); ++i) {
-        int field = fieldOrder[i];
-        const auto& interval = tree->chain_boxes[i - level];
-        uint32_t v = q[field];
+			printf("DBG SingletonChain: starting at level %d\n", level);
+    
+			for (int i = level; i < static_cast<int>(fieldOrder.size()); ++i) {
+				int field = fieldOrder[i];
+				const auto& interval = tree->chain_boxes[i - level];
+				uint32_t v = q[field];
 
-        TRACE("  [SingletonChain] checking field %s: pkt=0x%x interval=[0x%x,0x%x]\n",
-              FieldName(field), v, interval[0], interval[1]);
+				printf("DBG SingletonChain: field %s pkt=0x%x interval=[0x%x,0x%x]\n",
+                   FieldName(field), v, interval[0], interval[1]);
 
-        if (v == ANY32 || v == ANY16 || v == ANY8) {
-            TRACE("    wildcard skip for field %s\n", FieldName(field));
-            continue;
-        }
+				if (v == ANY32 || v == ANY16 || v == ANY8) {
+					printf("DBG SingletonChain: wildcard skip for field %s\n", FieldName(field));
+					continue;
+				}
 
-        if (v < interval[0] || v > interval[1]) {
-            TRACE("    mismatch on field %s: pkt=0x%x not in [%#x, %#x]\n",
-                  FieldName(field), v, interval[0], interval[1]);
-            return MatchResult();    // no match
-        }
-    }
-    TRACE("  SingletonChain: full chain matched, returning max match\n");
+				if (v < interval[0] || v > interval[1]) {
+					printf("DBG SingletonChain: mismatch on field %s: pkt=0x%x not in [%#x,%#x]\n",
+                       FieldName(field), v, interval[0], interval[1]);
+					return MatchResult();    // no match
+				}
+			}
+	printf("DBG SingletonChain: full chain matched\n");
     return tree->GetMaxMatch();
 }
 

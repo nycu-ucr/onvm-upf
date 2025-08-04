@@ -51,18 +51,16 @@ public:
 	{
 		MatchResult best{-1, 0};          // explicit init: priority = –1, desc = 0
 		int query = 0;
+		for (size_t idx = 0; idx < mitrees.size(); ++idx) {
+			auto* t = mitrees[idx];
+			if (best.priority > t->MaxPriority())
+				break;
 
-		size_t idx = 0;
-for (const auto& t : mitrees) {
-    if (best.priority > t->MaxPriority())
-        break;
-
-    MatchResult m = t->ClassifyAPacketMod(packet);
-    TRACE("MITree[%zu]: returned priority=%d descriptor=0x%lx (current best=%d)\n",
-          idx, m.priority, (unsigned long)m.descriptor, best.priority);
-    if (m.priority > best.priority)
-        best = m;
-    ++idx;
+			MatchResult m = t->ClassifyAPacketMod(packet);
+			printf("DBG MITree[%zu]: returned priority=%d descriptor=0x%lx (current best=%d)\n",
+               idx, m.priority, (unsigned long)m.descriptor, best.priority);
+			if (m.priority > best.priority)
+				best = m;
 }
 		QueryUpdate(query);
 		return best;

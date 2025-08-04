@@ -6,6 +6,8 @@
 #include <vector>
 #include <array>
 #include <string>
+#include <cstring>
+#include <unistd.h>
 
 // ---------------------- configuration ----------------------
 #ifndef CLASSIFIER_DEBUG_PATH
@@ -14,10 +16,10 @@
 
 #define TRACE(fmt, ...) \
     do { \
-        if (CLASSIFIER_DEBUG_PATH) { \
-            fprintf(stderr, "[CLS-TRACE] " fmt "\n", ##__VA_ARGS__); \
-            fflush(stderr); \
-        } \
+        fprintf(stderr, "[FORCE-TRACE] " fmt "\n", ##__VA_ARGS__); \
+        fflush(stderr); \
+        const char *s = "[FORCE-TRACE] flushed\n"; \
+        write(2, s, strlen(s)); \
     } while (0)
 
 // ---------------------- field definitions ----------------------
