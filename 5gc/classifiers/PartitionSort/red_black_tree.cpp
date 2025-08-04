@@ -1,4 +1,5 @@
 #include "red_black_tree.h"
+#include "../classifier_trace.h"
 
 static constexpr uint32_t ANY32 = 0xFFFFFFFFu;
 static constexpr uint16_t ANY16 = 0xFFFFu;
@@ -18,21 +19,34 @@ int CompareBox(const box& a, const box& b ) {
 	
 	return 0;
 }
+
+
 int inline CompareQuery(const box& a, const Packet& q, int level, const std::vector<int>& fieldOrder) {
+    const int LOW = 0, HIGH = 1;
+    int field = fieldOrder[level];
+    uint32_t v = q[field];
 
-	const int LOW = 0, HIGH = 1;
-    uint32_t v = q[fieldOrder[level]];       // Packet always stores 32-bit
+    // wildcard: treat as overlap/match
+    if (v == ANY32 || v == ANY16 || v == ANY8) {
+        TRACE("Level %d field=%s value=0x%x wildcard => OVERLAP\n", level, FieldName(field), v);
+        return 0;
+    }
 
-    /* ---------- wildcard?  early-accept this dimension ---------- */
-    if (v == ANY32 || v == ANY16 || v == ANY8)
-        return 0;                            // treat as “overlap”
+    if (a[HIGH] < v) {
+        TRACE("Level %d field=%s value=0x%x interval=[0x%x,0x%x] => RIGHT (compVal=-1)\n",
+              level, FieldName(field), v, a[LOW], a[HIGH]);
+        return -1;
+    }
+    if (a[LOW] > v) {
+        TRACE("Level %d field=%s value=0x%x interval=[0x%x,0x%x] => LEFT (compVal=1)\n",
+              level, FieldName(field), v, a[LOW], a[HIGH]);
+        return 1;
+    }
 
-    /* ---------- normal interval test ---------- */
-    if (a[HIGH] < v)  return -1;             // packet value to the right
-    if (a[LOW]  > v)  return  1;             // packet value to the left
-    return 0;                                // v inside [LOW, HIGH]
+    TRACE("Level %d field=%s value=0x%x interval=[0x%x,0x%x] => MATCH (compVal=0)\n",
+          level, FieldName(field), v, a[LOW], a[HIGH]);
+    return 0;
 }
-
 /***********************************************************************/
 /*  FUNCTION:  RBTreeCreate */
 /**/
@@ -977,19 +991,29 @@ MatchResult RBExactQueryIterativeMod(
 
         // 2) singleton chain?
         if (tree->count == 1) {
-            for (int i = level; i < static_cast<int>(fieldOrder.size()); ++i) {
-                const auto& interval = tree->chain_boxes[i - level];
-                auto v = q[fieldOrder[i]];
+    TRACE("SingletonChain: starting at level %d\n", level);
+    for (int i = level; i < static_cast<int>(fieldOrder.size()); ++i) {
+        int field = fieldOrder[i];
+        const auto& interval = tree->chain_boxes[i - level];
+        uint32_t v = q[field];
 
-				if (v == ANY32 || v == ANY16 || v == ANY8)   // ← wildcard: skip test
-        			continue;
+        TRACE("  [SingletonChain] checking field %s: pkt=0x%x interval=[0x%x,0x%x]\n",
+              FieldName(field), v, interval[0], interval[1]);
 
-                if (v < interval[0] || v > interval[1]) {
-                    return MatchResult();    // = (-1,0)
-                }
-            }
-            return tree->GetMaxMatch();
+        if (v == ANY32 || v == ANY16 || v == ANY8) {
+            TRACE("    wildcard skip for field %s\n", FieldName(field));
+            continue;
         }
+
+        if (v < interval[0] || v > interval[1]) {
+            TRACE("    mismatch on field %s: pkt=0x%x not in [%#x, %#x]\n",
+                  FieldName(field), v, interval[0], interval[1]);
+            return MatchResult();    // no match
+        }
+    }
+    TRACE("  SingletonChain: full chain matched, returning max match\n");
+    return tree->GetMaxMatch();
+}
 
         // 3) descend the RB tree
         rb_red_blk_node* x   = tree->root->left;

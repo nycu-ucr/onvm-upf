@@ -5,6 +5,7 @@
 #include "OptimizedMITree.h"
 #include "../Simulation.h"
 #include "SortableRulesetPartitioner.h"
+#include "../classifier_trace.h"
 
 #define DEBUG_ASSERT 0
 
@@ -51,18 +52,18 @@ public:
 		MatchResult best{-1, 0};          // explicit init: priority = –1, desc = 0
 		int query = 0;
 
-		for (const auto& t : mitrees) {
-		
-			if (best.priority > t->MaxPriority())
-				break;
+		size_t idx = 0;
+for (const auto& t : mitrees) {
+    if (best.priority > t->MaxPriority())
+        break;
 
-			++query;
-
-			MatchResult m = t->ClassifyAPacketMod(packet);
-			if (m.priority > best.priority)     
-				best = m;
-			/* If need tie-breaking on equal priority, handle it here */
-		}
+    MatchResult m = t->ClassifyAPacketMod(packet);
+    TRACE("MITree[%zu]: returned priority=%d descriptor=0x%lx (current best=%d)\n",
+          idx, m.priority, (unsigned long)m.descriptor, best.priority);
+    if (m.priority > best.priority)
+        best = m;
+    ++idx;
+}
 		QueryUpdate(query);
 		return best;
 	}
