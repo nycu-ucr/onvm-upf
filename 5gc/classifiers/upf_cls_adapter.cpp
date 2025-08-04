@@ -97,8 +97,11 @@ static inline source_interface_t map_src_if(uint8_t pfcp_if)
 
 static pdr_t updk_pdr_to_cls_rule(const UPDK_PDR *in, bool is_uplink)
 {
+    printf("updk_pdr_to_cls_rule: is_uplink = %s", is_uplink ? "true" : "false");
     pdr_t out{};
     // init_wildcard(&out);
+
+    out.is_uplink = is_uplink;
 
     if (in->flags.pdrId) {
         out.pdr_id = in->pdrId;
@@ -118,7 +121,7 @@ static pdr_t updk_pdr_to_cls_rule(const UPDK_PDR *in, bool is_uplink)
      }
 
     if (p.flags.fTeid && p.fTeid.flags.v4) {
-        out.pdi.teid = ntohl(p.fTeid.teid);
+        out.pdi.teid = p.fTeid.teid;
     }
 
     if (p.flags.qfi) {
@@ -128,7 +131,8 @@ static pdr_t updk_pdr_to_cls_rule(const UPDK_PDR *in, bool is_uplink)
         out.pdi.ni_hash = fnv1a_hash(p.networkInstance);
     }
     if (p.flags.sourceInterface)  {
-        out.pdi.source_if = map_src_if(p.sourceInterface);
+        // out.pdi.source_if = map_src_if(p.sourceInterface);
+        out.pdi.source_if = is_uplink ? SRC_IF_ACCESS : SRC_IF_CORE;
     }
 
 
@@ -145,9 +149,17 @@ static pdr_t updk_pdr_to_cls_rule(const UPDK_PDR *in, bool is_uplink)
             out.pdi.spi = f.securityParameterIndex;
         }
 
-        if (f.flags.fl) {
-            out.pdi.flow_label = p.flowLabel;
-        }  
+        // ignoring flow label for now as that is for IPv6 traffic only
+
+        /* if (f.flags.fl) {
+            // PFCP Flow-Label is a 3-octet field in network order
+            uint8_t *flb = (uint8_t*)f.flowLabel;
+            out.pdi.flow_label =
+                (uint32_t(flb[0]) << 16) |
+                (uint32_t(flb[1]) << 8)  |
+                (uint32_t(flb[2])      );
+        } */
+
 
         if (f.flags.fd && f.flowDescription) {
             const char *desc = f.flowDescription;
@@ -167,6 +179,12 @@ static pdr_t updk_pdr_to_cls_rule(const UPDK_PDR *in, bool is_uplink)
                     out.pdi.dst_ip.s_addr = out.pdi.ue_ip.s_addr;
                     out.pdi.dst_pref      = out.pdi.ue_pref;
                 }
+
+                printf("[CLS] FlowDescription hack: %s — src=%u, dst=%u\n",
+                is_uplink ? "UL" : "DL",
+                out.pdi.src_ip.s_addr,
+                out.pdi.dst_ip.s_addr);
+
             } else {
                 if (const char *pos = strstr(desc, "from ")) {
                 pos += 5;
@@ -235,24 +253,6 @@ static pdr_t updk_pdr_to_cls_rule(const UPDK_PDR *in, bool is_uplink)
         }
     }
 
-
-    /* if (p.flags.srcPort) {
-        out.pdi.src_port = p.srcPort;
-    }
-    if (p.flags.dstPort) {
-        out.pdi.dst_port = p.dstPort;
-    }      
-    if (p.flags.proto) {
-        out.pdi.proto = p.protocolId;
-    }        
-    if (p.flags.tos_tc) {
-        out.pdi.tos_tc = p.tosTrafficClass;
-    }       
-    if (p.flags.spi) {
-        out.pdi.spi = p.securityParameterIndex;
-    }   */        
-     
-
     log_rule(out);
     return out;
 }
@@ -265,6 +265,7 @@ extern "C" {
 /* insert */
 uintptr_t upf_cls_add_pdr(const UPDK_PDR *pdr, bool is_uplink)
 {
+    printf("upf_cls_add_pdr: is_uplink = %s", is_uplink ? "true" : "false");
     if (!pdr) return 0;
     printf("=================1======================");
     pdr_t rule = updk_pdr_to_cls_rule(pdr, is_uplink);

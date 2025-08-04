@@ -349,3 +349,63 @@ static inline uint16_t get_gtpu_header_len(struct rte_mbuf *pkt){
     }
     return gtp_len;
 }
+
+
+/**
+ * Like get_gtpu_header_len(), but also extracts QFI from extension type 0x85 (PDU Session Container).
+ * Keeps the original "quirky" length math unchanged for compatibility with gNB packets.
+ *
+ * @param pkt      packet buffer
+ * @param qfi_out  output pointer for QFI (0 if absent)
+ * @return total GTP-U header length
+ */
+static inline uint16_t get_gtpu_header_len_with_qfi(struct rte_mbuf *pkt, uint8_t *qfi_out) {
+    *qfi_out = 0; // default QFI if not present
+
+    uint16_t gtp_len = sizeof(gtpv1_t);
+
+    gtpv1_t *gtpv1 = rte_pktmbuf_mtod_offset(pkt, gtpv1_t *,
+                                             sizeof(struct rte_ipv4_hdr) + sizeof(struct rte_udp_hdr));
+
+    if (gtpv1->flags & GTP1_F_MASK) {
+        gtp_len += 4;
+    } else {
+        return gtp_len;
+    }
+
+    if (gtpv1->flags & GTP1_F_EXTHDR) {
+        uint8_t next_ehdr_type = 0;
+        gtpv1_hdr_opt_t *gtpv1_opt;
+
+        gtpv1_opt = rte_pktmbuf_mtod_offset(pkt, gtpv1_hdr_opt_t *,
+                            sizeof(struct rte_ipv4_hdr) + sizeof(struct rte_udp_hdr) + sizeof(gtpv1_t));
+        next_ehdr_type = gtpv1_opt->next_ehdr_type;
+
+        while (next_ehdr_type) {
+            switch (next_ehdr_type) {
+            case GTPV1_NEXT_EXT_HDR_TYPE_85: {
+                pdu_sess_container_hdr_t *ehdr_type_85 =
+                    rte_pktmbuf_mtod_offset(pkt, pdu_sess_container_hdr_t *,
+                        sizeof(struct rte_ipv4_hdr) + sizeof(struct rte_udp_hdr) +
+                        sizeof(gtpv1_t) + sizeof(gtpv1_hdr_opt_t));
+
+                // Extract QFI (first payload byte after fixed fields)
+                uint8_t *raw = (uint8_t *)ehdr_type_85;
+                *qfi_out = raw[2] & 0x3F;
+
+                // Extend header length (keep original math)
+                gtp_len += (ehdr_type_85->length * 4);
+
+                next_ehdr_type = ehdr_type_85->next_hdr;
+                break;
+            }
+            default:
+                printf("Invalid header type(%x)\n", next_ehdr_type);
+                next_ehdr_type = 0;
+                break;
+            }
+        }
+    }
+    return gtp_len;
+}
+

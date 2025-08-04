@@ -284,11 +284,15 @@ Status UpfN4HandleCreatePdr(UpfSession *session, CreatePDR *createPdr) {
                 return STATUS_ERROR,
                 "UpfPDRRegisterToSession failed");
 
+
+    // Distinguishing Uplink/Downlink PDR            
     bool is_uplink = false;     // default to downlink / CORE 
 
     if (upfPdr->flags.pdi && upfPdr->pdi.flags.sourceInterface) {
 
-        switch (upfPdr->pdi.source_if) {
+        UTLT_Debug("CreatePDR: PDI.SourceInterface IE present, value=%u", upfPdr->pdi.sourceInterface);
+
+        switch (upfPdr->pdi.sourceInterface) {
         case 0:        
             // N3 side (Uplink: UE → UPF)  
             is_uplink = true;  
@@ -300,13 +304,15 @@ Status UpfN4HandleCreatePdr(UpfSession *session, CreatePDR *createPdr) {
 
         default:  // unexpected value ⇒ treating as downlink
             UTLT_Warning("CreatePDR: unexpected SourceInterface=%u – treating as CORE",
-                        upfPdr->pdi.source_if);
+                        upfPdr->pdi.sourceInterface);
             break;
         }
     } else {
         /* Spec violation: Source-Interface missing – assume downlink */
         UTLT_Warning("CreatePDR: SourceInterface IE missing – treating as CORE");
     }
+
+    UTLT_Debug("CreatePDR: determined is_uplink = %s", is_uplink ? "true" : "false");
     
     uintptr_t desc = upf_cls_add_pdr(upfPdr, is_uplink);
 

@@ -78,14 +78,14 @@ static Rule to_cpp_rule(const pdr_t *in)
     "             UE_IP=%s/%u  SRC_IP=%s/%u  DST_IP=%s/%u\n"
     "             sport=%u  dport=%u  proto=%u  tos=%u\n"
     "             spi=%u  flow_label=%u\n"
-    "             teid=%u  source_if=%u  ni_hash=0x%08x  qfi=%u\n",
+    "             teid=%u  source_if=%u  ni_hash=0x%08x  qfi=%u is_uplink=%d\n",
     in->pdr_id, in->precedence, (unsigned long)in->descriptor,
     ue_buf,  in->pdi.ue_pref,
     src_buf, in->pdi.src_pref,
     dst_buf, in->pdi.dst_pref,
     in->pdi.src_port, in->pdi.dst_port, in->pdi.proto, in->pdi.tos_tc,
     in->pdi.spi, in->pdi.flow_label,
-    in->pdi.teid, in->pdi.source_if, in->pdi.ni_hash, in->pdi.qfi
+    in->pdi.teid, in->pdi.source_if, in->pdi.ni_hash, in->pdi.qfi, in->is_uplink
     );
     
 
@@ -137,19 +137,18 @@ static Rule to_cpp_rule(const pdr_t *in)
         R.range[7]         = {{ in->pdi.spi, in->pdi.spi }};
         R.prefix_length[7] = 32;
     }
-    if (in->pdi.flow_label) {
+    // ignoring flow label for now
+    /* if (in->pdi.flow_label) {
         R.range[8]         = {{ in->pdi.flow_label, in->pdi.flow_label }};
         R.prefix_length[8] = 32;
-    }
+    } */
 
-    if (in->pdi.teid) {
-        R.range[9]         = {{ in->pdi.teid, in->pdi.teid }};
-        R.prefix_length[9] = 32;
-    }
-    if (in->pdi.source_if) {
-        R.range[10]        = {{ in->pdi.source_if, in->pdi.source_if }};
-        R.prefix_length[10]= 32;
-    }
+    R.range[9]         = {{ in->pdi.teid, in->pdi.teid }};
+    R.prefix_length[9] = 32;
+    
+    R.range[10]        = {{ in->pdi.source_if, in->pdi.source_if }};
+    R.prefix_length[10]= 32;
+
     if (in->pdi.ni_hash) {
         R.range[11]        = {{ in->pdi.ni_hash, in->pdi.ni_hash }};
         R.prefix_length[11]= 32;
@@ -226,12 +225,10 @@ uintptr_t cls_insert_rule(cls_handle_t *h, const pdr_t *r)
 {
     if (!h || !r) return 0;
     Rule R = to_cpp_rule(r);
-    printf("=================50======================");
 #if CLS_SELECTED_BACKEND == CLS_BACKEND_PS
     uintptr_t desc = h->ps->InsertRuleReturnDescriptor(R);
     printf("DBG=>cls_insert_rule: got descriptor=0x%lx for pdr_id=%u\n",
        (unsigned long)desc, r->pdr_id);
-    printf("=================51======================");
     cls_print_all_rules(h);
     return desc;
 #elif CLS_SELECTED_BACKEND == CLS_BACKEND_TSS

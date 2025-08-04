@@ -13,7 +13,7 @@ extern "C" {
 
 /* Insert the PDR into the classifier.
  * Returns 0 on success, −1 on failure (e.g. capacity, duplicate).         */
-uintptr_t upf_cls_add_pdr(const UPDK_PDR *pdr);
+uintptr_t upf_cls_add_pdr(const UPDK_PDR *pdr, bool is_uplink);
 
 /* Remove that exact PDR (keyed by its pointer).
  * Returns 0 on success, −1 if not found.                                  */
