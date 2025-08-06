@@ -9,7 +9,7 @@
 #include "PartitionSort/PartitionSort.h"
 #include "TupleSpaceSearch/TupleSpaceSearch.h"
 
-/*────────────────── Handle definition (compile-time variant) ─────────────*/
+
 #if CLS_SELECTED_BACKEND == CLS_BACKEND_PS
 struct cls_handle_t { PartitionSort *ps; };
 #elif CLS_SELECTED_BACKEND == CLS_BACKEND_TSS
@@ -18,7 +18,7 @@ struct cls_handle_t { TupleSpaceSearch *tss; };
 struct cls_handle_t { PriorityTupleSpaceSearch *ptss; };
 #endif
 
-/*────────────────── Construction ─────────────────────────────────────────*/
+
 cls_handle_t *cls_create(cls_backend_t)
 {
     static cls_handle_t h;
@@ -32,7 +32,7 @@ cls_handle_t *cls_create(cls_backend_t)
     return &h;
 }
 
-/*────────────────── Helpers ------------------------------------------------*/
+
 
 static inline std::string ip4(uint32_t host_ip) {
     struct in_addr in { htonl(host_ip) };
@@ -146,7 +146,7 @@ static Rule to_cpp_rule(const pdr_t *in)
     R.range[9]         = {{ in->pdi.teid, in->pdi.teid }};
     R.prefix_length[9] = 32;
     
-    R.range[10]        = {{ in->pdi.source_if, in->pdi.source_if }};
+    R.range[10]        = {{ uint32_t(in->pdi.source_if), uint32_t(in->pdi.source_if) }};
     R.prefix_length[10]= 32;
 
     if (in->pdi.ni_hash) {

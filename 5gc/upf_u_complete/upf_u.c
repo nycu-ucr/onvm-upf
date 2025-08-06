@@ -972,7 +972,7 @@ UPDK_PDR *GetPdrByTeid(struct rte_mbuf *pkt, uint32_t td) {
                ip4_to_buf(outer4->dst_addr, o_dst),
                data_len);
 
-    // Outer UDP (must be GTP-U)
+    // Outer UDP
     struct rte_udp_hdr *outerU = onvm_pkt_udp_hdr(pkt);
     if (!outerU) return NULL;
     if (outerU->dst_port != rte_cpu_to_be_16(2152)) return NULL;
