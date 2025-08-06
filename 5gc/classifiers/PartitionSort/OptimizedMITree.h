@@ -118,29 +118,80 @@ public:
 	int MaxPriority() const { return maxPriority; }
 	bool Empty() const { return priorityContainer.empty(); }
 
-	void ReconstructIfNumRulesLessThanOrEqualTo(int threshold = 10) {
-		printf("=================600======================");
-		if (isMature) return;
+	void ReconstructIfNumRulesLessThanOrEqualTo(int threshold = 4) {
+		printf("DBG[OptMIT] ENTER  numRules=%d  threshold=%d  isMature=%d\n",
+           numRules, threshold, isMature);
+    	fflush(stdout);
+    
+		if (isMature) {
+			printf("DBG[OptMIT] EXIT   already mature\n");
+			return;
+		} 
 		if (numRules >= threshold) {
-			isMature = true;  return;
+			printf("DBG[OptMIT] EXIT   numRules(%d) >= threshold(%d) – defer to heavy rebuild\n",
+               numRules, threshold);
+			isMature = true;  
+			return;
 		}
 		//global_counter++;
 		std::vector<Rule> serialized_rules = SerializeIntoRules();
-		printf("=================601======================\n"); 
-		auto result = SortableRulesetPartitioner::FastGreedyFieldSelectionForAdaptive(serialized_rules);
-		printf("=================602======================\n");
-		if (!result.first) return;
-		if (IsIdenticalVector(fieldOrder, result.second)) return;
-		printf("=================603======================");
-		Reset();
+		
+		printf("DBG[OptMIT] serialized_rules.size = %zu\n", serialized_rules.size());
+    	fflush(stdout);
 
-		fieldOrder = result.second;
+		auto result = SortableRulesetPartitioner::FastGreedyFieldSelectionForAdaptive(serialized_rules);
+
+		printf("DBG[OptMIT] greedy.first = %d  fieldOrder candidate size = %zu\n",
+           result.first, result.second.size());
+    	fflush(stdout);
+
+		std::vector<int> newFieldOrder;
+		if (!result.first) {
+			newFieldOrder = {
+				10,  // SOURCE_IF 
+				9,   // TEID             
+				0,   // UE_IP 
+				1,   // SRC_IP
+				2,   // DST_IP 
+				// ---------- low-entropy or often wildcard ----------
+				5,   // PROTO
+				3,   // SRC_PORT
+				4,   // DST_PORT
+				6,   // TOS_TC
+				7,   // SPI
+				8,   // FLOW_LABEL
+				11,  // NI_HASH
+				12,  // QFI
+				13   // IS_UPLINK
+			};
+
+		} else {
+			newFieldOrder = std::move(result.second);
+		}
+		// --- skip rebuild only if field order unchanged *and* a tree exists ---
+		if (IsIdenticalVector(fieldOrder, newFieldOrder) && numRules > 0) {
+			printf("DBG[OptMIT] EXIT   fieldOrder unchanged and tree already populated\n");
+			return;
+		}
+
+		printf("DBG[OptMIT] Reset(): numRules before reset = %d\n", numRules);
+		Reset();                        // sets numRules to 0
+		printf("DBG[OptMIT] After reset: numRules = %d\n", numRules);
+
+		fieldOrder = std::move(newFieldOrder);
 
 		for (const auto & r : serialized_rules) {
 			Insertion(r);
 		}
-		printf("=================604======================");
+
+		printf("DBG[OptMIT] After insertion: numRules = %d  (should equal %zu)\n",
+           numRules, serialized_rules.size());
+    	fflush(stdout);
+
+		//isMature = true;   
+
 	}
+
 	std::vector<Rule> SerializeIntoRules() const {
 		return RBSerializeIntoRules(root, fieldOrder);
 	}

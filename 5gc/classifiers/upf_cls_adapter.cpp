@@ -286,6 +286,8 @@ int upf_cls_del_pdr(const UPDK_PDR *pdr)
 /* lookup */
 const UPDK_PDR *upf_cls_lookup(const ps_packet_t *pkt)
 {
+    printf("[SMOKE] Entered upf_cls_lookup\n");
+    fflush(stdout);
     uintptr_t desc = 0;
     if (cls_classify_packet(cls_global(), pkt, nullptr, &desc) == 1)
         return reinterpret_cast<const UPDK_PDR *>(desc);

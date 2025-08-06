@@ -1,6 +1,7 @@
 #include <climits>
 #include <cinttypes>
 #include <cstdio>
+#include <unistd.h>  // remove later..only added for getpid()
 #include <arpa/inet.h>
 
 #include "classifier_wrapper.h"
@@ -146,7 +147,7 @@ static Rule to_cpp_rule(const pdr_t *in)
     R.range[9]         = {{ in->pdi.teid, in->pdi.teid }};
     R.prefix_length[9] = 32;
     
-    R.range[10]        = {{ in->pdi.source_if, in->pdi.source_if }};
+    R.range[10]        = {{ uint32_t(in->pdi.source_if), uint32_t(in->pdi.source_if) }};
     R.prefix_length[10]= 32;
 
     if (in->pdi.ni_hash) {
@@ -208,6 +209,18 @@ static Packet to_cpp_pkt(const ps_packet_t *p)
 /*────────────────── C API (extern \"C\") ─────────────────────────────────*/
 extern "C" {
 
+
+cls_handle_t *cls_global() {
+        static cls_handle_t *h = nullptr;
+        if (!h) {
+            h = cls_create(CLS_SELECTED_BACKEND);
+            printf("[CLS] pid=%d  cls_global() created handle @ %p\n",
+               getpid(), (void*)h);
+            fflush(stdout);
+        }     
+        return h;
+}
+
 /* destroy ----------------------------------------------------------------*/
 void cls_destroy(cls_handle_t *h)
 {
@@ -268,6 +281,8 @@ int cls_classify_packet(
         uint32_t           *prec_out,
         uintptr_t          *desc_out)
 {
+    printf("[SMOKE] Entered cls_classify_packet\n");
+    fflush(stdout);
     if (!h || !p) return -1;
 #if CLS_SELECTED_BACKEND == CLS_BACKEND_PS
     MatchResult m = h->ps->ClassifyAPacketMod(to_cpp_pkt(p));

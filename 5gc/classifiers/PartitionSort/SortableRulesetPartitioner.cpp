@@ -576,39 +576,50 @@ std::pair<std::vector<Rule>, std::vector<int>> SortableRulesetPartitioner::FastG
 	return std::make_pair(current_rules, current_field);
 }
 
-std::pair<bool, std::vector<int>> SortableRulesetPartitioner::FastGreedyFieldSelectionForAdaptive(const std::vector<Rule>& rules) {
-	if (rules.size() == 0) {
-		printf("Warning: GreedyFieldSelection rule size = 0\n ");
-	}
-	int num_fields = rules[0].dim;
-	std::vector<int> current_field;
-	std::vector<part> all_partitions;
+std::pair<bool, std::vector<int>>
+SortableRulesetPartitioner::FastGreedyFieldSelectionForAdaptive(
+    const std::vector<Rule>& rules)
+{
+    if (rules.empty()) {
+        printf("Warning: GreedyFieldSelection rule size = 0\n");
+        return {false, {}};  // no fields, no improvement
+    }
 
-	all_partitions.push_back(rules);
+    int num_fields = rules[0].dim;
+    std::vector<int> current_field;
+    std::vector<part> all_partitions;
+    all_partitions.push_back(rules);
 
-	for (int i = 0; i < num_fields; i++) {
-		FastBestFieldAndConfiguration(all_partitions, current_field, num_fields);
-	}
+    // 1) Greedy loop, but bail if partitions die off
+    for (int i = 0; i < num_fields; ++i) {
+        FastBestFieldAndConfiguration(all_partitions,
+                                      current_field,
+                                      num_fields);
+        if (all_partitions.empty()) {
+            // no beneficial split possible
+            printf("DBG: all_partitions became EMPTY at iteration %d\n", i);
+            break;
+        }
+    }
 
-	for (int j = 0; j < num_fields; j++) {
-		if (std::find(begin(current_field), end(current_field), j) == end(current_field)) {
-			current_field.push_back(j);
-		}
-	}
+    // 2) Append any fields the greedy phase didn’t select
+    for (int j = 0; j < num_fields; ++j) {
+        if (std::find(current_field.begin(), current_field.end(),j) == current_field.end())
+        {
+            current_field.push_back(j);
+        }
+    }
 
-	bool same_size = false;
+    // 3) Determine success: did we keep the full rule set in the bucket?
+    bool same_size = false;
+    if (!all_partitions.empty()) {
+        same_size = (all_partitions[0].size() == rules.size());
+    }
+    // else same_size stays false
 
-	if (!all_partitions.empty()) {
-		same_size = (all_partitions[0].size() == rules.size());
-	} else {
-		printf("DBG: all_partitions is EMPTY at return-point!\n");
-	}
+    // optional debug
+    // printf("DBG: all_partitions.size() = %zu  -> same_size = %d\n",
+    //        all_partitions.size(), same_size);
 
-	printf("DBG: all_partitions.size() = %zu  -> same_size = %d\n",
-		all_partitions.size(), same_size);
-
-	return std::make_pair(same_size, current_field);
-
-
-	//return std::make_pair(all_partitions[0].size() == rules.size(), current_field);
+    return {same_size, current_field};
 }

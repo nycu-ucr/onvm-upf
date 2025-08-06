@@ -19,7 +19,7 @@ void PartitionSort::InsertRule(const Rule& one_rule) {
 			if (prioritychange) {
 				InsertionSortMITrees();
 			}
-			mitree->ReconstructIfNumRulesLessThanOrEqualTo(10);
+			mitree->ReconstructIfNumRulesLessThanOrEqualTo(4);
 			rules.push_back(std::make_pair(one_rule, mitree));
 			return;
 		}
@@ -45,7 +45,7 @@ uintptr_t PartitionSort::InsertRuleReturnDescriptor(const Rule& one_rule) {
             bool pri_change = false;
             if (mitree->TryInsertion(one_rule, pri_change)) {
                 if (pri_change) InsertionSortMITrees();
-                mitree->ReconstructIfNumRulesLessThanOrEqualTo(10);
+                mitree->ReconstructIfNumRulesLessThanOrEqualTo(4);
                 rules.emplace_back(one_rule, mitree);
                 descriptorIndexMap[one_rule.descriptor] = rules.size() - 1;
                 return one_rule.descriptor;
@@ -151,7 +151,7 @@ void PartitionSort::PrintAllRules() const {
                 printf("[%u–%u] ", r.range[d][0], r.range[d][1]);
             }
         }
-        
+
         // print prefix lengths
         printf("\n   prefixes:");
         for (int d = 0; d < r.dim; ++d) {

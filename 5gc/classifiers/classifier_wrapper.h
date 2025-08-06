@@ -94,15 +94,17 @@ int cls_classify_packet(
 
 void cls_print_all_rules(cls_handle_t *);
 
+cls_handle_t *cls_global();
+
 #ifdef __cplusplus
 }
 #endif
 
 /*────────────────── Singleton accessor (header-only) ─────────────────────*/
-static inline cls_handle_t *cls_global(void)
+/* static inline cls_handle_t *cls_global(void)
 {
     static cls_handle_t *h = NULL;
     if (!h)
         h = cls_create(CLS_SELECTED_BACKEND);
     return h;
-}
+} */

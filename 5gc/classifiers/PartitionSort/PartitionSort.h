@@ -49,19 +49,26 @@ public:
 
 	MatchResult ClassifyAPacketMod(const Packet& packet)
 	{
+		printf("[SMOKE] Entered ClassifyAPacketMod\n");
+    	fflush(stdout);
 		MatchResult best{-1, 0};          // explicit init: priority = –1, desc = 0
 		int query = 0;
 		for (size_t idx = 0; idx < mitrees.size(); ++idx) {
+			printf("[SMOKE] Inside ClassifyAPacketMod loop\n");
+    		fflush(stdout);
 			auto* t = mitrees[idx];
-			if (best.priority > t->MaxPriority())
+			if (best.priority > t->MaxPriority()) {
+				printf("[SMOKE] Inside ClassifyAPacketMod break\n");
 				break;
+			}
+				
 
 			MatchResult m = t->ClassifyAPacketMod(packet);
 			printf("DBG MITree[%zu]: returned priority=%d descriptor=0x%lx (current best=%d)\n",
                idx, m.priority, (unsigned long)m.descriptor, best.priority);
 			if (m.priority > best.priority)
 				best = m;
-}
+		}
 		QueryUpdate(query);
 		return best;
 	}

@@ -22,6 +22,7 @@ int CompareBox(const box& a, const box& b ) {
 
 
 int inline CompareQuery(const box& a, const Packet& q, int level, const std::vector<int>& fieldOrder) {
+	printf("---------------Within CompareQuery----------------------- \n");
     const int LOW = 0, HIGH = 1;
     int field = fieldOrder[level];
     uint32_t v = q[field];
@@ -981,6 +982,7 @@ MatchResult RBExactQueryIterativeMod(
     const Packet&        q,
     const std::vector<int>& fieldOrder
 ) {
+	printf("---------------Within RBExactQueryIterativeMod----------------------- \n");
     int level = 0;
     while (true) {
         // 1) at leaf depth?
