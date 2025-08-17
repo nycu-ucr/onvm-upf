@@ -10,6 +10,9 @@
 #include <net/if.h>
 
 #include <rte_byteorder.h>
+#include <rte_ring.h>
+#include <rte_errno.h>
+#include <rte_mbuf.h>
 
 #include "utlt_debug.h"
 #include "utlt_pool.h"
@@ -31,6 +34,27 @@
 static UpfContext self;
 static _Bool upfContextInitialized = 0;
 static uint64_t g_sessionIdPool = 1;
+
+
+static inline const char* upf_dl_ring_name_for(uint32_t ue_ip_be, char *buf, size_t n) {
+    // Stable, readable name; BE printed as 8-hex
+    snprintf(buf, n, "upf_dl_%08x", (unsigned)ue_ip_be);
+    return buf;
+}
+
+static inline struct rte_ring* upf_dl_ring_create(uint32_t ue_ip_be, unsigned ring_size) {
+    char name[RTE_RING_NAMESIZE];
+    const char *rname = upf_dl_ring_name_for(ue_ip_be, name, sizeof(name));
+    unsigned flags = RING_F_MP_ENQ | RING_F_SC_DEQ;
+
+    struct rte_ring *r = rte_ring_create(rname, ring_size, rte_socket_id(), flags);
+    if (!r && rte_errno == EEXIST) {
+        r = rte_ring_lookup(rname);
+    } 
+    
+    return r;  // NULL on failure
+}
+
 
 UpfContext *Self() {
     return &self;
@@ -266,6 +290,22 @@ UpfSession *UpfSessionAdd(PfcpUeIpAddr *ueIp,
     UTLT_Assert(InsertUEIPtoSessionMap(session->ueIpv4.addr4.s_addr, session) == STATUS_OK,
                 UpfSessionRemove(session); return NULL, "Unable to create Downlink data for UE IP (%u)", ueIp->addr4.s_addr);
 
+
+    // per-UE DL ring created by UPF-C and stored directly into the shared session
+    {
+        uint32_t ue_ip_be = session->ueIpv4.addr4.s_addr;   // BE in your codebase
+        struct rte_ring *r = upf_dl_ring_create(ue_ip_be, UPF_SESSION_RING_SIZE);
+        if (!r) {
+            UTLT_Warn("DL ring create failed for UE_BE=%08x", ue_ip_be);
+            session->dl_ring = NULL;
+        } else {
+            session->dl_ring = r;
+        }
+        // Initialize UE-wide gate & counters on the shared session
+        rte_atomic32_set(&session->buffering, 0);     // gate open by default
+        session->dl_enq = session->dl_deq = session->dl_drp = 0;
+    }
+
     g_sessionIdPool++;
     return session;
 }
@@ -282,6 +322,33 @@ Status UpfSessionRemove(UpfSession *session) {
     }
     UeIpToUpfSessionMapFree(session->ueIpv4.addr4.s_addr);
     TeidToUpfSessionMapFree(session->teid);
+
+    // Per-UE DL buffer teardown
+    if (session->dl_ring) {
+        // Open the UE gate so UPF-U will not enqueue anymore
+        rte_atomic32_set(&session->buffering, 0);
+
+        // Commented out code: Drain in bursts + bulk-free mbufs
+        /* const unsigned BURST = 64;
+        struct rte_mbuf *pkts[BURST];
+        unsigned n;
+        while ((n = rte_ring_sc_dequeue_burst(r, (void **)pkts, BURST, NULL)) > 0) {
+            rte_pktmbuf_free_bulk(pkts, n);
+        }
+        rte_ring_free(r); */
+
+        // draining whatever already there before freeing the ring
+        struct rte_mbuf *m = NULL;
+        while (rte_ring_sc_dequeue(session->dl_ring, (void**)&m) == 0) {
+            rte_pktmbuf_free(m);
+        }
+
+        // free the ring we created in UpfSessionAdd
+        rte_ring_free(session->dl_ring);
+        session->dl_ring = NULL;
+    }
+
+
     UpfSessionFree(session);
     return STATUS_OK;
 }

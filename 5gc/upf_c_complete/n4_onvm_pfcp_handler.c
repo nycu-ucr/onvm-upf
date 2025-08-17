@@ -21,6 +21,7 @@
 #include <endian.h>
 #include <arpa/inet.h>
 #include <net/if.h>
+#include <rte_malloc.h>
 
 #include "onvm_nflib.h"
 
@@ -33,10 +34,38 @@
 #include "pfcp_convert.h"
 #include "n4_onvm_pfcp_build.h"
 
+#include "utlt_event.h"
+#include "upf_events.h" 
+
 #include "updk/rule.h"
 #include "updk/rule_pdr.h"
 #include "updk/rule_far.h"
 #include "updk/rule_qer.h"
+
+
+
+
+static inline int send_upf_evt(uint32_t ue_ip_be, uint32_t type) {
+    Event *e = (Event *)rte_calloc("upf_evt", 1, sizeof(*e), 0);
+    if (!e) return -1;
+    e->type = (uintptr_t)type;
+    e->argc = 1;
+    e->arg0 = (uintptr_t)ue_ip_be;
+    int rc = onvm_nflib_send_msg_to_nf(UPF_U_SERVICE_ID, e);
+    if (rc < 0) {
+        rte_free(e);
+    }
+    return rc;
+}
+
+static inline int send_set_buffer(uint32_t ue_ip_be) {
+    return send_upf_evt(ue_ip_be, UPF_EVENT_SET_BUFFER);
+}
+
+static inline int send_clear_and_drain(uint32_t ue_ip_be) {
+    return send_upf_evt(ue_ip_be, UPF_EVENT_CLEAR_AND_DRAIN);
+}
+
 
 /*
  * Note: When apply a IE from PDR or FAR, you should check all
@@ -395,6 +424,16 @@ Status UpfN4HandleCreateFar(UpfSession *session, CreateFAR *createFar) {
     UTLT_Assert(UpfFARRegisterToSession(session, upfFar),
                 return STATUS_ERROR,
                 "UpfFARRegisterToSession failed");
+    
+    // If FAR is created with BUFF, close the UE gate now (UE-wide buffering)
+    if (upfFar->applyAction & PFCP_FAR_APPLY_ACTION_BUFF) {
+        uint32_t ue_ip_be = session->ueIpv4.addr4.s_addr;
+        int rc = send_set_buffer(ue_ip_be);
+        if (rc < 0) {
+            UTLT_Warn("SET_BUFFER event send failed for UE (BE=%08x)", ue_ip_be);
+        }
+    }
+
     return STATUS_OK;
 }
 
@@ -844,56 +883,51 @@ Status UpfN4HandleUpdateFar(UpfSession *session, UpdateFAR *updateFar) {
                 return STATUS_ERROR, "Far ID not presence");
 
     uint32_t farID = ntohl(*((uint32_t *)updateFar->fARID.value));
-    //to check the last action
-    uint8_t oldAction;
 
     UpfFAR *upfFar = UpfFARFindByID(session, farID);
-    UTLT_Assert(upfFar != NULL, return STATUS_ERROR, "FAR ID[%u] does NOT exist in UPF Context", farID);
+    UTLT_Assert(upfFar != NULL, return STATUS_ERROR,
+                "FAR ID[%u] does NOT exist in UPF Context", farID);
 
-    //to check the last action
-    oldAction = upfFar->applyAction;
-    if (oldAction & PFCP_FAR_APPLY_ACTION_BUFF) {
-         onvm_nflib_send_msg_to_nf(1, NULL);
-    }
+    /* Save old action to detect transitions */
+    uint8_t oldAction = upfFar->applyAction;
 
     UTLT_Assert(_ConvertUpdateFARTlvToRule(upfFar, updateFar) == STATUS_OK,
-        return STATUS_ERROR, "Convert FAR TLV To Rule is failed");
+                return STATUS_ERROR, "Convert FAR TLV To Rule is failed");
 
-#if HANDLE_BUFFER
-    // Buffered packet handle
-    if ((oldAction & PFCP_FAR_APPLY_ACTION_BUFF)) {
-        Sock *sock = &Self()->upSock;
+    // New action after applying the update
+    uint8_t newAction = upfFar->applyAction;
 
-        UpfBufPacket *bufPacket;
-        if (upfFar.applyAction & PFCP_FAR_APPLY_ACTION_DROP) {
-            UpfPDRNode *node, *nextNode = NULL;
-            ListForEachSafe(node, nextNode, &session->pdrList) {
-                UTLT_Assert((bufPacket = UpfBufPacketFindByPdrId(node->pdr.pdrId)), continue, "");
-                UpfBufPacketRemove(bufPacket);
-            }
-        } else if (upfFar.applyAction & PFCP_FAR_APPLY_ACTION_FORW) {
-            sock->remoteAddr._family = sock->localAddr._family;
-            sock->remoteAddr._port = sock->localAddr._port;
-            
-            if (sock->localAddr._family == AF_INET)
-                sock->remoteAddr.s4.sin_addr = upfFar.forwardingParameters.outerHeaderCreation.ipv4;
-            else
-                UTLT_Warning("Do NOT support IPv6 yet");
-            
-            UpfPDRNode *node, *nextNode = NULL;
-            ListForEachSafe(node, nextNode, &session->pdrList) {
-                UTLT_Assert(UpSendPacketByPdrFar(&node->pdr, &upfFar, sock) == STATUS_OK,
-                    continue, "UpSendPacketByPdrFar failed: PDR ID[%u], FAR ID[%u]", node->pdr.pdrId, node->pdr.farId);
-            }
+    uint32_t ue_ip_be = session->ueIpv4.addr4.s_addr;
+
+    /* === Drive UE-wide buffering via events (AFTER update) ===
+     * OFF→ON: start buffering (close gate)
+     * ON→OFF: stop buffering + drain (open gate, reuse live path with new TEID/gNB)
+     */
+
+    bool was_buff = (oldAction & PFCP_FAR_APPLY_ACTION_BUFF) != 0;
+    bool is_buff  = (newAction & PFCP_FAR_APPLY_ACTION_BUFF) != 0;
+    
+    if (!was_buff && is_buff) {
+        int rc = send_set_buffer(ue_ip_be);
+        if (rc < 0) {
+            UTLT_Warn("SET_BUFFER event send failed (UE_BE=%08x)", ue_ip_be);
+        }
+    } else if (was_buff && !is_buff) {
+        int rc = send_clear_and_drain(ue_ip_be);
+        if (rc < 0) {
+            UTLT_Warn("CLEAR_AND_DRAIN event send failed (UE_BE=%08x)", ue_ip_be);
         }
     }
-#endif
-    //if the action of srr has been done, then need to set the srr_flag to false
-    if((oldAction & PFCP_FAR_APPLY_ACTION_NOCP) && !(upfFar->applyAction & PFCP_FAR_APPLY_ACTION_NOCP)){
+
+    if ((oldAction & PFCP_FAR_APPLY_ACTION_NOCP) && !(newAction & PFCP_FAR_APPLY_ACTION_NOCP)) {
         session->srr_flag = false;
     }
+
     return STATUS_OK;
 }
+
+
+
 
 Status _ConvertUpdateQERTlvToRule(UpfQER *upfQer, UpdateQER *updateQer) {
     UTLT_Assert(upfQer && updateQer, return STATUS_ERROR,

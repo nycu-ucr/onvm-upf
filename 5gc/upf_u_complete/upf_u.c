@@ -31,6 +31,7 @@
 #include <sys/queue.h>
 #include <time.h>
 #include <unistd.h>
+#include <rte_byteorder.h>
 
 #include "gtp.h"
 #include "upf_context.h"
@@ -39,6 +40,10 @@
 #include "onvm_nflib.h"
 #include "onvm_pkt_helper.h"
 #include "rte_meter.h"
+
+#include "utlt_event.h"
+#include "upf_events.h"
+#include "upf_u_session_buf.h"
 
 #define NF_TAG "upf_u"
 
@@ -165,9 +170,18 @@ parseMAC(const char *config_path) {
     fclose(file);
 };
 
-#define MAX_OF_BUFFER_PACKET_SIZE 30000
-struct rte_mbuf *buffer[MAX_OF_BUFFER_PACKET_SIZE];
-uint32_t buffer_length = 0;
+
+static inline uint64_t now_us(void) {
+    struct timespec ts;
+    timespec_get(&ts, TIME_UTC);
+    return (uint64_t)ts.tv_sec * 1000000ULL + (uint64_t)(ts.tv_nsec / 1000ULL);
+}
+
+// commenting out global buffers
+
+// #define MAX_OF_BUFFER_PACKET_SIZE 30000
+// struct rte_mbuf *buffer[MAX_OF_BUFFER_PACKET_SIZE];
+// uint32_t buffer_length = 0;
 
 static inline uint8_t
 SourceInterfaceToPort(uint8_t interface) {
@@ -754,13 +768,7 @@ HandlePacketWithFar(struct rte_mbuf *pkt, UPDK_FAR *far, UPDK_QER *qer, struct o
                 meta->action = ONVM_NF_ACTION_OUT;
                 break;
             case UPDK_FAR_APPLY_ACTION_BUFF:
-                meta->destination = pkt->port ^ 1;
-                meta->action = ONVM_NF_ACTION_DROP;
-                if (buffer_length < MAX_OF_BUFFER_PACKET_SIZE) {
-                    Encap(pkt, far, qer);
-                    buffer[buffer_length++] = pkt;
-                    buff = 1;
-                }
+                meta->action = ONVM_NF_ACTION_DROP; 
                 break;
             default:
                 UTLT_Error("Unspec apply action[%u] in FAR[%u]", far->applyAction, far->farId);
@@ -811,8 +819,7 @@ AttachL2Header(struct rte_mbuf *pkt, bool is_dl) {
     eth_hdr->ether_type = rte_cpu_to_be_16(RTE_ETHER_TYPE_IPV4);
 }
 
-static int
-packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm_nf_local_ctx *nf_local_ctx) {
+static int packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm_nf_local_ctx *nf_local_ctx) {
     if (pkt == NULL || meta == NULL) {
         return 0;
     }
@@ -857,6 +864,30 @@ packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm_nf_
         timespec_get(&ts, TIME_UTC);
         // UTLT_Info("(%d) Time: %ld.%09ld\n", rte_cpu_to_be_32(iph->dst_addr), ts.tv_sec, ts.tv_nsec);
         UTLT_Info("(%s) Time: %ld.%09ld\n", convertToIpAddress(iph->dst_addr), ts.tv_sec, ts.tv_nsec);
+
+
+        // UE-wide buffering gate (buffer if CP flips the session bit)
+        UpfSession *sess = UpfSessionFindByUeIP(rte_cpu_to_be_32(iph->dst_addr));
+        if (sess && sess->dl_ring && rte_atomic32_read(&sess->buffering)) {
+            if (upfu_enqueue_dl(sess, pkt) != 0) {
+                // Ring full: helper already bumped dl_drp and fixed refcount.
+                if ((sess->dl_drp & 0x3FFu) == 1u) {  // ~1/1024
+                    uint32_t ip_host = rte_be_to_cpu_32(ue_ip_be);
+                    unsigned a = (ip_host >> 24) & 0xFF, b = (ip_host >> 16) & 0xFF;
+                    unsigned c = (ip_host >>  8) & 0xFF, d = (ip_host >>  0) & 0xFF;
+                    unsigned ring_count = sess->dl_ring ? rte_ring_count(sess->dl_ring) : 0;
+                    unsigned ring_free  = sess->dl_ring ? rte_ring_free_count(sess->dl_ring) : 0;
+                    UTLT_Warn("DL buffer full for UE %u.%u.%u.%u: drops=%" PRIu64
+                              " enq=%" PRIu64 " ring_count=%u free=%u",
+                              a,b,c,d, sess->dl_drp, sess->dl_enq, ring_count, ring_free);
+                }
+            }
+
+            // live copy must not continue. (queued or tail-dropped)
+            meta->action = ONVM_NF_ACTION_DROP;
+            return 1;
+        }
+
         //  Step 2: Get PDR rule
         pdr = GetPdrByUeIpAddress(pkt, rte_cpu_to_be_32(iph->dst_addr));
         GetQerByUEIpAddress(rte_cpu_to_be_32(iph->dst_addr), convertToIpAddress(iph->dst_addr));
@@ -909,6 +940,7 @@ packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm_nf_
     status = HandlePacketWithFar(pkt, far, pdr->qer, meta);
     if (meta->action == ONVM_NF_ACTION_DROP) {
         UTLT_Info("Action is drop\n");
+		return status;
     } else if (meta->action == ONVM_NF_ACTION_OUT) {
         UTLT_Info("Action is out\n");
     } else {
@@ -983,36 +1015,94 @@ packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm_nf_
     return status;
 }
 
-void
-msg_handler(void *msg_data, struct onvm_nf_local_ctx *nf_local_ctx) {
-    struct onvm_nf *nf;
-    nf = nf_local_ctx->nf;
+void msg_handler(void *msg_data, struct onvm_nf_local_ctx *ctx) {
+    Event *e = (Event *)msg_data;
+    if (!e) return;
 
-    if (buffer_length <= 0) {
+    switch ((uint32_t)e->type) {
+
+    case UPF_EVENT_SET_BUFFER: {
+        // arg0 = ue_ip_be (network order)
+        if (e->argc < 1) {
+            UTLT_Warn("SET_BUFFER: missing arg0 (ue_ip_be)");
+            rte_free(e);
+            return; 
+        }
+        uint32_t ue_ip_be = (uint32_t)e->arg0;
+
+        // Remove the following two lines later after validation
+        const char *ue = convertToIpAddress(ue_ip_be);  // expects BE
+        UTLT_Info("UE %s — msg: type=0x%08x argc=%u", ue, (uint32_t)e->type, (unsigned)e->argc);
+
+        uint64_t t0 = now_us();
+
+        UpfSession *s = UpfSessionFindByUeIP(ue_ip_be);
+        if (s && s->dl_ring) {
+            // Close UE-wide gate: subsequent DL packets will be enqueued by the gate
+            upfu_set_buffering(s, 1);
+        }
+
+        uint64_t dt = now_us() - t0;
+
+        UTLT_Info("UE %s — SET_BUFFER: dt=%" PRIu64 " us", ue, dt);
+
+        rte_free(e);
         return;
     }
 
-    // struct onvm_pkt_meta *meta;
-//#ifdef FIX_BUFFER
-//    for (i = 0; i < buffer_length; i++) {
-        // TODO: (@vivek fix it)
-//        Encap(buffer[i]);
-//        AttachL2Header(buffer[i], 1); // 1 == Downlink packet
-//        meta = onvm_get_pkt_meta(buffer[i]);
-//        meta = ONVM_NF_ACTION_OUT;
-//    }
-//#endif
+    case UPF_EVENT_CLEAR_AND_DRAIN: {
+        if (e->argc < 1) {
+            UTLT_Warn("CLEAR_AND_DRAIN: missing arg0 (ue_ip_be)");
+            rte_free(e);
+            return;
+        }
+        uint32_t ue_ip_be = (uint32_t)e->arg0;
 
-    struct onvm_configuration *onvm_config = onvm_nflib_get_onvm_config();
-    if (onvm_config == NULL) {
-        fprintf(stderr, "Error: onvm_nflib_get_onvm_config() returned NULL\n");
-        exit(EXIT_FAILURE);
+        // Remove the following two lines later after validation
+        const char *ue = convertToIpAddress(ue_ip_be);  // expects BE
+        UTLT_Info("UE %s — msg: type=0x%08x argc=%u", ue, (uint32_t)e->type, (unsigned)e->argc);
+
+        uint64_t t0 = now_us();
+
+        UpfSession *s = UpfSessionFindByUeIP(ue_ip_be);  /* expects BE */
+        if (s && s->dl_ring) {
+            /* Open gate then drain a budget now through the live pipeline */
+            upfu_set_buffering(s, 0);
+            upfu_drain_now(s, ctx);
+        }
+        uint64_t dt = now_us() - t0;
+
+        UTLT_Info("UE %s — CLEAR_AND_DRAIN: dt=%" PRIu64 " us", ue, dt);
+
+        rte_free(e);
+        return;
     }
-    onvm_pkt_process_tx_batch(nf->nf_tx_mgr, buffer, onvm_config->dynfield_offset, buffer_length, nf);
-    onvm_pkt_flush_all_nfs(nf->nf_tx_mgr, nf);
-    UTLT_Debug("Sending out %u packets\n", buffer_length);
-    buffer_length = 0;
+
+    default:
+        break;
+    }
 }
+
+
+void __upf_process_dl_packet(struct rte_mbuf *m,
+                        UpfSession *s /*unused*/,
+                        struct onvm_nf_local_ctx *ctx) {
+  struct onvm_configuration *cfg = onvm_nflib_get_onvm_config();
+  struct onvm_pkt_meta *meta = onvm_get_pkt_meta(m, cfg->dynfield_offset);
+
+  /* Safety default; packet_handler will set final action */
+  meta->action = ONVM_NF_ACTION_DROP;
+
+  int ret = packet_handler(m, meta, ctx);
+
+  if (ret == 0) {
+    // Hand back to ONVM runtime; it will follow meta->action
+    onvm_nflib_return_pkt(ctx->nf, m);
+  } else {
+    rte_pktmbuf_free(m);
+  }
+}
+
 
 uint64_t last_p = NULL;
 static int 
@@ -1051,7 +1141,7 @@ main(int argc, char *argv[]) {
     struct onvm_nf_local_ctx *nf_local_ctx;
     struct onvm_nf_function_table *nf_function_table;
     // UTLT_SetLogLevel("Panic"); // to eliminate log print influenced jitter
-    UTLT_SetLogLevel("warning"); // to eliminate log print influenced jitter
+    UTLT_SetLogLevel("debug"); // to eliminate log print influenced jitter
 
     nf_local_ctx = onvm_nflib_init_nf_local_ctx();
     onvm_nflib_start_signal_handler(nf_local_ctx, NULL);

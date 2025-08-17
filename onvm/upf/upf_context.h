@@ -5,6 +5,8 @@
 #include <netinet/in.h>
 #include <net/if.h>
 #include <pthread.h>
+#include <rte_ring.h>
+#include <rte_atomic.h>
 
 #include "utlt_list.h"
 #include "utlt_buff.h"
@@ -140,6 +142,17 @@ typedef struct _UpfSession {
     list_t          *qer_list;
 
     bool srr_flag;
+
+
+    /* --- DL buffering additions --- */
+    struct rte_ring   *dl_ring;      // lazily created per-UE buffer
+    rte_atomic32_t     buffering;    // 1 = buffer DL, 0 = forward
+    
+    // counters
+    uint64_t           dl_enq;
+    uint64_t           dl_deq;
+    uint64_t           dl_drp;
+
 } UpfSession;
 
 UpfContext *Self();

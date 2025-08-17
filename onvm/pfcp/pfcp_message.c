@@ -189,7 +189,7 @@ static IeDescription ieDescriptionTable[] = {\
 {0, sizeof(PFCPSessionReportResponse), 0, 4, {19, 40, 12, 50, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}}, \
 };
 
-_Bool dbf = 0;
+_Bool dbf = 1;
 
 int _TlvParseMessage(void * msg, IeDescription * msgDes, void * buff, int buffLen) {
     int msgPivot = 0; // msg (struct) offset
