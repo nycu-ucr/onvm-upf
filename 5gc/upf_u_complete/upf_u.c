@@ -872,12 +872,12 @@ static int packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, stru
             if (upfu_enqueue_dl(sess, pkt) != 0) {
                 // Ring full: helper already bumped dl_drp and fixed refcount.
                 if ((sess->dl_drp & 0x3FFu) == 1u) {  // ~1/1024
-                    uint32_t ip_host = rte_be_to_cpu_32(ue_ip_be);
+                    uint32_t ip_host = rte_be_to_cpu_32(iph->dst_addr);
                     unsigned a = (ip_host >> 24) & 0xFF, b = (ip_host >> 16) & 0xFF;
                     unsigned c = (ip_host >>  8) & 0xFF, d = (ip_host >>  0) & 0xFF;
                     unsigned ring_count = sess->dl_ring ? rte_ring_count(sess->dl_ring) : 0;
                     unsigned ring_free  = sess->dl_ring ? rte_ring_free_count(sess->dl_ring) : 0;
-                    UTLT_Warn("DL buffer full for UE %u.%u.%u.%u: drops=%" PRIu64
+                    UTLT_Warning("DL buffer full for UE %u.%u.%u.%u: drops=%" PRIu64
                               " enq=%" PRIu64 " ring_count=%u free=%u",
                               a,b,c,d, sess->dl_drp, sess->dl_enq, ring_count, ring_free);
                 }
@@ -1024,7 +1024,7 @@ void msg_handler(void *msg_data, struct onvm_nf_local_ctx *ctx) {
     case UPF_EVENT_SET_BUFFER: {
         // arg0 = ue_ip_be (network order)
         if (e->argc < 1) {
-            UTLT_Warn("SET_BUFFER: missing arg0 (ue_ip_be)");
+            UTLT_Warning("SET_BUFFER: missing arg0 (ue_ip_be)");
             rte_free(e);
             return; 
         }
@@ -1052,7 +1052,7 @@ void msg_handler(void *msg_data, struct onvm_nf_local_ctx *ctx) {
 
     case UPF_EVENT_CLEAR_AND_DRAIN: {
         if (e->argc < 1) {
-            UTLT_Warn("CLEAR_AND_DRAIN: missing arg0 (ue_ip_be)");
+            UTLT_Warning("CLEAR_AND_DRAIN: missing arg0 (ue_ip_be)");
             rte_free(e);
             return;
         }

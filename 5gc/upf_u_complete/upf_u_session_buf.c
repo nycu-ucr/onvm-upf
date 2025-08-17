@@ -14,11 +14,6 @@
 } */
 
 
-static inline void upfu_set_buffering(UpfSession *s, int on) {
-    rte_atomic32_set(&s->buffering, on ? 1 : 0);
-}
-
-
 // NOTE: init is owned by UPF-C now. Keeping a stub for linkage if anything ever calls it.
 
 int upfu_session_buf_init(UpfSession *s, unsigned ring_size) {

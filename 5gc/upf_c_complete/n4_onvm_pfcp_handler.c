@@ -430,7 +430,7 @@ Status UpfN4HandleCreateFar(UpfSession *session, CreateFAR *createFar) {
         uint32_t ue_ip_be = session->ueIpv4.addr4.s_addr;
         int rc = send_set_buffer(ue_ip_be);
         if (rc < 0) {
-            UTLT_Warn("SET_BUFFER event send failed for UE (BE=%08x)", ue_ip_be);
+            UTLT_Warning("SET_BUFFER event send failed for UE (BE=%08x)", ue_ip_be);
         }
     }
 
@@ -910,12 +910,12 @@ Status UpfN4HandleUpdateFar(UpfSession *session, UpdateFAR *updateFar) {
     if (!was_buff && is_buff) {
         int rc = send_set_buffer(ue_ip_be);
         if (rc < 0) {
-            UTLT_Warn("SET_BUFFER event send failed (UE_BE=%08x)", ue_ip_be);
+            UTLT_Warning("SET_BUFFER event send failed (UE_BE=%08x)", ue_ip_be);
         }
     } else if (was_buff && !is_buff) {
         int rc = send_clear_and_drain(ue_ip_be);
         if (rc < 0) {
-            UTLT_Warn("CLEAR_AND_DRAIN event send failed (UE_BE=%08x)", ue_ip_be);
+            UTLT_Warning("CLEAR_AND_DRAIN event send failed (UE_BE=%08x)", ue_ip_be);
         }
     }
 

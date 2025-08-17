@@ -20,6 +20,7 @@
 #include "utlt_hash.h"
 #include "utlt_network.h"
 #include "utlt_netheader.h"
+#include "upf_events.h"
 
 #include "pfcp_message.h"
 #include "pfcp_types.h"
@@ -45,7 +46,7 @@ static inline const char* upf_dl_ring_name_for(uint32_t ue_ip_be, char *buf, siz
 static inline struct rte_ring* upf_dl_ring_create(uint32_t ue_ip_be, unsigned ring_size) {
     char name[RTE_RING_NAMESIZE];
     const char *rname = upf_dl_ring_name_for(ue_ip_be, name, sizeof(name));
-    unsigned flags = RING_F_MP_ENQ | RING_F_SC_DEQ;
+    unsigned flags = RING_F_SC_DEQ;
 
     struct rte_ring *r = rte_ring_create(rname, ring_size, rte_socket_id(), flags);
     if (!r && rte_errno == EEXIST) {
@@ -296,7 +297,7 @@ UpfSession *UpfSessionAdd(PfcpUeIpAddr *ueIp,
         uint32_t ue_ip_be = session->ueIpv4.addr4.s_addr;   // BE in your codebase
         struct rte_ring *r = upf_dl_ring_create(ue_ip_be, UPF_SESSION_RING_SIZE);
         if (!r) {
-            UTLT_Warn("DL ring create failed for UE_BE=%08x", ue_ip_be);
+            UTLT_Warning("DL ring create failed for UE_BE=%08x", ue_ip_be);
             session->dl_ring = NULL;
         } else {
             session->dl_ring = r;
