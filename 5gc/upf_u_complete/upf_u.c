@@ -77,6 +77,31 @@ uint8_t DnMac[RTE_ETHER_ADDR_LEN];
 uint8_t AnMac[RTE_ETHER_ADDR_LEN];
 int SELF_IP;
 
+
+// ------------------ remove this part after unit testing --------------------------------------
+// Per-UE state keyed by UE IP (BE)
+// tiny, static table that persists across function calls
+typedef struct { 
+    uint32_t ip_be;
+    uint32_t cnt; 
+} __ue_test_row_t;
+
+static __ue_test_row_t __ue_test_tab[64];
+
+static inline uint32_t *__ue_test_get_cnt_by_ip(uint32_t ip_be) {
+    // simple hash+linear probe
+    uint32_t mask = (uint32_t)(sizeof(__ue_test_tab)/sizeof(__ue_test_tab[0])) - 1u;
+    uint32_t i = (ip_be ? (ip_be ^ (ip_be >> 11) ^ (ip_be >> 19)) : 0u) & mask;
+    for (uint32_t p = 0; p < (uint32_t)(sizeof(__ue_test_tab)/sizeof(__ue_test_tab[0])); ++p) {
+        uint32_t idx = (i + p) & mask;
+        if (__ue_test_tab[idx].ip_be == ip_be) return &__ue_test_tab[idx].cnt;
+        if (__ue_test_tab[idx].ip_be == 0u) { __ue_test_tab[idx].ip_be = ip_be; __ue_test_tab[idx].cnt = 0; return &__ue_test_tab[idx].cnt; }
+    }
+    return NULL; /* table full: disable test for this UE */
+}
+
+// ------------------ upper block to be removed after unit testing -----------------------------
+
 char *
 convertToIpAddress(uint32_t big_endian_value) {
     static char ip_string[16];
@@ -887,28 +912,6 @@ static int packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, stru
             meta->action = ONVM_NF_ACTION_DROP;
             return 1;
         } */
-
-
-        // Per-UE state keyed by UE IP (BE)
-        // tiny, static table that persists across function calls
-        typedef struct { 
-            uint32_t ip_be;
-            uint32_t cnt; 
-        } __ue_test_row_t;
-        
-        static __ue_test_row_t __ue_test_tab[1024];
-
-        static inline uint32_t *__ue_test_get_cnt_by_ip(uint32_t ip_be) {
-            // simple hash+linear probe
-            uint32_t mask = (uint32_t)(sizeof(__ue_test_tab)/sizeof(__ue_test_tab[0])) - 1u;
-            uint32_t i = (ip_be ? (ip_be ^ (ip_be >> 11) ^ (ip_be >> 19)) : 0u) & mask;
-            for (uint32_t p = 0; p < (uint32_t)(sizeof(__ue_test_tab)/sizeof(__ue_test_tab[0])); ++p) {
-                uint32_t idx = (i + p) & mask;
-                if (__ue_test_tab[idx].ip_be == ip_be) return &__ue_test_tab[idx].cnt;
-                if (__ue_test_tab[idx].ip_be == 0u) { __ue_test_tab[idx].ip_be = ip_be; __ue_test_tab[idx].cnt = 0; return &__ue_test_tab[idx].cnt; }
-            }
-            return NULL; /* table full: disable test for this UE */
-        }
 
         // Compute the UE key and look up the session
         const uint32_t ue_ip_be = rte_cpu_to_be_32(iph->dst_addr);
