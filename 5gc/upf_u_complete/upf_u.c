@@ -86,6 +86,7 @@ typedef struct {
     uint32_t cnt; 
 } __ue_test_row_t;
 
+static int __upf_in_drain = 0;
 static __ue_test_row_t __ue_test_tab[64];
 
 static inline uint32_t *__ue_test_get_cnt_by_ip(uint32_t ip_be) {
@@ -916,7 +917,7 @@ static int packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, stru
         UpfSession *sess = UpfSessionFindByUeIP(ue_ip_be);
 
         // Decide PASS vs BUFFER for this UE (and flip the gate accordingly)
-        if (sess && sess->dl_ring) {
+        if (__upf_in_drain == 0 && sess && sess->dl_ring) {
             /* k in [0..9]  -> PASS (gate open)
             k in [10..19]-> BUFFER (gate closed), then auto-drain on k==19 */
             uint32_t *pcnt = __ue_test_get_cnt_by_ip(ue_ip_be);
@@ -1193,20 +1194,22 @@ void msg_handler(void *msg_data, struct onvm_nf_local_ctx *ctx) {
 void __upf_process_dl_packet(struct rte_mbuf *m,
                         UpfSession *s /*unused*/,
                         struct onvm_nf_local_ctx *ctx) {
-  struct onvm_configuration *cfg = onvm_nflib_get_onvm_config();
-  struct onvm_pkt_meta *meta = onvm_get_pkt_meta(m, cfg->dynfield_offset);
+    struct onvm_configuration *cfg = onvm_nflib_get_onvm_config();
+    struct onvm_pkt_meta *meta = onvm_get_pkt_meta(m, cfg->dynfield_offset);
 
-  /* Safety default; packet_handler will set final action */
-  meta->action = ONVM_NF_ACTION_DROP;
+    /* Safety default; packet_handler will set final action */
+    meta->action = ONVM_NF_ACTION_DROP;
 
-  int ret = packet_handler(m, meta, ctx);
-
-  if (ret == 0) {
+    /* Mark “drain context” while we reuse the live pipeline */
+    __upf_in_drain++;
+    int ret = packet_handler(m, meta, ctx);
+    __upf_in_drain--;
+    if (ret == 0) {
     // Hand back to ONVM runtime; it will follow meta->action
     onvm_nflib_return_pkt(ctx->nf, m);
-  } else {
+    } else {
     rte_pktmbuf_free(m);
-  }
+    }
 }
 
 
