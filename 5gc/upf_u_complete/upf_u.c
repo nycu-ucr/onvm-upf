@@ -928,10 +928,10 @@ static int packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, stru
 
                 if (k == 0u) {
                     UTLT_Info("UE %s — TEST: starting PASS phase (10 pkts)",
-                            convertToIpAddress(ue_ip_be));
+                            convertToIpAddress(iph->dst_addr));
                 } else if (k == 10u) {
                     UTLT_Info("UE %s — TEST: starting BUFFER phase (10 pkts)",
-                            convertToIpAddress(ue_ip_be));
+                            convertToIpAddress(iph->dst_addr));
                 }
 
                 if (k < 10u) {
@@ -953,9 +953,9 @@ static int packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, stru
                     unsigned c = (ip_host >>  8) & 0xFF, d = (ip_host >>  0) & 0xFF;
                     unsigned ring_count = sess->dl_ring ? rte_ring_count(sess->dl_ring) : 0;
                     unsigned ring_free  = sess->dl_ring ? rte_ring_free_count(sess->dl_ring) : 0;
-                    UTLT_Warning("DL buffer full for UE %u.%u.%u.%u: drops=%" PRIu64
-                                " enq=%" PRIu64 " ring_count=%u free=%u",
-                                a,b,c,d, sess->dl_drp, sess->dl_enq, ring_count, ring_free);
+                    UTLT_Warning("DL buffer full for UE %s: drops=%" PRIu64 " enq=%" PRIu64
+                                 " ring_count=%u free=%u", convertToIpAddress(iph->dst_addr),
+                                 sess->dl_drp, sess->dl_enq, ring_count, ring_free);
                 }
             }
 
@@ -971,7 +971,7 @@ static int packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, stru
                         upfu_drain_now(sess, nf_local_ctx);
                         uint64_t drained = sess->dl_deq - before;
                         UTLT_Info("UE %s — TEST: drained %" PRIu64 " buffered pkts; cycle complete",
-                                convertToIpAddress(ue_ip_be), drained);
+                                convertToIpAddress(iph->dst_addr), drained);
                     }
                 }
             }
@@ -1126,7 +1126,7 @@ void msg_handler(void *msg_data, struct onvm_nf_local_ctx *ctx) {
         uint32_t ue_ip_be = (uint32_t)e->arg0;
 
         // Remove the following two lines later after validation
-        const char *ue = convertToIpAddress(ue_ip_be);  // expects BE
+        const char *ue = convertToIpAddress(rte_be_to_cpu_32(ue_ip_be));  // expects BE
         UTLT_Info("UE %s — msg: type=0x%08x argc=%u", ue, (uint32_t)e->type, (unsigned)e->argc);
 
         uint64_t t0 = now_us();
