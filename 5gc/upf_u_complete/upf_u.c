@@ -867,7 +867,7 @@ static int packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, stru
 
 
         // UE-wide buffering gate (buffer if CP flips the session bit)
-        UpfSession *sess = UpfSessionFindByUeIP(rte_cpu_to_be_32(iph->dst_addr));
+        /* UpfSession *sess = UpfSessionFindByUeIP(rte_cpu_to_be_32(iph->dst_addr));
         if (sess && sess->dl_ring && rte_atomic32_read(&sess->buffering)) {
             if (upfu_enqueue_dl(sess, pkt) != 0) {
                 // Ring full: helper already bumped dl_drp and fixed refcount.
@@ -886,7 +886,99 @@ static int packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, stru
             // live copy must not continue. (queued or tail-dropped)
             meta->action = ONVM_NF_ACTION_DROP;
             return 1;
+        } */
+
+
+        // Per-UE state keyed by UE IP (BE)
+        // tiny, static table that persists across function calls
+        typedef struct { 
+            uint32_t ip_be;
+            uint32_t cnt; 
+        } __ue_test_row_t;
+        
+        static __ue_test_row_t __ue_test_tab[1024];
+
+        static inline uint32_t *__ue_test_get_cnt_by_ip(uint32_t ip_be) {
+            // simple hash+linear probe
+            uint32_t mask = (uint32_t)(sizeof(__ue_test_tab)/sizeof(__ue_test_tab[0])) - 1u;
+            uint32_t i = (ip_be ? (ip_be ^ (ip_be >> 11) ^ (ip_be >> 19)) : 0u) & mask;
+            for (uint32_t p = 0; p < (uint32_t)(sizeof(__ue_test_tab)/sizeof(__ue_test_tab[0])); ++p) {
+                uint32_t idx = (i + p) & mask;
+                if (__ue_test_tab[idx].ip_be == ip_be) return &__ue_test_tab[idx].cnt;
+                if (__ue_test_tab[idx].ip_be == 0u) { __ue_test_tab[idx].ip_be = ip_be; __ue_test_tab[idx].cnt = 0; return &__ue_test_tab[idx].cnt; }
+            }
+            return NULL; /* table full: disable test for this UE */
         }
+
+        // Compute the UE key and look up the session
+        const uint32_t ue_ip_be = rte_cpu_to_be_32(iph->dst_addr);
+        UpfSession *sess = UpfSessionFindByUeIP(ue_ip_be);
+
+        // Decide PASS vs BUFFER for this UE (and flip the gate accordingly)
+        if (sess && sess->dl_ring) {
+            /* k in [0..9]  -> PASS (gate open)
+            k in [10..19]-> BUFFER (gate closed), then auto-drain on k==19 */
+            uint32_t *pcnt = __ue_test_get_cnt_by_ip(ue_ip_be);
+            if (pcnt) {
+                uint32_t k = (*pcnt) % 20u;
+                ++(*pcnt);
+
+                if (k == 0u) {
+                    UTLT_Info("UE %s — TEST: starting PASS phase (10 pkts)",
+                            convertToIpAddress(ue_ip_be));
+                } else if (k == 10u) {
+                    UTLT_Info("UE %s — TEST: starting BUFFER phase (10 pkts)",
+                            convertToIpAddress(ue_ip_be));
+                }
+
+                if (k < 10u) {
+                    /* PASS phase: ensure gate open */
+                    if (rte_atomic32_read(&sess->buffering)) upfu_set_buffering(sess, 0);
+                } else {
+                    /* BUFFER phase: ensure gate closed so block below enqueues */
+                    if (!rte_atomic32_read(&sess->buffering)) upfu_set_buffering(sess, 1);
+                }
+            }
+        }
+
+        // canonical UE-wide buffering gate (actual enqueue happens only here)
+        if (sess && sess->dl_ring && rte_atomic32_read(&sess->buffering)) {
+            if (upfu_enqueue_dl(sess, pkt) != 0) {
+                if ((sess->dl_drp & 0x3FFu) == 1u) {
+                    uint32_t ip_host = rte_be_to_cpu_32(ue_ip_be);
+                    unsigned a = (ip_host >> 24) & 0xFF, b = (ip_host >> 16) & 0xFF;
+                    unsigned c = (ip_host >>  8) & 0xFF, d = (ip_host >>  0) & 0xFF;
+                    unsigned ring_count = sess->dl_ring ? rte_ring_count(sess->dl_ring) : 0;
+                    unsigned ring_free  = sess->dl_ring ? rte_ring_free_count(sess->dl_ring) : 0;
+                    UTLT_Warning("DL buffer full for UE %u.%u.%u.%u: drops=%" PRIu64
+                                " enq=%" PRIu64 " ring_count=%u free=%u",
+                                a,b,c,d, sess->dl_drp, sess->dl_enq, ring_count, ring_free);
+                }
+            }
+
+            // Auto-drain at the end of the BUFFER phase, then reopen the gate
+            // If this was the 20th in the cycle, auto-drain and reopen
+            {
+                uint32_t *pcnt = __ue_test_get_cnt_by_ip(ue_ip_be);
+                if (pcnt) {
+                    uint32_t k_prev = ((*pcnt - 1u) % 20u);
+                    if (k_prev == 19u) {
+                        uint64_t before = sess->dl_deq;
+                        upfu_set_buffering(sess, 0);
+                        upfu_drain_now(sess, nf_local_ctx);
+                        uint64_t drained = sess->dl_deq - before;
+                        UTLT_Info("UE %s — TEST: drained %" PRIu64 " buffered pkts; cycle complete",
+                                convertToIpAddress(ue_ip_be), drained);
+                    }
+                }
+            }
+
+            meta->action = ONVM_NF_ACTION_DROP;
+            return 1;
+        }
+
+
+
 
         //  Step 2: Get PDR rule
         pdr = GetPdrByUeIpAddress(pkt, rte_cpu_to_be_32(iph->dst_addr));
