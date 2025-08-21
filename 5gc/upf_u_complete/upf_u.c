@@ -1138,7 +1138,7 @@ void msg_handler(void *msg_data, struct onvm_nf_local_ctx *ctx) {
         uint32_t ue_ip_be = (uint32_t)e->arg0;
 
         // Remove the following two lines later after validation
-        const char *ue = convertToIpAddress(rte_be_to_cpu_32(ue_ip_be));  // expects BE
+        const char *ue = convertToIpAddress(ue_ip_be);  // expects BE
         UTLT_Info("UE %s — msg: type=0x%08x argc=%u", ue, (uint32_t)e->type, (unsigned)e->argc);
 
         uint64_t t0 = now_us();
