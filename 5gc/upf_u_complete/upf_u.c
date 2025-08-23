@@ -960,6 +960,9 @@ static int packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, stru
 
                 // Ingress must not continue processing this mbuf.
                 meta->action = ONVM_NF_ACTION_DROP;
+
+                DUPLOG("ING consumed m=%p%s%u", pkt, ihas ? " icmp_seq=" : "", ihas ? iseq : 0);
+
                 onvm_nflib_return_pkt(nf_local_ctx->nf, pkt);
 
                 // Record touched session for the tiny egress tick and try a small inline drain if live
@@ -1204,6 +1207,10 @@ void __upf_process_dl_packet(struct rte_mbuf *m,
     int ret = packet_handler(m, meta, ctx);
     __upf_in_drain--;
     if (ret == 0) {
+
+    uint16_t txseq=0; int thas = upf_icmp_seq(m, &txseq);
+    DUPLOG("DRN tx m=%p%s%u", m, thas ? " icmp_seq=" : "", thas ? txseq : 0);
+
     // Hand back to ONVM runtime; it will follow meta->action
     onvm_nflib_return_pkt(ctx->nf, m);
     } else {
