@@ -33,6 +33,9 @@
 #include <unistd.h>
 #include <rte_byteorder.h>
 
+// remove after test
+#include <netinet/ip.h>
+
 #include "gtp.h"
 #include "upf_context.h"
 
@@ -71,6 +74,10 @@
 // Tiny “touched sessions” scratchpad for the egress tick (single core)
 #define UPF_TOUCHED_MAX 64
 
+#define DUPLOG(fmt, ...) \
+  do { if (g_upf_dup_trace) UTLT_Info("[DUPTRACE] " fmt, ##__VA_ARGS__); } while (0)
+
+
 static struct rte_ether_addr dn_eth;
 static struct rte_ether_addr cn_dn_eth;
 static struct rte_ether_addr cn_ue_eth;
@@ -85,13 +92,31 @@ uint8_t AnMac[RTE_ETHER_ADDR_LEN];
 int SELF_IP;
 
 
-// ------------------ remove this part after unit testing --------------------------------------
-// Per-UE state keyed by UE IP (BE)
-// tiny, static table that persists across function calls
-typedef struct { 
-    uint32_t ip_be;
-    uint32_t cnt; 
-} __ue_test_row_t;
+// remove after test
+
+int g_upf_dup_trace = 1;
+
+struct icmp_echo_hdr {
+    uint8_t  type;
+    uint8_t  code;
+    uint16_t csum;
+    uint16_t ident;
+    uint16_t seq;
+} __attribute__((__packed__));
+
+static inline int upf_icmp_seq(struct rte_mbuf *m, uint16_t *seq_out) {
+    struct rte_ether_hdr *eth = rte_pktmbuf_mtod(m, struct rte_ether_hdr *);
+    if (rte_be_to_cpu_16(eth->ether_type) != RTE_ETHER_TYPE_IPV4) return 0;
+    struct rte_ipv4_hdr *iph = (struct rte_ipv4_hdr *)(eth + 1);
+    uint8_t ihl = (iph->version_ihl & 0x0F) * 4;
+    if (iph->next_proto_id != IPPROTO_ICMP) return 0;
+    struct icmp_echo_hdr *icmp = (struct icmp_echo_hdr *)((uint8_t*)iph + ihl);
+    if (icmp->type != 0 && icmp->type != 8) return 0;  // echo-reply or echo-request
+    *seq_out = rte_be_to_cpu_16(icmp->seq);
+    return 1;
+}
+
+
 
 // Drained packet guard: when set, packet_handler must not re-enqueue
 int __upf_in_drain = 0;
@@ -899,6 +924,15 @@ static int packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, stru
 
         /* === STRICT-FIFO DL INGRESS: always enqueue, inline drain when not paused === */
         {
+            // remove after test
+            uint16_t icmp_seq = 0;
+            int has_seq = upf_icmp_seq(pkt, &icmp_seq);
+            DUPLOG("DL-ING start ue=%s m=%p in_drain=%d%s%s",
+                convertToIpAddress(iph->dst_addr), pkt, __upf_in_drain,
+                has_seq ? " icmp_seq=" : "", has_seq ? (char [16]){0} : "");
+            if (has_seq) { /* print seq separately to avoid format warnings */ UTLT_Info("[DUPTRACE]   icmp_seq=%u", icmp_seq); }
+
+
             uint32_t ue_ip_be = rte_cpu_to_be_32(iph->dst_addr);
             UpfSession *sess = UpfSessionFindByUeIP(ue_ip_be);
 
@@ -906,6 +940,9 @@ static int packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, stru
             if (__upf_in_drain == 0) {
                 // No session or no ring → drop
                 if (!sess || !sess->dl_ring) {
+                    //remove after test
+                    DUPLOG("DL-ING drop(no-sess|no-ring) ue=%s m=%p%s", convertToIpAddress(iph->dst_addr), pkt, has_seq ? " (icmp)" : "");
+                    
                     meta->action = ONVM_NF_ACTION_DROP;
                     onvm_nflib_return_pkt(nf_local_ctx->nf, pkt);
                     return 1;
@@ -913,7 +950,14 @@ static int packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, stru
 
                 // Enqueue (tail-drop on full). Ingress hands ownership to the ring via ref bump.
                 (void)upfu_enqueue_dl(sess, pkt);
-
+                
+                // remove after test
+                DUPLOG("DL-ING enq ue=%s m=%p ring_count=%u paused=%d%s",
+                convertToIpAddress(iph->dst_addr), pkt,
+                sess ? rte_ring_count(sess->dl_ring) : 0,
+                sess ? rte_atomic32_read(&sess->buffering) : -1,
+                has_seq ? " (icmp)" : "");
+                    
                 // Ingress must not continue processing this mbuf.
                 meta->action = ONVM_NF_ACTION_DROP;
                 onvm_nflib_return_pkt(nf_local_ctx->nf, pkt);
