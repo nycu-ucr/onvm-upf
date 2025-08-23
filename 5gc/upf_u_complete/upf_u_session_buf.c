@@ -17,18 +17,8 @@ extern int __upf_in_drain;
 // remove after test
 extern int g_upf_dup_trace;
 
+extern int upf_icmp_seq(struct rte_mbuf *m, uint16_t *seq_out);
 
-static inline int upf_icmp_seq(struct rte_mbuf *m, uint16_t *seq_out) {
-    struct rte_ether_hdr *eth = rte_pktmbuf_mtod(m, struct rte_ether_hdr *);
-    if (rte_be_to_cpu_16(eth->ether_type) != RTE_ETHER_TYPE_IPV4) return 0;
-    struct rte_ipv4_hdr *iph = (struct rte_ipv4_hdr *)(eth + 1);
-    uint8_t ihl = (iph->version_ihl & 0x0F) * 4;
-    if (iph->next_proto_id != IPPROTO_ICMP) return 0;
-    struct icmp_echo_hdr *icmp = (struct icmp_echo_hdr *)((uint8_t*)iph + ihl);
-    if (icmp->type != 0 && icmp->type != 8) return 0;  // echo-reply or echo-request
-    *seq_out = rte_be_to_cpu_16(icmp->seq);
-    return 1;
-}
 
 int upfu_session_buf_init(UpfSession *s, unsigned ring_size) {
     if (!s) return -EINVAL;
