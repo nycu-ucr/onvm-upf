@@ -960,7 +960,7 @@ static int packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, stru
                 // Ingress must not continue processing this mbuf.
                 meta->action = ONVM_NF_ACTION_DROP;
 
-                DUPLOG("ING consumed m=%p%s%u", pkt, ihas ? " icmp_seq=" : "", has_seq ? icmp_seq : 0);
+                DUPLOG("ING consumed m=%p%s%u", pkt, has_seq ? " icmp_seq=" : "", has_seq ? icmp_seq : 0);
 
                 onvm_nflib_return_pkt(nf_local_ctx->nf, pkt);
 
