@@ -68,10 +68,17 @@
 #define MAX_UE 256 // Max number of UEs
 #define MIN(x, y) (((x) < (y)) ? (x) : (y))
 
+// Tiny “touched sessions” scratchpad for the egress tick (single core)
+#define UPF_TOUCHED_MAX 64
 
 static struct rte_ether_addr dn_eth;
 static struct rte_ether_addr cn_dn_eth;
 static struct rte_ether_addr cn_ue_eth;
+
+static UpfSession *g_touched[UPF_TOUCHED_MAX];
+static uint32_t g_touched_n = 0;
+static uint32_t g_enq_since_tick = 0;
+
 
 uint8_t DnMac[RTE_ETHER_ADDR_LEN];
 uint8_t AnMac[RTE_ETHER_ADDR_LEN];
@@ -86,22 +93,26 @@ typedef struct {
     uint32_t cnt; 
 } __ue_test_row_t;
 
-static int __upf_in_drain = 0;
-static __ue_test_row_t __ue_test_tab[64];
+// Drained packet guard: when set, packet_handler must not re-enqueue
+int __upf_in_drain = 0;
 
-static inline uint32_t *__ue_test_get_cnt_by_ip(uint32_t ip_be) {
-    // simple hash+linear probe
-    uint32_t mask = (uint32_t)(sizeof(__ue_test_tab)/sizeof(__ue_test_tab[0])) - 1u;
-    uint32_t i = (ip_be ? (ip_be ^ (ip_be >> 11) ^ (ip_be >> 19)) : 0u) & mask;
-    for (uint32_t p = 0; p < (uint32_t)(sizeof(__ue_test_tab)/sizeof(__ue_test_tab[0])); ++p) {
-        uint32_t idx = (i + p) & mask;
-        if (__ue_test_tab[idx].ip_be == ip_be) return &__ue_test_tab[idx].cnt;
-        if (__ue_test_tab[idx].ip_be == 0u) { __ue_test_tab[idx].ip_be = ip_be; __ue_test_tab[idx].cnt = 0; return &__ue_test_tab[idx].cnt; }
+static inline void touched_add(UpfSession *s) {
+    for (uint32_t i = 0; i < g_touched_n; i++) {
+        if (g_touched[i] == s) return;
     }
-    return NULL; /* table full: disable test for this UE */
+    if (g_touched_n < UPF_TOUCHED_MAX) g_touched[g_touched_n++] = s;
 }
 
-// ------------------ upper block to be removed after unit testing -----------------------------
+static inline void egress_tick(struct onvm_nf_local_ctx *ctx) {
+    for (uint32_t i = 0; i < g_touched_n; i++) {
+        UpfSession *s = g_touched[i];
+        if (s && s->dl_ring && rte_atomic32_read(&s->buffering) == 0) {
+            upfu_drain_some(s, ctx, UPF_TICK_DRAIN_BUDGET);
+        }
+    }
+    g_touched_n = 0;
+    g_enq_since_tick = 0;
+}
 
 char *
 convertToIpAddress(uint32_t big_endian_value) {
@@ -883,116 +894,47 @@ static int packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, stru
         pdr = GetPdrByTeid(pkt, teid);
 
     } else {
-        // UTLT_Info("It is downlink, dst is %d\n", rte_cpu_to_be_32(iph->dst_addr));
+
         UTLT_Info("It is downlink, dst is %s\n", convertToIpAddress(iph->dst_addr));
 
-        struct timespec ts;
-        timespec_get(&ts, TIME_UTC);
-        // UTLT_Info("(%d) Time: %ld.%09ld\n", rte_cpu_to_be_32(iph->dst_addr), ts.tv_sec, ts.tv_nsec);
-        UTLT_Info("(%s) Time: %ld.%09ld\n", convertToIpAddress(iph->dst_addr), ts.tv_sec, ts.tv_nsec);
+        /* === STRICT-FIFO DL INGRESS: always enqueue, inline drain when not paused === */
+        {
+            uint32_t ue_ip_be = rte_cpu_to_be_32(iph->dst_addr);
+            UpfSession *sess = UpfSessionFindByUeIP(ue_ip_be);
 
-
-        // UE-wide buffering gate (buffer if CP flips the session bit)
-        /* UpfSession *sess = UpfSessionFindByUeIP(rte_cpu_to_be_32(iph->dst_addr));
-        if (sess && sess->dl_ring && rte_atomic32_read(&sess->buffering)) {
-            if (upfu_enqueue_dl(sess, pkt) != 0) {
-                // Ring full: helper already bumped dl_drp and fixed refcount.
-                if ((sess->dl_drp & 0x3FFu) == 1u) {  // ~1/1024
-                    unsigned ring_count = sess->dl_ring ? rte_ring_count(sess->dl_ring) : 0;
-                    unsigned ring_free  = sess->dl_ring ? rte_ring_free_count(sess->dl_ring) : 0;
-                    UTLT_Warning("DL buffer full for UE %s: drops=%" PRIu64 " enq=%" PRIu64
-                                " ring_count=%u free=%u",
-                                convertToIpAddress(iph->dst_addr),
-                                sess->dl_drp, sess->dl_enq, ring_count, ring_free);
+            // If this invocation is from the drain path, do NOT enqueue; fall through
+            if (__upf_in_drain == 0) {
+                // No session or no ring → drop
+                if (!sess || !sess->dl_ring) {
+                    meta->action = ONVM_NF_ACTION_DROP;
+                    return 1;
                 }
+
+                // Enqueue (tail-drop on full). Ingress hands ownership to the ring via ref bump.
+                (void)upfu_enqueue_dl(sess, pkt);
+
+                // Ingress must not continue processing this mbuf.
+                meta->action = ONVM_NF_ACTION_DROP;
+
+                // Record touched session for the tiny egress tick and try a small inline drain if live
+                touched_add(sess);
+                g_enq_since_tick++;
+
+                if (rte_atomic32_read(&sess->buffering) == 0) { // BUFF OFF → live
+                    upfu_drain_some(sess, nf_local_ctx, UPF_INLINE_DRAIN_BUDGET);
+                }
+
+                // Periodic egress tick to keep latency low without a scheduler
+                if (g_enq_since_tick >= UPF_EGRESS_TICK_INTERVAL) {
+                    egress_tick(nf_local_ctx);
+                }
+                return 1;
             }
 
-            // live copy must not continue. (queued or tail-dropped)
-            meta->action = ONVM_NF_ACTION_DROP;
-            return 1;
-        } */
-
-        // Compute the UE key and look up the session
-        const uint32_t ue_ip_be = rte_cpu_to_be_32(iph->dst_addr);
-        UpfSession *sess = UpfSessionFindByUeIP(ue_ip_be);
-
-        // Decide PASS vs BUFFER for this UE (and flip the gate accordingly)
-        if (__upf_in_drain == 0 && sess && sess->dl_ring) {
-            /* k in [0..9]  -> PASS (gate open)
-            k in [10..19]-> BUFFER (gate closed), then auto-drain on k==19 */
-            uint32_t *pcnt = __ue_test_get_cnt_by_ip(ue_ip_be);
-            if (pcnt) {
-                uint32_t k = (*pcnt) % 20u;
-                ++(*pcnt);
-
-                if (k == 0u) {
-                    UTLT_Info("UE %s — TEST: starting PASS phase (10 pkts)",
-                            convertToIpAddress(iph->dst_addr));
-                } else if (k == 10u) {
-                    UTLT_Info("UE %s — TEST: starting BUFFER phase (10 pkts)",
-                            convertToIpAddress(iph->dst_addr));
-                }
-
-                if (k < 10u) {
-                    /* PASS phase: ensure gate open */
-                    if (rte_atomic32_read(&sess->buffering)) upfu_set_buffering(sess, 0);
-                } else {
-                    /* BUFFER phase: ensure gate closed so block below enqueues */
-                    if (!rte_atomic32_read(&sess->buffering)) upfu_set_buffering(sess, 1);
-                }
-            }
+            // else: __upf_in_drain == 1 => this is a drained packet;
+            // fall through to our existing live pipeline (PDR→FAR/QER→encap→L2→OUT).
         }
-
-        // canonical UE-wide buffering gate (actual enqueue happens only here)
-        if (sess && sess->dl_ring && rte_atomic32_read(&sess->buffering)) {
-            uint64_t enq_t0 = now_us();
-            int enq_rc = upfu_enqueue_dl(sess, pkt);
-            uint64_t enq_t1 = now_us();
-
-            UTLT_Info("UE %s — TEST: enqueue dt=%" PRIu64 " us%s",
-                    convertToIpAddress(iph->dst_addr),
-                    (enq_t1 - enq_t0),
-                    enq_rc ? " (ring full)" : "");
-
-            if (enq_rc != 0) {
-                if ((sess->dl_drp & 0x3FFu) == 1u) {
-                    unsigned ring_count = sess->dl_ring ? rte_ring_count(sess->dl_ring) : 0;
-                    unsigned ring_free  = sess->dl_ring ? rte_ring_free_count(sess->dl_ring) : 0;
-                    UTLT_Warning("DL buffer full for UE %s: drops=%" PRIu64 " enq=%" PRIu64
-                                " ring_count=%u free=%u",
-                                convertToIpAddress(iph->dst_addr),
-                                sess->dl_drp, sess->dl_enq, ring_count, ring_free);
-                }
-            }
-
-            // Auto-drain at the end of the BUFFER phase, then reopen the gate
-            // If this was the 20th in the cycle, auto-drain and reopen
-            {
-                uint32_t *pcnt = __ue_test_get_cnt_by_ip(ue_ip_be);
-                if (pcnt) {
-                    uint32_t k_prev = ((*pcnt - 1u) % 20u);
-                    if (k_prev == 19u) {
-                        uint64_t before = sess->dl_deq;
-                        upfu_set_buffering(sess, 0);
-
-                        uint64_t drain_t0 = now_us();
-                        upfu_drain_now(sess, nf_local_ctx);
-                        uint64_t drain_t1 = now_us();
-
-                        uint64_t drained = sess->dl_deq - before;
-                        UTLT_Info("UE %s — TEST: drained %" PRIu64 " pkts in %" PRIu64 " us; cycle complete",
-                                convertToIpAddress(iph->dst_addr),
-                                drained,
-                                (drain_t1 - drain_t0));
-                    }
-                }
-            }
-
-            meta->action = ONVM_NF_ACTION_DROP;
-            return 1;
-        }
-
-
+        /* === END STRICT-FIFO DL INGRESS === */
 
 
         //  Step 2: Get PDR rule
@@ -1128,66 +1070,77 @@ void msg_handler(void *msg_data, struct onvm_nf_local_ctx *ctx) {
 
     switch ((uint32_t)e->type) {
 
-    case UPF_EVENT_SET_BUFFER: {
-        // arg0 = ue_ip_be (network order)
-        if (e->argc < 1) {
-            UTLT_Warning("SET_BUFFER: missing arg0 (ue_ip_be)");
-            rte_free(e);
-            return; 
-        }
-        uint32_t ue_ip_be = (uint32_t)e->arg0;
+        case UPF_EVENT_SET_BUFFER: {
+            // arg0 = ue_ip_be (network order)
+            if (e->argc < 1) {
+                UTLT_Warning("SET_BUFFER: missing arg0 (ue_ip_be)");
+                rte_free(e);
+                return;
+            }
+            uint32_t ue_ip_be = (uint32_t)e->arg0;
 
-        // Remove the following two lines later after validation
-        const char *ue = convertToIpAddress(ue_ip_be);  // expects BE
-        UTLT_Info("UE %s — msg: type=0x%08x argc=%u", ue, (uint32_t)e->type, (unsigned)e->argc);
+            // Remove the following two lines later after validation
+            const char *ue = convertToIpAddress(ue_ip_be);
+            UTLT_Info("UE %s — msg: type=0x%08x argc=%u", ue, (uint32_t)e->type, (unsigned)e->argc);
 
-        uint64_t t0 = now_us();
+            uint64_t t0 = now_us();
 
-        UpfSession *s = UpfSessionFindByUeIP(ue_ip_be);
-        if (s && s->dl_ring) {
-            // Close UE-wide gate: subsequent DL packets will be enqueued by the gate
-            upfu_set_buffering(s, 1);
-        }
+            UpfSession *s = UpfSessionFindByUeIP(ue_ip_be);
+            if (s) {
+                upfu_set_buffering(s, 1);   // pause dequeuing; producers still enqueue
+                if (!s->dl_ring) {
+                     UTLT_Warning("SET_BUFFER before ring attach for UE=%s", convertToIpAddress(ue_ip_be));
+                }
+            }
 
-        uint64_t dt = now_us() - t0;
+            uint64_t dt = now_us() - t0;
 
-        UTLT_Info("UE %s — SET_BUFFER: dt=%" PRIu64 " us", ue, dt);
+            UTLT_Info("UE %s — SET_BUFFER: dt=%" PRIu64 " us", ue, dt);
 
-        rte_free(e);
-        return;
-    }
-
-    case UPF_EVENT_CLEAR_AND_DRAIN: {
-        if (e->argc < 1) {
-            UTLT_Warning("CLEAR_AND_DRAIN: missing arg0 (ue_ip_be)");
             rte_free(e);
             return;
         }
-        uint32_t ue_ip_be = (uint32_t)e->arg0;
 
-        // Remove the following two lines later after validation
-        const char *ue = convertToIpAddress(ue_ip_be);  // expects BE
-        UTLT_Info("UE %s — msg: type=0x%08x argc=%u", ue, (uint32_t)e->type, (unsigned)e->argc);
+        case UPF_EVENT_CLEAR_AND_DRAIN: {
+            if (e->argc < 1) {
+                UTLT_Warning("CLEAR_AND_DRAIN: missing arg0 (ue_ip_be)");
+                rte_free(e);
+                return;
+            }
+            uint32_t ue_ip_be = (uint32_t)e->arg0;
 
-        uint64_t t0 = now_us();
+            // Remove the following two lines later after validation
+            const char *ue = convertToIpAddress(ue_ip_be);
+            UTLT_Info("UE %s — msg: type=0x%08x argc=%u", ue, (uint32_t)e->type, (unsigned)e->argc);
 
-        UpfSession *s = UpfSessionFindByUeIP(ue_ip_be);  /* expects BE */
-        if (s && s->dl_ring) {
-            /* Open gate then drain a budget now through the live pipeline */
-            upfu_set_buffering(s, 0);
-            upfu_drain_now(s, ctx);
+            uint64_t t0 = now_us();
+
+            UpfSession *s = UpfSessionFindByUeIP(ue_ip_be);
+
+            if (s) {
+                upfu_set_buffering(s, 0);   // unpause
+                if (s->dl_ring) {
+                    // Kick a larger drain to flush pre-release backlog even without new arrivals
+                    upfu_drain_some(s, ctx, UPF_EVENT_KICK_BUDGET);  // action requires ring
+                } else {
+                    // Optional TODO: Warn
+                }
+            }
+
+            uint64_t dt = now_us() - t0;
+
+            UTLT_Info("UE %s — CLEAR_AND_DRAIN: dt=%" PRIu64 " us", ue, dt);
+
+            rte_free(e);
+            return;
         }
-        uint64_t dt = now_us() - t0;
 
-        UTLT_Info("UE %s — CLEAR_AND_DRAIN: dt=%" PRIu64 " us", ue, dt);
+        default:
+            break;
+        }
 
-        rte_free(e);
-        return;
-    }
 
-    default:
-        break;
-    }
+
 }
 
 

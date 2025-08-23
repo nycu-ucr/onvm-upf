@@ -44,16 +44,17 @@ static inline const char* upf_dl_ring_name_for(uint32_t ue_ip_be, char *buf, siz
 }
 
 static inline struct rte_ring* upf_dl_ring_create(uint32_t ue_ip_be, unsigned ring_size) {
-    char name[RTE_RING_NAMESIZE];
-    const char *rname = upf_dl_ring_name_for(ue_ip_be, name, sizeof(name));
-    unsigned flags = RING_F_SC_DEQ;
+        char name[RTE_RING_NAMESIZE];
+        const char *rname = upf_dl_ring_name_for(ue_ip_be, name, sizeof(name));
 
-    struct rte_ring *r = rte_ring_create(rname, ring_size, rte_socket_id(), flags);
-    if (!r && rte_errno == EEXIST) {
-        r = rte_ring_lookup(rname);
-    } 
-    
-    return r;  // NULL on failure
+        // Single-core: single-producer, single-consumer → cheapest atomics
+        unsigned flags = RING_F_SP_ENQ | RING_F_SC_DEQ;
+
+        struct rte_ring *r = rte_ring_create(rname, ring_size, rte_socket_id(), flags);
+        if (!r && rte_errno == EEXIST) {
+                r = rte_ring_lookup(rname);
+        }
+        return r;  // NULL on failure
 }
 
 
