@@ -907,7 +907,8 @@ static int packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, stru
                 // No session or no ring → drop
                 if (!sess || !sess->dl_ring) {
                     meta->action = ONVM_NF_ACTION_DROP;
-                    return 0;
+                    onvm_nflib_return_pkt(nf_local_ctx->nf, pkt);
+                    return 1;
                 }
 
                 // Enqueue (tail-drop on full). Ingress hands ownership to the ring via ref bump.
@@ -915,6 +916,7 @@ static int packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, stru
 
                 // Ingress must not continue processing this mbuf.
                 meta->action = ONVM_NF_ACTION_DROP;
+                onvm_nflib_return_pkt(nf_local_ctx->nf, pkt);
 
                 // Record touched session for the tiny egress tick and try a small inline drain if live
                 touched_add(sess);
@@ -928,7 +930,7 @@ static int packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, stru
                 if (g_enq_since_tick >= UPF_EGRESS_TICK_INTERVAL) {
                     egress_tick(nf_local_ctx);
                 }
-                return 0;
+                return 1;
             }
 
             // else: __upf_in_drain == 1 => this is a drained packet;
