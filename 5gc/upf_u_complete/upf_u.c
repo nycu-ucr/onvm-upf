@@ -104,7 +104,7 @@ struct icmp_echo_hdr {
     uint16_t seq;
 } __attribute__((__packed__));
 
-static inline int upf_icmp_seq(struct rte_mbuf *m, uint16_t *seq_out) {
+int upf_icmp_seq(struct rte_mbuf *m, uint16_t *seq_out) {
     struct rte_ether_hdr *eth = rte_pktmbuf_mtod(m, struct rte_ether_hdr *);
     if (rte_be_to_cpu_16(eth->ether_type) != RTE_ETHER_TYPE_IPV4) return 0;
     struct rte_ipv4_hdr *iph = (struct rte_ipv4_hdr *)(eth + 1);
@@ -957,7 +957,7 @@ static int packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, stru
                 sess ? rte_ring_count(sess->dl_ring) : 0,
                 sess ? rte_atomic32_read(&sess->buffering) : -1,
                 has_seq ? " (icmp)" : "");
-                    
+
                 // Ingress must not continue processing this mbuf.
                 meta->action = ONVM_NF_ACTION_DROP;
                 onvm_nflib_return_pkt(nf_local_ctx->nf, pkt);
