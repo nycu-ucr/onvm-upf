@@ -125,7 +125,9 @@ static inline void touched_add(UpfSession *s) {
     for (uint32_t i = 0; i < g_touched_n; i++) {
         if (g_touched[i] == s) return;
     }
-    if (g_touched_n < UPF_TOUCHED_MAX) g_touched[g_touched_n++] = s;
+    if (g_touched_n < UPF_TOUCHED_MAX) {
+        g_touched[g_touched_n++] = s;
+    }
 }
 
 static inline void egress_tick(struct onvm_nf_local_ctx *ctx) {
@@ -899,6 +901,8 @@ static int packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, stru
         return 0;
     }
 
+    UTLT_Info("Inside Packet Handler");
+
     UPDK_PDR *pdr = NULL;
     // Step 1: Identify if it is a uplink packet or downlink packet
     char *src_address = convertToIpAddress(iph->src_addr);
@@ -941,42 +945,47 @@ static int packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, stru
                 if (!sess || !sess->dl_ring) {
                     //remove after test
                     DUPLOG("DL-ING drop(no-sess|no-ring) ue=%s m=%p%s", convertToIpAddress(iph->dst_addr), pkt, has_seq ? " (icmp)" : "");
-                    
-                    meta->action = ONVM_NF_ACTION_DROP;
-                    onvm_nflib_return_pkt(nf_local_ctx->nf, pkt);
+                    rte_pktmbuf_free(pkt);
                     return 1;
                 }
 
-                // Enqueue (tail-drop on full). Ingress hands ownership to the ring via ref bump.
-                (void)upfu_enqueue_dl(sess, pkt);
-                
-                // remove after test
-                DUPLOG("DL-ING enq ue=%s m=%p ring_count=%u paused=%d%s",
-                convertToIpAddress(iph->dst_addr), pkt,
-                sess ? rte_ring_count(sess->dl_ring) : 0,
-                sess ? rte_atomic32_read(&sess->buffering) : -1,
-                has_seq ? " (icmp)" : "");
+                 // Enqueue (tail-drop on full). Ingress hands ownership to the ring via ref bump.
+                int rc = upfu_enqueue_dl(sess, pkt);
 
-                // Ingress must not continue processing this mbuf.
-                meta->action = ONVM_NF_ACTION_DROP;
+                if (rc == 0) {
+                    // Enqueued successfully
+                    DUPLOG("DL-ING enq ue=%s m=%p ring_count=%u paused=%d%s",
+                        convertToIpAddress(iph->dst_addr), pkt,
+                        sess ? rte_ring_count(sess->dl_ring) : 0,
+                        sess ? rte_atomic32_read(&sess->buffering) : -1,
+                        has_seq ? " (icmp)" : "");
 
+                    if (sess) {
+                        touched_add(sess);
+                        g_enq_since_tick++;
+
+                        if (rte_atomic32_read(&sess->buffering) == 0) { // BUFF OFF → live
+                            upfu_drain_some(sess, nf_local_ctx, UPF_INLINE_DRAIN_BUDGET);
+                        }
+
+                        if (g_enq_since_tick >= UPF_EGRESS_TICK_INTERVAL) {
+                            egress_tick(nf_local_ctx);
+                        }
+                    }
+                } else {
+                    // Enqueue failed (ring full or no session). Log and skip touch/tick.
+                    DUPLOG("DL-ING enq FAIL ue=%s m=%p rc=%d ring_count=%u paused=%d%s",
+                        convertToIpAddress(iph->dst_addr), pkt, rc,
+                        (sess && sess->dl_ring) ? rte_ring_count(sess->dl_ring) : 0,
+                        sess ? rte_atomic32_read(&sess->buffering) : -1,
+                        has_seq ? " (icmp)" : "");
+                        rte_pktmbuf_free(pkt);
+                }
+
+                // In all cases, the live path must not continue processing this mbuf.
                 DUPLOG("ING consumed m=%p%s%u", pkt, has_seq ? " icmp_seq=" : "", has_seq ? icmp_seq : 0);
-
-                onvm_nflib_return_pkt(nf_local_ctx->nf, pkt);
-
-                // Record touched session for the tiny egress tick and try a small inline drain if live
-                touched_add(sess);
-                g_enq_since_tick++;
-
-                if (rte_atomic32_read(&sess->buffering) == 0) { // BUFF OFF → live
-                    upfu_drain_some(sess, nf_local_ctx, UPF_INLINE_DRAIN_BUDGET);
-                }
-
-                // Periodic egress tick to keep latency low without a scheduler
-                if (g_enq_since_tick >= UPF_EGRESS_TICK_INTERVAL) {
-                    egress_tick(nf_local_ctx);
-                }
                 return 1;
+                
             }
 
             // else: __upf_in_drain == 1 => this is a drained packet;
@@ -1045,6 +1054,17 @@ static int packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, stru
     }
     AttachL2Header(pkt, is_dl);
     if (meta->action == ONVM_NF_ACTION_OUT && is_dl) {
+        
+        // comment out the code below after testing
+        struct rte_ipv4_hdr *iph2 = onvm_pkt_ipv4_hdr(pkt);
+        uint16_t seq;
+        if (upf_icmp_seq(pkt, &seq)) {
+            DUPLOG("%s-TX icmp m=%p seq=%u src=%s dst=%s",
+                is_dl ? "DL" : "UL", pkt, seq,
+                convertToIpAddress(iph2->src_addr),
+                convertToIpAddress(iph2->dst_addr));
+        }
+
         // check if the UE IP exists in the table and update the token
         int index = findIndexByUeIpAddress(rte_cpu_to_be_32(iph->dst_addr));
         if (index != -1) {
@@ -1203,18 +1223,10 @@ void __upf_process_dl_packet(struct rte_mbuf *m,
 
     /* Mark “drain context” while we reuse the live pipeline */
     __upf_in_drain++;
-    int ret = packet_handler(m, meta, ctx);
+    (void)packet_handler(m, meta, ctx);
     __upf_in_drain--;
-    if (ret == 0) {
 
-    uint16_t txseq=0; int thas = upf_icmp_seq(m, &txseq);
-    DUPLOG("DRN tx m=%p%s%u", m, thas ? " icmp_seq=" : "", thas ? txseq : 0);
-
-    // Hand back to ONVM runtime; it will follow meta->action
-    onvm_nflib_return_pkt(ctx->nf, m);
-    } else {
-    rte_pktmbuf_free(m);
-    }
+    //rte_pktmbuf_free(m);
 }
 
 

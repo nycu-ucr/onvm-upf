@@ -11,6 +11,9 @@
 #define DUPLOG(fmt, ...) \
   do { if (g_upf_dup_trace) UTLT_Info("[DUPTRACE] " fmt, ##__VA_ARGS__); } while (0)
 
+
+
+
 // Guard defined in upf_u.c; we toggle it so drained packets never re-enqueue
 extern int __upf_in_drain;
 
@@ -45,12 +48,13 @@ int upfu_enqueue_dl(UpfSession *s, struct rte_mbuf *m) {
     }
 
     // Buffer takes its own reference; the ingress path will DROP/free its ref
-    rte_pktmbuf_refcnt_update(m, 1);
+    // rte_pktmbuf_refcnt_update(m, 1);
 
 
     uint16_t seq=0; int has = upf_icmp_seq(m, &seq);
     DUPLOG("ENQ try  s=%p m=%p%s%u",
        s, m, has ? " icmp_seq=" : "", has ? seq : 0);
+    
 
     // Single-core: SP enqueue
     if (rte_ring_sp_enqueue(s->dl_ring, m) != 0) {
@@ -82,8 +86,8 @@ static inline void upfu_drain_budget(UpfSession *s, struct onvm_nf_local_ctx *ct
 
         uint16_t dseq=0; int dhas = upf_icmp_seq(m, &dseq);
         DUPLOG("DEQ      s=%p m=%p left=%u%s%u",
-       s, m, rte_ring_count(s->dl_ring),
-       dhas ? " icmp_seq=" : "", dhas ? dseq : 0);
+        s, m, rte_ring_count(s->dl_ring),
+        dhas ? " icmp_seq=" : "", dhas ? dseq : 0);
 
         __upf_process_dl_packet(m, s, ctx);
         drained++;
@@ -92,6 +96,7 @@ static inline void upfu_drain_budget(UpfSession *s, struct onvm_nf_local_ctx *ct
     __upf_in_drain = prev;
 
     s->dl_deq += drained;
+
 }
 
 void upfu_drain_some(UpfSession *s, struct onvm_nf_local_ctx *ctx, unsigned budget) {
