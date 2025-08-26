@@ -7,20 +7,24 @@
 #include "upf_events.h"
 #include "upf_u_session_buf.h"
 
-// remove after test
-#define DUPLOG(fmt, ...) \
-  do { if (g_upf_dup_trace) UTLT_Info("[DUPTRACE] " fmt, ##__VA_ARGS__); } while (0)
+extern int g_upf_dup_trace;
+#define BUFLOG(tag, fmt, ...) \
+  do { if (g_upf_dup_trace) UTLT_Info("[BUF:%s] " fmt, tag, ##__VA_ARGS__); } while (0)
 
 
+
+static inline const char* src2s(upf_drain_src_t src) {
+    switch (src) {
+    case UPF_DRAIN_SRC_INLINE: return "INLINE";
+    case UPF_DRAIN_SRC_TICK:   return "TICK";
+    case UPF_DRAIN_SRC_EVENT:  return "EVENT";
+    default: return "UNKNOWN";
+    }
+}
 
 
 // Guard defined in upf_u.c; we toggle it so drained packets never re-enqueue
 extern int __upf_in_drain;
-
-// remove after test
-extern int g_upf_dup_trace;
-
-extern int upf_icmp_seq(struct rte_mbuf *m, uint16_t *seq_out);
 
 
 int upfu_session_buf_init(UpfSession *s, unsigned ring_size) {
@@ -49,11 +53,6 @@ int upfu_enqueue_dl(UpfSession *s, struct rte_mbuf *m) {
 
     // Buffer takes its own reference; the ingress path will DROP/free its ref
     // rte_pktmbuf_refcnt_update(m, 1);
-
-
-    uint16_t seq=0; int has = upf_icmp_seq(m, &seq);
-    DUPLOG("ENQ try  s=%p m=%p%s%u",
-       s, m, has ? " icmp_seq=" : "", has ? seq : 0);
     
 
     // Single-core: SP enqueue
@@ -64,48 +63,50 @@ int upfu_enqueue_dl(UpfSession *s, struct rte_mbuf *m) {
         return -ENOSPC;
     }
 
-    DUPLOG("ENQ ok   s=%p m=%p ring_count=%u",
-       s, m, rte_ring_count(s->dl_ring));
+    BUFLOG("ENQ", "ok s=%p m=%p ring=%u", s, m,
+      s && s->dl_ring ? rte_ring_count(s->dl_ring) : 0);
 
 
     s->dl_enq++;
     return 0;
 }
 
-static inline void upfu_drain_budget(UpfSession *s, struct onvm_nf_local_ctx *ctx, unsigned budget) {
+static inline void upfu_drain_budget(UpfSession *s, struct onvm_nf_local_ctx *ctx, unsigned budget, upf_drain_src_t src) {
     if (!s || !s->dl_ring || budget == 0) return;
 
     unsigned drained = 0;
-    struct rte_mbuf *m = NULL;
+
+    BUFLOG("DRAIN", "start src=%s s=%p budget=%u avail=%u",
+          src2s(src), s, budget, rte_ring_count(s->dl_ring));
 
     // Mark that we are processing drained packets (no re-enqueue in packet_handler)
-    int prev = __upf_in_drain;
-    __upf_in_drain = 1;
+    __upf_in_drain++;
 
-    while (drained < budget && rte_ring_sc_dequeue(s->dl_ring, (void**)&m) == 0) {
+    while (drained < budget) {
+        struct rte_mbuf *m = NULL;
+        if (rte_ring_dequeue(s->dl_ring, (void**)&m) != 0) break;
 
-        uint16_t dseq=0; int dhas = upf_icmp_seq(m, &dseq);
-        DUPLOG("DEQ      s=%p m=%p left=%u%s%u",
-        s, m, rte_ring_count(s->dl_ring),
-        dhas ? " icmp_seq=" : "", dhas ? dseq : 0);
-
-        __upf_process_dl_packet(m, s, ctx);
+        /* hand off to the live pipeline; packet_handler() must fully consume m */
+        __upf_process_dl_packet(m, s, ctx, src);
         drained++;
     }
 
-    __upf_in_drain = prev;
+    __upf_in_drain--;
 
     s->dl_deq += drained;
 
+    BUFLOG("DRAIN", "done  src=%s s=%p drained=%u left=%u",
+          src2s(src), s, drained, rte_ring_count(s->dl_ring));
+
 }
 
-void upfu_drain_some(UpfSession *s, struct onvm_nf_local_ctx *ctx, unsigned budget) {
+void upfu_drain_some(UpfSession *s, struct onvm_nf_local_ctx *ctx, unsigned budget, upf_drain_src_t src) {
     // Only drain when not paused (BUFF OFF)
     if (!s) return;
     if (rte_atomic32_read(&s->buffering) != 0) return;
-    upfu_drain_budget(s, ctx, budget);
+    upfu_drain_budget(s, ctx, budget, src);
 }
 
 void upfu_drain_now(UpfSession *s, struct onvm_nf_local_ctx *ctx) {
-    upfu_drain_some(s, ctx, UPF_SESSION_DRAIN_BUDGET);
+    upfu_drain_some(s, ctx, UPF_SESSION_DRAIN_BUDGET, UPF_DRAIN_SRC_EVENT);
 }

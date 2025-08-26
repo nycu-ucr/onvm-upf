@@ -33,9 +33,6 @@
 #include <unistd.h>
 #include <rte_byteorder.h>
 
-// remove after test
-#include <netinet/ip.h>
-
 #include "gtp.h"
 #include "upf_context.h"
 
@@ -74,8 +71,9 @@
 // Tiny “touched sessions” scratchpad for the egress tick (single core)
 #define UPF_TOUCHED_MAX 64
 
-#define DUPLOG(fmt, ...) \
-  do { if (g_upf_dup_trace) UTLT_Info("[DUPTRACE] " fmt, ##__VA_ARGS__); } while (0)
+extern int g_upf_dup_trace;
+#define BUFLOG(tag, fmt, ...) \
+  do { if (g_upf_dup_trace) UTLT_Info("[BUF:%s] " fmt, tag, ##__VA_ARGS__); } while (0)
 
 
 static struct rte_ether_addr dn_eth;
@@ -96,7 +94,7 @@ int SELF_IP;
 
 int g_upf_dup_trace = 1;
 
-struct icmp_echo_hdr {
+/* struct icmp_echo_hdr {
     uint8_t  type;
     uint8_t  code;
     uint16_t csum;
@@ -114,7 +112,7 @@ int upf_icmp_seq(struct rte_mbuf *m, uint16_t *seq_out) {
     if (icmp->type != 0 && icmp->type != 8) return 0;  // echo-reply or echo-request
     *seq_out = rte_be_to_cpu_16(icmp->seq);
     return 1;
-}
+} */
 
 
 
@@ -130,7 +128,7 @@ static inline void touched_add(UpfSession *s) {
     }
 }
 
-static inline void egress_tick(struct onvm_nf_local_ctx *ctx) {
+/* static inline void egress_tick(struct onvm_nf_local_ctx *ctx) {
     for (uint32_t i = 0; i < g_touched_n; i++) {
         UpfSession *s = g_touched[i];
         if (s && s->dl_ring && rte_atomic32_read(&s->buffering) == 0) {
@@ -139,7 +137,44 @@ static inline void egress_tick(struct onvm_nf_local_ctx *ctx) {
     }
     g_touched_n = 0;
     g_enq_since_tick = 0;
+} */
+
+
+static inline void egress_tick(struct onvm_nf_local_ctx *ctx)
+{
+    if (g_touched_n == 0) {
+        g_enq_since_tick = 0;
+        return;
+    }
+
+    UTLT_Debug("[BUF:TICK] fire touched=%u enq_since=%u", g_touched_n, g_enq_since_tick);
+
+    for (uint32_t i = 0; i < g_touched_n; i++) {
+        UpfSession *s = g_touched[i];
+        if (!s || !s->dl_ring)               continue;
+        if (rte_atomic32_read(&s->buffering) != 0) continue;
+
+        unsigned avail = rte_ring_count(s->dl_ring);
+        if (!avail) {
+            BUFLOG("DRAIN", "skip(tick,empty) s=%p", s);
+            continue;
+        }
+
+        upfu_drain_some(s, ctx, UPF_TICK_DRAIN_BUDGET, UPF_DRAIN_SRC_TICK);
+
+        // Guaranteed progress across ticks without new arrivals when leftovers remain
+        
+        if (rte_ring_count(s->dl_ring) > 0) {
+            touched_add(s);
+        }
+       
+    }
+
+    g_touched_n = 0;
+    g_enq_since_tick = 0;
 }
+
+
 
 char *
 convertToIpAddress(uint32_t big_endian_value) {
@@ -927,24 +962,14 @@ static int packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, stru
 
         /* === STRICT-FIFO DL INGRESS: always enqueue, inline drain when not paused === */
         {
-            // remove after test
-            uint16_t icmp_seq = 0;
-            int has_seq = upf_icmp_seq(pkt, &icmp_seq);
-            DUPLOG("DL-ING start ue=%s m=%p in_drain=%d%s%s",
-                convertToIpAddress(iph->dst_addr), pkt, __upf_in_drain,
-                has_seq ? " icmp_seq=" : "", has_seq ? (char [16]){0} : "");
-            if (has_seq) { /* print seq separately to avoid format warnings */ UTLT_Info("[DUPTRACE]   icmp_seq=%u", icmp_seq); }
-
-
+        
             uint32_t ue_ip_be = rte_cpu_to_be_32(iph->dst_addr);
             UpfSession *sess = UpfSessionFindByUeIP(ue_ip_be);
 
-            // If this invocation is from the drain path, do NOT enqueue; fall through
+            // Invocation is from the enqueue path
             if (__upf_in_drain == 0) {
                 // No session or no ring → drop
                 if (!sess || !sess->dl_ring) {
-                    //remove after test
-                    DUPLOG("DL-ING drop(no-sess|no-ring) ue=%s m=%p%s", convertToIpAddress(iph->dst_addr), pkt, has_seq ? " (icmp)" : "");
                     rte_pktmbuf_free(pkt);
                     return 1;
                 }
@@ -954,18 +979,12 @@ static int packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, stru
 
                 if (rc == 0) {
                     // Enqueued successfully
-                    DUPLOG("DL-ING enq ue=%s m=%p ring_count=%u paused=%d%s",
-                        convertToIpAddress(iph->dst_addr), pkt,
-                        sess ? rte_ring_count(sess->dl_ring) : 0,
-                        sess ? rte_atomic32_read(&sess->buffering) : -1,
-                        has_seq ? " (icmp)" : "");
-
                     if (sess) {
                         touched_add(sess);
                         g_enq_since_tick++;
 
                         if (rte_atomic32_read(&sess->buffering) == 0) { // BUFF OFF → live
-                            upfu_drain_some(sess, nf_local_ctx, UPF_INLINE_DRAIN_BUDGET);
+                            upfu_drain_some(sess, nf_local_ctx, UPF_INLINE_DRAIN_BUDGET, UPF_DRAIN_SRC_INLINE);
                         }
 
                         if (g_enq_since_tick >= UPF_EGRESS_TICK_INTERVAL) {
@@ -974,22 +993,14 @@ static int packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, stru
                     }
                 } else {
                     // Enqueue failed (ring full or no session). Log and skip touch/tick.
-                    DUPLOG("DL-ING enq FAIL ue=%s m=%p rc=%d ring_count=%u paused=%d%s",
-                        convertToIpAddress(iph->dst_addr), pkt, rc,
-                        (sess && sess->dl_ring) ? rte_ring_count(sess->dl_ring) : 0,
-                        sess ? rte_atomic32_read(&sess->buffering) : -1,
-                        has_seq ? " (icmp)" : "");
-                        rte_pktmbuf_free(pkt);
+                    BUFLOG("ENQ", "fail s=%p m=%p rc=%d ring=%u paused=%d",
+                    sess, pkt, rc,
+                    (sess && sess->dl_ring) ? rte_ring_count(sess->dl_ring) : 0,
+                    sess ? rte_atomic32_read(&sess->buffering) : -1);
                 }
 
-                // In all cases, the live path must not continue processing this mbuf.
-                DUPLOG("ING consumed m=%p%s%u", pkt, has_seq ? " icmp_seq=" : "", has_seq ? icmp_seq : 0);
                 return 1;
-                
             }
-
-            // else: __upf_in_drain == 1 => this is a drained packet;
-            // fall through to our existing live pipeline (PDR→FAR/QER→encap→L2→OUT).
         }
         /* === END STRICT-FIFO DL INGRESS === */
 
@@ -1054,16 +1065,6 @@ static int packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, stru
     }
     AttachL2Header(pkt, is_dl);
     if (meta->action == ONVM_NF_ACTION_OUT && is_dl) {
-        
-        // comment out the code below after testing
-        struct rte_ipv4_hdr *iph2 = onvm_pkt_ipv4_hdr(pkt);
-        uint16_t seq;
-        if (upf_icmp_seq(pkt, &seq)) {
-            DUPLOG("%s-TX icmp m=%p seq=%u src=%s dst=%s",
-                is_dl ? "DL" : "UL", pkt, seq,
-                convertToIpAddress(iph2->src_addr),
-                convertToIpAddress(iph2->dst_addr));
-        }
 
         // check if the UE IP exists in the table and update the token
         int index = findIndexByUeIpAddress(rte_cpu_to_be_32(iph->dst_addr));
@@ -1155,7 +1156,7 @@ void msg_handler(void *msg_data, struct onvm_nf_local_ctx *ctx) {
 
             UpfSession *s = UpfSessionFindByUeIP(ue_ip_be);
             if (s) {
-                upfu_set_buffering(s, 1);   // pause dequeuing; producers still enqueue
+                (void)upfu_set_buffering(s, 1);   // pause dequeuing; producers still enqueue
                 if (!s->dl_ring) {
                      UTLT_Warning("SET_BUFFER before ring attach for UE=%s", convertToIpAddress(ue_ip_be));
                 }
@@ -1186,12 +1187,16 @@ void msg_handler(void *msg_data, struct onvm_nf_local_ctx *ctx) {
             UpfSession *s = UpfSessionFindByUeIP(ue_ip_be);
 
             if (s) {
-                upfu_set_buffering(s, 0);   // unpause
-                if (s->dl_ring) {
-                    // Kick a larger drain to flush pre-release backlog even without new arrivals
-                    upfu_drain_some(s, ctx, UPF_EVENT_KICK_BUDGET);  // action requires ring
-                } else {
-                    // Optional TODO: Warn
+                int prev = upfu_set_buffering(s, 0);
+                if (prev != 0 && s->dl_ring) {
+                    unsigned avail = rte_ring_count(s->dl_ring);
+                    if (avail) {
+                        upfu_drain_some(s, ctx, UPF_EVENT_KICK_BUDGET, UPF_DRAIN_SRC_EVENT);
+                    } else {
+                        BUFLOG("DRAIN", "skip(event,empty) s=%p", s);
+                    }
+                } else if (!s->dl_ring) {
+                    BUFLOG("DRAIN", "skip(event,no-ring) s=%p", s);
                 }
             }
 
@@ -1207,25 +1212,23 @@ void msg_handler(void *msg_data, struct onvm_nf_local_ctx *ctx) {
             break;
         }
 
-
-
 }
 
 
-void __upf_process_dl_packet(struct rte_mbuf *m,
-                        UpfSession *s /*unused*/,
-                        struct onvm_nf_local_ctx *ctx) {
+void __upf_process_dl_packet(struct rte_mbuf *m, UpfSession *s, struct onvm_nf_local_ctx *ctx, upf_drain_src_t src) {
     struct onvm_configuration *cfg = onvm_nflib_get_onvm_config();
     struct onvm_pkt_meta *meta = onvm_get_pkt_meta(m, cfg->dynfield_offset);
 
     /* Safety default; packet_handler will set final action */
     meta->action = ONVM_NF_ACTION_DROP;
+    
+    BUFLOG("PKT", "drain src=%s m=%p", 
+           (src == UPF_DRAIN_SRC_INLINE) ? "INLINE" :
+           (src == UPF_DRAIN_SRC_TICK)   ? "TICK"   :
+           (src == UPF_DRAIN_SRC_EVENT)  ? "EVENT"  : "UNKNOWN",
+           m);
 
-    /* Mark “drain context” while we reuse the live pipeline */
-    __upf_in_drain++;
     (void)packet_handler(m, meta, ctx);
-    __upf_in_drain--;
-
     //rte_pktmbuf_free(m);
 }
 
