@@ -10,6 +10,9 @@
 #include <net/if.h>
 
 #include <rte_byteorder.h>
+#include <rte_memzone.h>
+#include <rte_memory.h>
+#include <rte_malloc.h>
 
 #include "utlt_debug.h"
 #include "utlt_pool.h"
@@ -31,6 +34,23 @@
 static UpfContext self;
 static _Bool upfContextInitialized = 0;
 static uint64_t g_sessionIdPool = 1;
+
+upf_cls_ctrl_t *g_upf_cls_ctrl = NULL;
+
+int UpfClsCtrlInit(void) {
+    const struct rte_memzone *mz = rte_memzone_lookup(MZ_UPF_CLS_CTRL);
+    if (!mz) {
+        mz = rte_memzone_reserve_aligned(
+            MZ_UPF_CLS_CTRL, sizeof(upf_cls_ctrl_t),
+            SOCKET_ID_ANY, RTE_MEMZONE_2MB, RTE_CACHE_LINE_SIZE);
+        if (!mz) return -1;
+        upf_cls_ctrl_t *ctrl = (upf_cls_ctrl_t *)mz->addr;
+        ctrl->active  = NULL;   /* safety default: U-plane drops until publish */
+        ctrl->version = 0;
+    }
+    g_upf_cls_ctrl = (upf_cls_ctrl_t *)mz->addr;
+    return 0;
+}
 
 UpfContext *Self() {
     return &self;

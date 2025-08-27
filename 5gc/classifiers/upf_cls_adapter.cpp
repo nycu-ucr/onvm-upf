@@ -1,295 +1,189 @@
-/* C + C++ standard headers */
-#include <ctype.h>
-#include <string.h>
-#include <cstdlib>
+/* C/C++ headers */
+#include <cstring>
+#include <cctype>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <arpa/inet.h>
-#include <iostream>
-#include <iomanip>
 
-/* Classifier front-end & public adapter interface */
-#include "classifier_wrapper.h"
+
+/* Public adapter interface + wrapper types */
 #include "upf_cls_adapter.h"
+#include "classifier_wrapper.h"
 
-/* UPDK structures */
-#include "../../onvm/updk/updk/rule_pdr.h"
+/*──────────────────── local helpers ────────────────────*/
 
-/*──── Local helpers / state ─────────────────────────────────────────────*/
-#define SRC_IF_ANY  ((source_interface_t)ANY8)
-static int cls_debug_enabled = 1;
-
-static inline std::string ip4(uint32_t host_ip) {
-    struct in_addr in { htonl(host_ip) };
-    char buf[INET_ADDRSTRLEN];
-    return inet_ntop(AF_INET, &in, buf, sizeof(buf)) ? buf : "<invalid>";
-}
-
-/* Pretty-printer for converted PDR → rule */
-static void log_rule(const pdr_t &r) {
-    if (!cls_debug_enabled) return;
-    std::cerr << "ClassifierRule: id=" << r.pdr_id
-              << " prec=" << r.precedence
-              << " UE="  << ip4(r.pdi.ue_ip.s_addr)  << "/" << (int)r.pdi.ue_pref
-              << " SRC=" << ip4(r.pdi.src_ip.s_addr) << "/" << (int)r.pdi.src_pref
-              << " DST=" << ip4(r.pdi.dst_ip.s_addr) << "/" << (int)r.pdi.dst_pref
-              << " sport="  << r.pdi.src_port
-              << " dport="  << r.pdi.dst_port
-              << " proto="  << (int)r.pdi.proto
-              << " tos="    << (int)r.pdi.tos_tc
-              << " spi="    << r.pdi.spi
-              << " flow="   << r.pdi.flow_label
-              << " teid="   << r.pdi.teid
-              << " srcIf="  << (int)r.pdi.source_if
-              << " ni=0x"   << std::hex << std::setw(8) << std::setfill('0')
-                             << r.pdi.ni_hash << std::dec
-              << " qfi="    << (int)r.pdi.qfi
-              << " desc=0x" << std::hex << r.descriptor << std::dec
-              << '\n';
-}
-
-/* 32-bit FNV-1a hash for Network-Instance */
 static inline uint32_t fnv1a_hash(const char *s) {
     uint32_t h = 2166136261u;
+    if (!s) return 0u;
     while (*s) { h ^= (uint8_t)*s++; h *= 16777619u; }
     return h;
 }
 
-/* Initialise a rule with wildcards */
-/* static inline void init_wildcard(pdr_t *r)
-{
-    memset(r, 0, sizeof(*r));
-    r->pdi.src_port   = ANY16;
-    r->pdi.dst_port   = ANY16;
-    r->pdi.spi        = ANY32;
-    r->pdi.flow_label = ANY32;
-    r->pdi.teid       = ANY32;
-    r->pdi.source_if  = SRC_IF_ANY;
-    r->pdi.ni_hash    = ANY32;
-    r->pdi.qfi        = ANY8;
-} */
+/* Parse "A.B.C.D[/P]" → host-order IPv4 + prefix (0..32).
+ * If no /P, defaults to /32 (exact). On parse error, returns 0 with pref=0. */
+static inline uint32_t parse_ip_prefix(const char *s, uint8_t *pref_out) {
+    if (!s || !*s) { *pref_out = 0; return 0; }
+    char buf[32]; std::memset(buf, 0, sizeof(buf));
+    std::strncpy(buf, s, sizeof(buf) - 1);
 
-/* Parse “X.Y.Z.W[/P]” into host-order IPv4 + prefix */
-static inline uint32_t parse_ip_prefix(const char *s, uint8_t *pref_out)
-{
-    char buf[32];
-    strncpy(buf, s, sizeof(buf) - 1);
-    buf[sizeof(buf) - 1] = 0;
-
-    char *slash = strchr(buf, '/');
+    char *slash = std::strchr(buf, '/');
     if (slash) {
-        *slash = 0;
-        *pref_out = isdigit((unsigned)slash[1]) ? (uint8_t)atoi(slash + 1) : 32;
+        *slash = '\0';
+        const char *p = slash + 1;
+        *pref_out = (std::isdigit((unsigned char)*p)) ? (uint8_t)std::atoi(p) : 32;
         if (*pref_out > 32) *pref_out = 32;
     } else {
         *pref_out = 32;
     }
 
-    struct in_addr a;
+    struct in_addr a{};
     if (!inet_aton(buf, &a)) { *pref_out = 0; return 0; }
+    /* store as host-order 32-bit (we convert as needed downstream) */
     return ntohl(a.s_addr);
 }
 
-static inline source_interface_t map_src_if(uint8_t pfcp_if)
-{
-    return pfcp_if < SRC_IF_COUNT ? (source_interface_t)pfcp_if
-                                  : SRC_IF_ACCESS;
+/* Map PFCP sourceInterface to our enum; default ACCESS if unknown. */
+static inline source_interface_t map_src_if(uint8_t pfcp_if) {
+    return (pfcp_if < SRC_IF_COUNT) ? (source_interface_t)pfcp_if : SRC_IF_ACCESS;
 }
 
-static pdr_t updk_pdr_to_cls_rule(const UPDK_PDR *in, bool is_uplink)
-{
-    printf("updk_pdr_to_cls_rule: is_uplink = %s", is_uplink ? "true" : "false");
+
+static const char* ip_to_str(uint32_t host_ip, char buf[INET_ADDRSTRLEN]) {
+    struct in_addr a; a.s_addr = htonl(host_ip);
+    return inet_ntop(AF_INET, &a, buf, sizeof(buf)) ? buf : "<?>"; 
+}
+
+static void log_rule(const pdr_t* r, const char* tag /* e.g., "UL" or "DL" */) {
+    if (!r) return;
+    char ue[INET_ADDRSTRLEN], si[INET_ADDRSTRLEN], di[INET_ADDRSTRLEN];
+    printf("[CLS][%s] PDR id=%u prec=%u is_ul=%u desc=0x%lx\n"
+           "          UE=%s/%u  SRC=%s/%u  DST=%s/%u  L4:%u->%u proto=%u tos=%u\n"
+           "          TEID=%u src_if=%u qfi=%u spi=%u ni_hash=0x%x\n",
+           tag ? tag : "-", r->pdr_id, r->precedence, (unsigned)r->is_uplink,
+           (unsigned long)r->descriptor,
+           ip_to_str(r->pdi.ue_ip.s_addr, ue), r->pdi.ue_pref,
+           ip_to_str(r->pdi.src_ip.s_addr, si), r->pdi.src_pref,
+           ip_to_str(r->pdi.dst_ip.s_addr, di), r->pdi.dst_pref,
+           (unsigned)r->pdi.src_port, (unsigned)r->pdi.dst_port,
+           (unsigned)r->pdi.proto, (unsigned)r->pdi.tos_tc,
+           r->pdi.teid, (unsigned)r->pdi.source_if, (unsigned)r->pdi.qfi,
+           r->pdi.spi, r->pdi.ni_hash);
+}
+
+/*──────────────────── public C API ─────────────────────*/
+
+extern "C" pdr_t updk_pdr_to_cls_rule(const UPDK_PDR *in, bool is_uplink) {
     pdr_t out{};
-    // init_wildcard(&out);
-
     out.is_uplink = is_uplink;
+    out.descriptor = 0; /* builder sets if desired */
 
-    if (in->flags.pdrId) {
-        out.pdr_id = in->pdrId;
-    }
-    if (in->flags.precedence) { 
-        out.precedence = in->precedence;
-    }
-    if (!in->flags.pdi) {
-        return out;
-    }
+    if (!in) return out;
 
+    if (in->flags.pdrId)       out.pdr_id    = in->pdrId;
+    if (in->flags.precedence)  out.precedence= in->precedence;
+
+    if (!in->flags.pdi) return out;
     const UPDK_PDI &p = in->pdi;
 
+    /* UE IP (IPv4) */
     if (p.flags.ueIpAddress && p.ueIpAddress.flags.v4) {
-         out.pdi.ue_ip.s_addr = ntohl(p.ueIpAddress.ipv4.s_addr);
-         out.pdi.ue_pref      = 32;
-     }
+        out.pdi.ue_ip.s_addr = ntohl(p.ueIpAddress.ipv4.s_addr); /* host-order */
+        out.pdi.ue_pref      = 32;
+    }
 
-    if (p.flags.fTeid && p.fTeid.flags.v4) {
+    /* TEID (host-order as carried) */
+    if (p.flags.fTeid && p.fTeid.flags.v4)
         out.pdi.teid = p.fTeid.teid;
-    }
 
-    if (p.flags.qfi) {
-        out.pdi.qfi = p.qfi;
-    }
-    if (p.flags.networkInstance) {
-        out.pdi.ni_hash = fnv1a_hash(p.networkInstance);
-    }
-    if (p.flags.sourceInterface)  {
-        // out.pdi.source_if = map_src_if(p.sourceInterface);
-        out.pdi.source_if = is_uplink ? SRC_IF_ACCESS : SRC_IF_CORE;
-    }
+    /* QFI / Network Instance hash / Source Interface */
+    if (p.flags.qfi)               out.pdi.qfi       = p.qfi;
+    if (p.flags.networkInstance)   out.pdi.ni_hash   = fnv1a_hash(p.networkInstance);
+    if (p.flags.sourceInterface)   out.pdi.source_if = map_src_if(p.sourceInterface);
+    else                           out.pdi.source_if = is_uplink ? SRC_IF_ACCESS : SRC_IF_CORE;
 
-
-    // PDI -> SDF Filter -> Flow Description
-
+    /* SDF Filter → optional fields */
     if (p.flags.sdfFilter) {
-        
         const auto &f = p.sdfFilter;
 
-        if (f.flags.ttc) {
-            out.pdi.tos_tc = f.tosTrafficClass;
-        }
-        if (f.flags.spi) {
-            out.pdi.spi = f.securityParameterIndex;
-        }
+        if (f.flags.ttc) out.pdi.tos_tc = f.tosTrafficClass;
+        if (f.flags.spi) out.pdi.spi    = f.securityParameterIndex;
+        /* IPv6 flow-label intentionally ignored here */
 
-        // ignoring flow label for now as that is for IPv6 traffic only
-
-        /* if (f.flags.fl) {
-            // PFCP Flow-Label is a 3-octet field in network order
-            uint8_t *flb = (uint8_t*)f.flowLabel;
-            out.pdi.flow_label =
-                (uint32_t(flb[0]) << 16) |
-                (uint32_t(flb[1]) << 8)  |
-                (uint32_t(flb[2])      );
-        } */
-
-
+        /* Flow Description heuristics (simple "from X to Y" parsing) */
         if (f.flags.fd && f.flowDescription) {
             const char *desc = f.flowDescription;
-            char token[32];
 
-            if (strstr(desc, "from any") && strstr(desc, "to assigned")) {
+            /* Quick path: "from any to assigned" / "from assigned to any" */
+            bool has_from_any      = std::strstr(desc, "from any")      != nullptr;
+            bool has_to_assigned   = std::strstr(desc, "to assigned")   != nullptr;
+            bool has_from_assigned = std::strstr(desc, "from assigned") != nullptr;
+            bool has_to_any        = std::strstr(desc, "to any")        != nullptr;
+
+            if (out.pdi.ue_pref && (has_from_any && has_to_assigned)) {
                 if (is_uplink) {
-                    // uplink: match UE→any
-                    out.pdi.src_ip.s_addr = out.pdi.ue_ip.s_addr;
-                    out.pdi.src_pref      = out.pdi.ue_pref;
-                    out.pdi.dst_ip.s_addr = 0;
-                    out.pdi.dst_pref      = 0;
+                    /* UL: UE→any */
+                    out.pdi.src_ip.s_addr = out.pdi.ue_ip.s_addr; out.pdi.src_pref = out.pdi.ue_pref;
+                    out.pdi.dst_ip.s_addr = 0;                    out.pdi.dst_pref = 0;
                 } else {
-                    // downlink: match any→UE
-                    out.pdi.src_ip.s_addr = 0;
-                    out.pdi.src_pref      = 0;
-                    out.pdi.dst_ip.s_addr = out.pdi.ue_ip.s_addr;
-                    out.pdi.dst_pref      = out.pdi.ue_pref;
+                    /* DL: any→UE */
+                    out.pdi.src_ip.s_addr = 0;                    out.pdi.src_pref = 0;
+                    out.pdi.dst_ip.s_addr = out.pdi.ue_ip.s_addr; out.pdi.dst_pref = out.pdi.ue_pref;
                 }
-
-                printf("[CLS] FlowDescription hack: %s — src=%u, dst=%u\n",
-                is_uplink ? "UL" : "DL",
-                out.pdi.src_ip.s_addr,
-                out.pdi.dst_ip.s_addr);
-
+            } else if (out.pdi.ue_pref && (has_from_assigned && has_to_any)) {
+                if (is_uplink) {
+                    /* UL: UE→any */
+                    out.pdi.src_ip.s_addr = out.pdi.ue_ip.s_addr; out.pdi.src_pref = out.pdi.ue_pref;
+                    out.pdi.dst_ip.s_addr = 0;                    out.pdi.dst_pref = 0;
+                } else {
+                    /* DL: any→UE */
+                    out.pdi.src_ip.s_addr = 0;                    out.pdi.src_pref = 0;
+                    out.pdi.dst_ip.s_addr = out.pdi.ue_ip.s_addr; out.pdi.dst_pref = out.pdi.ue_pref;
+                }
             } else {
-                if (const char *pos = strstr(desc, "from ")) {
-                pos += 5;
-                size_t i = 0;
-                while (pos[i] && !isspace((unsigned char)pos[i]) && i + 1 < sizeof(token)) {
-                    token[i] = pos[i];
-                    ++i;
-                }
-                    
-                token[i] = '\0';
-
-                if (strcmp(token, "any") == 0) {
-                    out.pdi.src_ip.s_addr = 0;
-                    out.pdi.src_pref      = 0;          /* wildcard */
-                } else if (strcmp(token, "assigned") == 0) {
-                    if (out.pdi.ue_pref == 0 && out.pdi.ue_ip.s_addr == 0) {
-                        std::cerr << "[upf_cls_adapter] ‘assigned’ used but UE IP missing – "
-                                     "treating as wildcard\n";
-                        out.pdi.src_ip.s_addr = 0;
-                        out.pdi.src_pref      = 0;
-                    } else {
-                        out.pdi.src_ip.s_addr = out.pdi.ue_ip.s_addr;
-                        out.pdi.src_pref      = out.pdi.ue_pref;
+                /* Generic "from X" */
+                char tok[32] = {0};
+                if (const char *pos = std::strstr(desc, "from ")) {
+                    pos += 5;
+                    size_t i = 0;
+                    while (pos[i] && !std::isspace((unsigned char)pos[i]) && i + 1 < sizeof(tok)) {
+                        tok[i++] = pos[i-0];
                     }
-                } else {
-                    uint8_t pf = 0;
-                    out.pdi.src_ip.s_addr = parse_ip_prefix(token, &pf);
-                    out.pdi.src_pref      = pf;
-                }
-            }
-
-            /* ─── “to …” ───────────────────────────────────────────── */
-            memset(token, 0, sizeof(token)); 
-            
-            if (const char *pos = strstr(desc, "to ")) {
-                pos += 3;
-                size_t j = 0;
-                while (pos[j] && !isspace((unsigned char)pos[j]) && j + 1 < sizeof(token)) {
-                    token[j] = pos[j];
-                    ++j;
-                }
-                    
-                token[j] = '\0';
-
-                if (strcmp(token, "any") == 0) {
-                    out.pdi.dst_ip.s_addr = 0;
-                    out.pdi.dst_pref      = 0;
-                } else if (strcmp(token, "assigned") == 0) {
-                    if (out.pdi.ue_pref == 0 && out.pdi.ue_ip.s_addr == 0) {
-                        std::cerr << "[upf_cls_adapter] ‘assigned’ used but UE IP missing – "
-                                     "treating as wildcard\n";
-                        out.pdi.dst_ip.s_addr = 0;
-                        out.pdi.dst_pref      = 0;
+                    tok[i] = '\0';
+                    if      (std::strcmp(tok, "any") == 0)      { out.pdi.src_ip.s_addr = 0; out.pdi.src_pref = 0; }
+                    else if (std::strcmp(tok, "assigned") == 0) {
+                        if (out.pdi.ue_pref) { out.pdi.src_ip.s_addr = out.pdi.ue_ip.s_addr; out.pdi.src_pref = out.pdi.ue_pref; }
+                        else                 { out.pdi.src_ip.s_addr = 0;                     out.pdi.src_pref = 0; }
                     } else {
-                        out.pdi.dst_ip.s_addr = out.pdi.ue_ip.s_addr;
-                        out.pdi.dst_pref      = out.pdi.ue_pref;
+                        uint8_t pf = 0; out.pdi.src_ip.s_addr = parse_ip_prefix(tok, &pf); out.pdi.src_pref = pf;
                     }
-                } else {
-                    uint8_t pf2 = 0;
-                    out.pdi.dst_ip.s_addr = parse_ip_prefix(token, &pf2);
-                    out.pdi.dst_pref      = pf2;
+                }
+                /* Generic "to Y" */
+                std::memset(tok, 0, sizeof(tok));
+                if (const char *pos = std::strstr(desc, "to ")) {
+                    pos += 3;
+                    size_t j = 0;
+                    while (pos[j] && !std::isspace((unsigned char)pos[j]) && j + 1 < sizeof(tok)) {
+                        tok[j++] = pos[j-0];
+                    }
+                    tok[j] = '\0';
+                    if      (std::strcmp(tok, "any") == 0)      { out.pdi.dst_ip.s_addr = 0; out.pdi.dst_pref = 0; }
+                    else if (std::strcmp(tok, "assigned") == 0) {
+                        if (out.pdi.ue_pref) { out.pdi.dst_ip.s_addr = out.pdi.ue_ip.s_addr; out.pdi.dst_pref = out.pdi.ue_pref; }
+                        else                 { out.pdi.dst_ip.s_addr = 0;                     out.pdi.dst_pref = 0; }
+                    } else {
+                        uint8_t pf2 = 0; out.pdi.dst_ip.s_addr = parse_ip_prefix(tok, &pf2); out.pdi.dst_pref = pf2;
+                    }
                 }
             }
-            }
-            
+        }
+
+        /* Ports/proto from SDF fields if present (your UPDK model may carry them separately).
+           If not present, they remain wildcard (0 / prefix=0 in rule mapping). */
+        if (f.flags.bidirectional) {
+            /* If you support explicit ports/proto tokens, parse them here as needed. */
         }
     }
 
-    log_rule(out);
     return out;
 }
-
-
-
-/*──────────────────────── C-callable API ───────────────────────────────*/
-extern "C" {
-
-/* insert */
-uintptr_t upf_cls_add_pdr(const UPDK_PDR *pdr, bool is_uplink)
-{
-    printf("upf_cls_add_pdr: is_uplink = %s", is_uplink ? "true" : "false");
-    if (!pdr) return 0;
-    printf("=================1======================");
-    pdr_t rule = updk_pdr_to_cls_rule(pdr, is_uplink);
-    printf("=================2======================");
-    rule.descriptor = reinterpret_cast<uintptr_t>(pdr);
-    printf("=================3======================");
-    return cls_insert_rule(cls_global(), &rule);
-}
-
-/* delete */
-int upf_cls_del_pdr(const UPDK_PDR *pdr)
-{
-    if (!pdr) return -1;
-    uintptr_t desc = reinterpret_cast<uintptr_t>(pdr);
-    return cls_delete_rule_by_descriptor(cls_global(), desc);
-}
-
-/* lookup */
-const UPDK_PDR *upf_cls_lookup(const ps_packet_t *pkt)
-{
-    uintptr_t desc = 0;
-    if (cls_classify_packet(cls_global(), pkt, nullptr, &desc) == 1)
-        return reinterpret_cast<const UPDK_PDR *>(desc);
-    return nullptr;
-}
-
-} /* extern "C" */

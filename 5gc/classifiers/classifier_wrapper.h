@@ -6,26 +6,21 @@
 
 #include "../../onvm/updk/updk/rule_pdr.h"
 
-
+/*────────────────── Backend selection ───────────────────────────────────*/
 typedef enum {
     CLS_BACKEND_PS,      /* PartitionSort        */
     CLS_BACKEND_TSS,     /* Tuple-Space-Search   */
-    CLS_BACKEND_PTSS     /* Parallel-TSS variant */
+    CLS_BACKEND_PTSS     /* Priority/Parallel TSS */
 } cls_backend_t;
-
 
 #ifndef CLS_SELECTED_BACKEND
 #define CLS_SELECTED_BACKEND CLS_BACKEND_PS
 #endif
 
-/*────────────────── Constants ─────────────────────────────────────────────*/
+/* Max number of PDI dimensions we feed into engines */
 #define PDI_MAX_FLD 14
 
-/* #define ANY32 0xFFFFFFFFu
-#define ANY16 0xFFFFu
-#define ANY8  0xFFu */
-
-/*────────────────── Core data types ──────────────────────────────────────*/
+/*────────────────── Core data types ─────────────────────────────────────*/
 typedef enum {
     SRC_IF_ACCESS  = 0,
     SRC_IF_CORE    = 1,
@@ -35,7 +30,7 @@ typedef enum {
     SRC_IF_COUNT   = 5
 } source_interface_t;
 
-/* PDI inside a PDR --------------------------------------------------------*/
+/* Packet Detection Information (subset we index on) */
 typedef struct {
     /* mandatory key */
     struct in_addr ue_ip;  uint8_t ue_pref;
@@ -52,57 +47,60 @@ typedef struct {
     uint32_t           ni_hash;
 } pdi_t;
 
-/* Rule wrapper -----------------------------------------------------------*/
+/* Rule wrapper (one per PDR filter) */
 typedef struct {
     uint16_t  pdr_id;
     uint32_t  precedence;
     pdi_t     pdi;
-    uintptr_t descriptor;       // back-pointer to original UPDK_PDR
-    bool is_uplink;             // traffic direction flag
+    uintptr_t descriptor;       /* back-pointer/cookie to DP view (hugepage) */
+    bool      is_uplink;        /* traffic direction flag */
 } pdr_t;
 
-/* Flat packet view -------------------------------------------------------*/
+/* Flat packet view for classification */
 typedef struct {
     uint32_t ue_ip, src_ip, dst_ip;
     uint16_t src_port, dst_port;
-    uint8_t  proto, tos_tc;
-    uint32_t spi, flow_label;
-    uint32_t teid, source_if, ni_hash;
+    uint8_t  proto,  tos_tc;
+    uint32_t spi,    flow_label;
+    uint32_t teid,   source_if, ni_hash;
     uint8_t  qfi;
     uint8_t  is_uplink;
 } ps_packet_t;
 
-/* Opaque classifier handle ----------------------------------------------*/
+/* Optional: consolidated match result (convenience) */
+typedef struct {
+    int       matched;      /* 0/1 */
+    uint32_t  pdr_id;
+    uint32_t  precedence;
+    uintptr_t descriptor;   /* engine’s descriptor cookie */
+} cls_match_t;
+
+/* Opaque classifier handle (one per immutable snapshot) */
 typedef struct cls_handle_t cls_handle_t;
 
-/*────────────────── Public API ───────────────────────────────────────────*/
+/*────────────────── Public C API (handle-based) ─────────────────────────*/
 #ifdef __cplusplus
 extern "C" {
 #endif
 
+/* CP side (build-time, UPF-C only) */
 cls_handle_t *cls_create(cls_backend_t which);
 void          cls_destroy(cls_handle_t *);
 
-uintptr_t cls_insert_rule(cls_handle_t *, const pdr_t *);
-int       cls_delete_rule_by_descriptor(cls_handle_t *, uintptr_t);
+/* Insert/delete rules while building a snapshot (UPF-C only) */
+uintptr_t cls_insert_rule(cls_handle_t *h, const pdr_t *r);
+int       cls_delete_rule_by_descriptor(cls_handle_t *h, uintptr_t d);
 
+/* DP side (read-only classify on an immutable snapshot, UPF-U) */
 int cls_classify_packet(
-        cls_handle_t       *,
-        const ps_packet_t  *,
+        cls_handle_t       *h,            /* snapshot handle (immutable) */
+        const ps_packet_t  *pkt,
         uint32_t           *precedence_out,
         uintptr_t          *descriptor_out);
 
-void cls_print_all_rules(cls_handle_t *);
+/* Optional debug (CP only) */
+void cls_print_all_rules(cls_handle_t *h);
 
 #ifdef __cplusplus
 }
 #endif
-
-/*────────────────── Singleton accessor (header-only) ─────────────────────*/
-static inline cls_handle_t *cls_global(void)
-{
-    static cls_handle_t *h = NULL;
-    if (!h)
-        h = cls_create(CLS_SELECTED_BACKEND);
-    return h;
-}
