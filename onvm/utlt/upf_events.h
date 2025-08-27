@@ -44,7 +44,7 @@
 
 // How often (in number of successful enqueues) to run egress tick
 #ifndef UPF_EGRESS_TICK_INTERVAL
-#define UPF_EGRESS_TICK_INTERVAL 16
+#define UPF_EGRESS_TICK_INTERVAL 32
 #endif
 
 enum {

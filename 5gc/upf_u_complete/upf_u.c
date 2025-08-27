@@ -80,9 +80,18 @@ static struct rte_ether_addr dn_eth;
 static struct rte_ether_addr cn_dn_eth;
 static struct rte_ether_addr cn_ue_eth;
 
-static UpfSession *g_touched[UPF_TOUCHED_MAX];
-static uint32_t g_touched_n = 0;
+
 static uint32_t g_enq_since_tick = 0;
+
+// Two physical arrays
+static UpfSession *g_tbufA[UPF_TOUCHED_MAX];
+static UpfSession *g_tbufB[UPF_TOUCHED_MAX];
+
+// Logical views: "current epoch" and "next epoch"
+static UpfSession **g_touched_cur = g_tbufA;
+static UpfSession **g_touched_nxt = g_tbufB;
+static uint32_t     g_touched_cur_n = 0;
+static uint32_t     g_touched_nxt_n = 0;
 
 
 uint8_t DnMac[RTE_ETHER_ADDR_LEN];
@@ -120,11 +129,21 @@ int upf_icmp_seq(struct rte_mbuf *m, uint16_t *seq_out) {
 int __upf_in_drain = 0;
 
 static inline void touched_add(UpfSession *s) {
-    for (uint32_t i = 0; i < g_touched_n; i++) {
-        if (g_touched[i] == s) return;
+    for (uint32_t i = 0; i < g_touched_cur_n; i++) {
+        if (g_touched_cur[i] == s) return;
     }
-    if (g_touched_n < UPF_TOUCHED_MAX) {
-        g_touched[g_touched_n++] = s;
+    if (g_touched_cur_n < UPF_TOUCHED_MAX) {
+        g_touched_cur[g_touched_cur_n++] = s;
+    }
+}
+
+/* Carryover touch: used by egress_tick() to keep leftovers for the next tick */
+static inline void touched_add_next(UpfSession *s) {
+    for (uint32_t i = 0; i < g_touched_nxt_n; i++) {
+        if (g_touched_nxt[i] == s) return;         /* already carried */
+    }
+    if (g_touched_nxt_n < UPF_TOUCHED_MAX) {
+        g_touched_nxt[g_touched_nxt_n++] = s;
     }
 }
 
@@ -142,15 +161,16 @@ static inline void touched_add(UpfSession *s) {
 
 static inline void egress_tick(struct onvm_nf_local_ctx *ctx)
 {
-    if (g_touched_n == 0) {
+    if (g_touched_cur_n == 0) {
         g_enq_since_tick = 0;
         return;
     }
 
-    UTLT_Debug("[BUF:TICK] fire touched=%u enq_since=%u", g_touched_n, g_enq_since_tick);
+    UTLT_Debug("[BUF:TICK] fire touched=%u enq_since=%u", g_touched_cur_n, g_enq_since_tick);
 
-    for (uint32_t i = 0; i < g_touched_n; i++) {
-        UpfSession *s = g_touched[i];
+    const uint32_t curr_n = g_touched_cur_n;
+    for (uint32_t i = 0; i < curr_n; i++) {
+        UpfSession *s = g_touched_cur[i];
         if (!s || !s->dl_ring)               continue;
         if (rte_atomic32_read(&s->buffering) != 0) continue;
 
@@ -165,13 +185,24 @@ static inline void egress_tick(struct onvm_nf_local_ctx *ctx)
         // Guaranteed progress across ticks without new arrivals when leftovers remain
         
         if (rte_ring_count(s->dl_ring) > 0) {
-            touched_add(s);
+            touched_add_next(s);
         }
        
     }
 
-    g_touched_n = 0;
+    // Promote NEXT -> CURRENT by swapping pointers (O(1); NO copying)
+    {
+        UpfSession **tmp_list = g_touched_cur;
+        g_touched_cur         = g_touched_nxt;
+        g_touched_nxt         = tmp_list;
+
+        uint32_t tmp_n        = g_touched_cur_n;
+        g_touched_cur_n       = g_touched_nxt_n;
+        g_touched_nxt_n       = 0;
+    }
+
     g_enq_since_tick = 0;
+
 }
 
 
