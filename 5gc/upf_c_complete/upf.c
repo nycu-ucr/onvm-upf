@@ -68,6 +68,14 @@ int main(int argc, char *argv[]) {
         }
     }
 
+    // Create the shared classifier control slot
+    if (UpfClsCtrlInit() < 0) {
+        rte_exit(EXIT_FAILURE, "CLS_CTRL memzone init failed\n");
+    }
+
+    UpfPDRGlobalInit();
+
+
     OnvmSetNfContext(nf_local_ctx);
 
     argc -= arg_offset;

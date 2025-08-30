@@ -37,6 +37,40 @@ static uint64_t g_sessionIdPool = 1;
 
 upf_cls_ctrl_t *g_upf_cls_ctrl = NULL;
 
+list_t *g_all_pdr_list = NULL;
+
+
+void UpfPDRGlobalInit(void) {
+    if (!g_all_pdr_list) {
+        g_all_pdr_list = list_new();
+    }
+}
+
+void UpfPDRGlobalAdd(UpfPDR *pdr) {
+    if (!pdr) {
+        return;
+    }
+    if (!g_all_pdr_list) {
+        g_all_pdr_list = list_new();
+    }
+    list_rpush(g_all_pdr_list, list_node_new(pdr));
+}
+
+void UpfPDRGlobalRemove(UpfPDR *pdr) {
+    if (!g_all_pdr_list || !pdr) {
+        return;
+    }
+    list_iterator_t *it = list_iterator_new(g_all_pdr_list, LIST_HEAD);
+    for (list_node_t *n; (n = list_iterator_next(it)); ) {
+        if ((UpfPDR *)n->val == pdr) { 
+            list_remove(g_all_pdr_list, n);
+            break;
+        }
+    }
+    list_iterator_destroy(it);
+}
+
+
 int UpfClsCtrlInit(void) {
     const struct rte_memzone *mz = rte_memzone_lookup(MZ_UPF_CLS_CTRL);
     if (!mz) {

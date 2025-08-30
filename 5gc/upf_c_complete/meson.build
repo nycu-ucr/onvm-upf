@@ -5,5 +5,6 @@ sources = files(
     'n4_onvm_pfcp_path.c',
     'n4_onvm_pfcp_handler.c',
     'n4_onvm_pfcp_build.c',
-    'n4_dispatcher.c'
+    'n4_dispatcher.c',
+    '../classifiers/cls_heap_dpdk_shim.cpp',
 )

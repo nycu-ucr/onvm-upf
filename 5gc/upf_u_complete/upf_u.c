@@ -44,6 +44,8 @@
 #include "onvm_pkt_helper.h"
 #include "list.h"
 
+#include "upf_events.h"
+
 #include "../classifiers/upf_cls_adapter.h"
 #include "../classifiers/classifier_wrapper.h"
 
@@ -110,6 +112,61 @@ struct flow_entry {
 flow_entry_t iPFlows[APP_FLOWS_MAX];
 uint32_t iPFlowsLen = 0;
 uint32_t trTCMidx = 0; 
+
+
+typedef struct {
+    void    *ptr;          // current active snapshot (cls_handle_t*)
+    uint32_t ver;          // last applied version
+    uint32_t pending_ver;  // version announced by UPF-C via REQ
+    uint8_t  flip_pending; // 1 when a flip is requested; cleared after flip
+} upf_cls_local_t;
+
+static upf_cls_local_t g_cls_local = {0};
+
+/* Flip to the latest published snapshot (called at burst boundary) */
+static inline void UpfClsMaybeFlipAndAck(void) {
+    if (likely(!g_cls_local.flip_pending)) {
+        return;
+    }
+    /* Pair with UPF-C's rte_wmb before publishing; read pointer then version */
+    rte_rmb();
+    void    *new_ptr = g_upf_cls_ctrl ? g_upf_cls_ctrl->active  : NULL;
+    uint32_t new_ver = g_upf_cls_ctrl ? g_upf_cls_ctrl->version : 0;
+
+    g_cls_local.ptr = new_ptr;
+    g_cls_local.ver = new_ver;
+    g_cls_local.flip_pending = 0;
+
+    // ACK back to UPF-C with the new version we observed
+    (void)UpfSendEvt1(UPF_C_SERVICE_ID, EVT_CLS_GC_ACK, (uintptr_t)new_ver);
+}
+
+/* static inline const UPDK_PDR *UpfLookupPdr(const ps_packet_t *key) {
+    const cls_handle_t *snap = (const cls_handle_t *)g_cls_local.ptr;
+    if (unlikely(!snap)) return NULL;
+
+    uint32_t  precedence = 0;
+    uintptr_t cookie     = 0;
+    int hit = cls_classify_packet((cls_handle_t *)snap, key, &precedence, &cookie);
+    if (!hit) return NULL;
+
+    return (const UPDK_PDR *)cookie;
+} */
+
+static inline uint16_t UpfClassifyGetPdrId(const ps_packet_t *key) {
+    const cls_handle_t *snap = (const cls_handle_t *)g_cls_local.ptr;
+    if (!snap) return 0;
+
+    uint32_t  precedence = 0;
+    uintptr_t pdrId     = 0;
+    int hit = cls_classify_packet((cls_handle_t *)snap, key, &precedence, &pdrId);
+    if (hit != 1) {
+        return 0;
+    }
+
+    return (uint16_t)pdrId;
+}
+
 
 
 bool ftAddEntry(uint32_t subnet, int flow_idx) {
@@ -616,18 +673,20 @@ GetPdrByUeIpAddress(struct rte_mbuf *pkt, uint32_t ue_ip)
         (unsigned)key.source_if
     ); */
 
-
-    /* ── 2) Classifier lookup ─────────────────────────────────── */
-    const UPDK_PDR *pdr = upf_cls_lookup(&key);
-    if (!pdr) return NULL;
-
-    /* ── 3) QER processing ───────────────────────────────────── */
-    UpfSession *session = UpfSessionFindByUeIP(ue_ip);
-    if (session) {
-        ConfigureQerFlows(session, pdr, pkt->port, key.ue_ip, false);
+    uint16_t pdr_id = UpfClassifyGetPdrId(&key);
+    if (pdr_id == 0) {
+        UTLT_Error("Couldn't classify the packet to a PDR");
+        return NULL;
     }
 
-    return (UPDK_PDR*)pdr;
+    UpfSession *session = UpfSessionFindByUeIP(ue_ip);
+    if (!session) return NULL;
+    
+    const UPDK_PDR *pdr = UpfPDRFindByID(session, pdr_id);
+
+    ConfigureQerFlows(session, pdr, pkt->port, key.ue_ip, false);
+
+    return pdr;
 }
 
 
@@ -1083,17 +1142,23 @@ UPDK_PDR *GetPdrByTeid(struct rte_mbuf *pkt, uint32_t td) {
     key.is_uplink ? "true" : "false"
 );
 
-    // Lookup
-    const UPDK_PDR *pdr = upf_cls_lookup(&key);
-    printf("Lookup returned: %p\n", (void*)pdr);
 
-    if (!pdr) return NULL;
+    uint16_t pdr_id = UpfClassifyGetPdrId(&key);
+    if (pdr_id == 0) {
+        UTLT_Error("Couldn't classify the packet to a PDR");
+        return NULL;
+    }
 
+    printf("PDR ID from Classifier = %" PRIu16 "\n", pdr_id);
+    
     UpfSession *session = UpfSessionFindByTeid(td);
-    if (session)
-        ConfigureQerFlows(session, pdr, pkt->port, key.ue_ip, true);
+    if (!session) return NULL;
+    
+    const UPDK_PDR *pdr = UpfPDRFindByID(session, pdr_id);
 
-    return (UPDK_PDR *)pdr;
+    ConfigureQerFlows(session, pdr, pkt->port, key.ue_ip, true);
+
+    return pdr;
 }
 
 
@@ -1296,6 +1361,9 @@ packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm_nf_
         return 0;
     }
 
+    // Flip to a newly published snapshot if a REQ was received
+    UpfClsMaybeFlipAndAck();
+
     UPDK_PDR *pdr = NULL;
     // Step 1: Identify if it is a uplink packet or downlink packet
     // char *src_address = convertToIpAddress(iph->src_addr);
@@ -1468,10 +1536,22 @@ packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm_nf_
 
 void
 msg_handler(void *msg_data, struct onvm_nf_local_ctx *nf_local_ctx) {
-    struct onvm_nf *nf;
-    nf = nf_local_ctx->nf;
+
+    Event *e = (Event *)msg_data;
+
+    /* Our NF→NF control path: CP tells us to flip */
+    if (e && (uint32_t)e->type == EVT_CLS_GC_REQ) {
+        g_cls_local.pending_ver = (uint32_t)e->arg0;
+        g_cls_local.flip_pending = 1;      // The actual flip happens at burst boundary
+        rte_free(e);                       // Receiver frees Event on success
+        return;
+    }
+
+
+    struct onvm_nf *nf = nf_local_ctx->nf;
 
     if (buffer_length <= 0) {
+        if (e) rte_free(e);
         return;
     }
 
@@ -1495,6 +1575,8 @@ msg_handler(void *msg_data, struct onvm_nf_local_ctx *nf_local_ctx) {
     onvm_pkt_flush_all_nfs(nf->nf_tx_mgr, nf);
     UTLT_Debug("Sending out %u packets\n", buffer_length);
     buffer_length = 0;
+
+    if (e) rte_free(e);
 }
 
 uint64_t last_p = NULL;
@@ -1551,6 +1633,10 @@ main(int argc, char *argv[]) {
         } else {
             rte_exit(EXIT_FAILURE, "Failed ONVM init\n");
         }
+    }
+
+    if (UpfClsCtrlInit() < 0) {
+        rte_exit(EXIT_FAILURE, "CLS_CTRL memzone init failed\n");
     }
 
     int ret;

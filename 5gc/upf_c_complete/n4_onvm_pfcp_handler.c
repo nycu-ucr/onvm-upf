@@ -38,7 +38,75 @@
 #include "updk/rule_far.h"
 #include "updk/rule_qer.h"
 
+#include "../classifiers/classifier_wrapper.h"
 #include "../classifiers/upf_cls_adapter.h"
+
+
+static void *g_cls_retired_snapshot = NULL;
+static uint32_t g_cls_retired_version = 0;
+
+
+bool UpfClsRebuildAndPublish(uint32_t *out_version) {
+    cls_handle_t *snap = cls_create(CLS_SELECTED_BACKEND);
+    if (!snap) {
+        UTLT_Error("Classifier snapshot create failed");
+        return false;
+    }
+
+    // size_t inserted = 0;
+    list_iterator_t *it = list_iterator_new(g_all_pdr_list, LIST_HEAD);
+    for (list_node_t *n; it && (n = list_iterator_next(it)); ) {
+        UpfPDR *up = (UpfPDR *)n->val;
+        if (!up) continue;
+
+        bool is_ul = UpfPdrIsUplink(up);
+        pdr_t r    = updk_pdr_to_cls_rule(up, is_ul);
+
+        //r.descriptor = (uintptr_t)up;       // or: (uintptr_t)up->pdrId
+        r.descriptor = (uintptr_t)up->pdrId;
+
+        uintptr_t ins = cls_insert_rule(snap, &r);
+        if (ins == 0) {
+            UTLT_Error("cls_insert_rule failed for PDR id=%u", (unsigned)up->pdrId);
+            // Fail hard: destroy snapshot and keep the previous active one
+            if (it) {
+                list_iterator_destroy(it);
+            }
+            cls_destroy(snap);
+            return false;
+        }
+        //inserted++;
+    }
+    if (it) list_iterator_destroy(it);
+
+    // sanity: allow empty snapshots, but warn
+    /* if (inserted == 0) {
+        UTLT_Warning("Rebuilt empty classifier snapshot");
+    } */
+
+    void *retired = NULL;
+    uint32_t ver  = upf_cls_publish((void *)snap, &retired);
+    g_cls_retired_snapshot = retired;
+    g_cls_retired_version  = ver;
+
+    (void)UpfSendEvt1(UPF_U_SERVICE_ID, EVT_CLS_GC_REQ, (uintptr_t)ver);
+    if (out_version) {
+        *out_version = ver;
+    }
+    return true;
+}
+
+
+//  C-plane msg handler will free on ACK via this
+void UpfClsOnAckFree(uint32_t ver) {
+    if (ver == g_cls_retired_version && g_cls_retired_snapshot) {
+        cls_destroy((cls_handle_t*)g_cls_retired_snapshot);
+        g_cls_retired_snapshot = NULL;
+    }
+}
+
+
+
 
 /*
  * Note: When apply a IE from PDR or FAR, you should check all
@@ -284,7 +352,9 @@ Status UpfN4HandleCreatePdr(UpfSession *session, CreatePDR *createPdr) {
                 return STATUS_ERROR,
                 "UpfPDRRegisterToSession failed");
 
+    UpfPDRGlobalAdd(upfPdr);
 
+/* 
     // Distinguishing Uplink/Downlink PDR            
     bool is_uplink = false;     // default to downlink / CORE 
 
@@ -308,23 +378,22 @@ Status UpfN4HandleCreatePdr(UpfSession *session, CreatePDR *createPdr) {
             break;
         }
     } else {
-        /* Spec violation: Source-Interface missing – assume downlink */
+        //Spec violation: Source-Interface missing – assume downlink
         UTLT_Warning("CreatePDR: SourceInterface IE missing – treating as CORE");
     }
 
     UTLT_Debug("CreatePDR: determined is_uplink = %s", is_uplink ? "true" : "false");
     
-    uintptr_t desc = upf_cls_add_pdr(upfPdr, is_uplink);
+    uintptr_t desc = upf_cls_add_pdr(upfPdr, is_uplink); */
 
-    if (desc == 0) {
+    uint32_t new_ver;
+    if (!UpfClsRebuildAndPublish(&new_ver)) {
         UTLT_Error("Classifier insert failed for PDRId=%u", upfPdr->pdrId);
         UpfPDRDeregisterToSessionByID(session, upfPdr->pdrId);
         rte_free(upfPdr);
         return STATUS_ERROR;
-    }   
-
+    }
     return STATUS_OK;
-
 }
 
 Status _ConvertCreateFARTlvToRule(UpfFAR *upfFar, CreateFAR *createFar) {
@@ -788,6 +857,15 @@ Status UpfN4HandleUpdatePdr(UpfSession *session, UpdatePDR *updatePdr) {
     UTLT_Assert(UpfPDRRegisterToSession(session, &upfPdr),
         return STATUS_ERROR, "UpfPDRRegisterToSession failed");
 #endif
+
+    uint32_t new_ver;
+    if (!UpfClsRebuildAndPublish(&new_ver)) {
+        UTLT_Error("Classifier update failed");
+        UpfPDRDeregisterToSessionByID(session, upfPdr->pdrId);
+        rte_free(upfPdr);
+        return STATUS_ERROR;
+    }
+
     return STATUS_OK;
 }
 
@@ -1083,6 +1161,15 @@ Status UpfN4HandleRemovePdr(UpfSession *session, uint16_t nPDRID) {
     
     if (upf_cls_del_pdr(upfPdr) != 0) {
         UTLT_Warning("Classifier delete failed (not found) for PDRId=%u", pdrID);      
+    }
+
+    UpfPDRGlobalRemove(upfPdr);
+ 
+    uint32_t new_ver;
+    if (!UpfClsRebuildAndPublish(&new_ver)) {
+        UTLT_Error("Classifier update failed while PDR deletion");
+        rte_free(upfPdr);
+        return STATUS_ERROR;
     }
 
     rte_free(upfPdr);

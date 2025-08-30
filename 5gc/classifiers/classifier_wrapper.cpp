@@ -161,7 +161,9 @@ uintptr_t cls_insert_rule(cls_handle_t *h, const pdr_t *r) {
     try {
         h->ptss->InsertRule(R);
         return R.descriptor;
-    } catch (const std::bad_alloc&) { return 0; }
+    } catch (const std::bad_alloc&) { 
+        return 0; 
+    }
 #endif
 }
 

@@ -26,6 +26,7 @@
 #include "pfcp_types.h"
 #include "pfcp_xact.h"
 
+#include "upf_events.h"
 #include "upf_context.h"
 
 #include "n4_dispatcher.h"
@@ -35,6 +36,8 @@
 #define ETHER_IP_UDP_HDR_LEN \
   (RTE_ETHER_HDR_LEN + 20 + sizeof(struct rte_udp_hdr))
 
+// UpfClsOnAckFree is defined in n4_onvm_pfcp_handler.c
+extern void UpfClsOnAckFree(uint32_t ver);
 
 void
 msg_handler(void *msg_data, struct onvm_nf_local_ctx *nf_local_ctx) {
@@ -44,6 +47,20 @@ msg_handler(void *msg_data, struct onvm_nf_local_ctx *nf_local_ctx) {
         UTLT_Error("received msg is NULL");
         return;
     }
+
+    switch ((uint32_t)e->type) {
+
+        case EVT_CLS_GC_ACK: {
+            uint32_t ver = (uint32_t)msg->arg0;
+            UpfClsOnAckFree(ver);    /* frees retired snapshot if version matches */
+            rte_free(msg);           /* receiver frees Event on success */
+            return;
+        }
+        default:
+            break;
+    }
+
+
 
     Event event;
 

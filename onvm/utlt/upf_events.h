@@ -5,6 +5,10 @@
 #define UPF_U_SERVICE_ID  1 
 #endif
 
+#ifndef UPF_C_SERVICE_ID
+#define UPF_C_SERVICE_ID  2
+#endif
+
 
 enum {
         UPF_EVENT_SET_BUFFER       = 0xA0,
