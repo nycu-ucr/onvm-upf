@@ -138,13 +138,12 @@ bool UpfClsRebuildAndPublish(uint32_t *out_version) {
     void *retired = NULL;
     uint32_t ver  = upf_cls_publish((void *)snap, &retired);
 
-    // logging block
+    
 
-    void *retired = NULL;
-    uint32_t ver  = upf_cls_publish((void *)snap, &retired);
     g_cls_retired_snapshot = retired;
     g_cls_retired_version  = ver;
 
+    // logging block
     /* NEW: deep publish diagnostics */
     void *handle = (void *)snap;                  /* published handle */
     void *engine = handle ? *(void**)handle : NULL;      /* first word in handle */
@@ -160,9 +159,6 @@ bool UpfClsRebuildAndPublish(uint32_t *out_version) {
 
     // logging block
 
-
-    g_cls_retired_snapshot = retired;
-    g_cls_retired_version  = ver;
 
     (void)UpfSendEvt1(UPF_U_SERVICE_ID, EVT_CLS_GC_REQ, (uintptr_t)ver);
     if (out_version) {
