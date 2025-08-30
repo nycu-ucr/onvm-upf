@@ -45,6 +45,7 @@
 #include "list.h"
 
 #include "upf_events.h"
+#include "upf_cls_ctrl.h"
 
 #include "../classifiers/upf_cls_adapter.h"
 #include "../classifiers/classifier_wrapper.h"
@@ -78,6 +79,18 @@
 #ifndef IPV6_FLOWLABEL_MASK
 #define IPV6_FLOWLABEL_MASK 0x000FFFFFu
 #endif
+
+
+static inline int UpfSendEvt1(uint16_t dest_sid, uint32_t type, uintptr_t a0) {
+    Event *e = (Event *)rte_calloc("upf_evt", 1, sizeof(*e), 0);
+    if (!e) return -1;
+    e->type = (uintptr_t)type;
+    e->argc = 1;
+    e->arg0 = a0;
+    int rc = onvm_nflib_send_msg_to_nf(dest_sid, e);
+    // if (rc < 0) rte_free(e);
+    return rc;
+}
 
 static struct rte_ether_addr dn_eth;
 static struct rte_ether_addr cn_dn_eth;
@@ -207,6 +220,9 @@ ConfigureQerFlows(UpfSession *session,
                  uint32_t id24,
                  bool is_uplink)
 {
+    if (!session || !pdr) return;
+    if (!session->qer_list) return;
+    
     for (int i = 0; i < 2; i++) {
         uint32_t qerId = pdr->qerId[i];
         if (!qerId) continue;
@@ -1139,8 +1155,7 @@ UPDK_PDR *GetPdrByTeid(struct rte_mbuf *pkt, uint32_t td) {
     key.ni_hash,
     key.qfi,
     key.source_if,
-    key.is_uplink ? "true" : "false"
-);
+    key.is_uplink ? "true" : "false");
 
 
     uint16_t pdr_id = UpfClassifyGetPdrId(&key);
@@ -1543,7 +1558,7 @@ msg_handler(void *msg_data, struct onvm_nf_local_ctx *nf_local_ctx) {
     if (e && (uint32_t)e->type == EVT_CLS_GC_REQ) {
         g_cls_local.pending_ver = (uint32_t)e->arg0;
         g_cls_local.flip_pending = 1;      // The actual flip happens at burst boundary
-        rte_free(e);                       // Receiver frees Event on success
+        //rte_free(e);                       // Receiver frees Event on success
         return;
     }
 
@@ -1551,7 +1566,6 @@ msg_handler(void *msg_data, struct onvm_nf_local_ctx *nf_local_ctx) {
     struct onvm_nf *nf = nf_local_ctx->nf;
 
     if (buffer_length <= 0) {
-        if (e) rte_free(e);
         return;
     }
 
@@ -1575,8 +1589,6 @@ msg_handler(void *msg_data, struct onvm_nf_local_ctx *nf_local_ctx) {
     onvm_pkt_flush_all_nfs(nf->nf_tx_mgr, nf);
     UTLT_Debug("Sending out %u packets\n", buffer_length);
     buffer_length = 0;
-
-    if (e) rte_free(e);
 }
 
 uint64_t last_p = NULL;

@@ -22,6 +22,8 @@
 #include <arpa/inet.h>
 #include <net/if.h>
 
+#include <rte_memory.h>
+
 #include "onvm_nflib.h"
 
 #include "utlt_list.h"
@@ -32,6 +34,8 @@
 #include "pfcp_xact.h"
 #include "pfcp_convert.h"
 #include "n4_onvm_pfcp_build.h"
+#include "upf_events.h"
+#include "upf_cls_ctrl.h"
 
 #include "updk/rule.h"
 #include "updk/rule_pdr.h"
@@ -40,6 +44,23 @@
 
 #include "../classifiers/classifier_wrapper.h"
 #include "../classifiers/upf_cls_adapter.h"
+
+
+
+/* Publish a freshly built immutable snapshot into the shared control slot.
+ * Returns the new monotonically increasing version.
+ * If retired_out != NULL, *retired_out receives the previously active pointer. */
+static inline uint32_t upf_cls_publish(void *new_snap, void **retired_out) {
+    /* Publish order: snapshot contents (already built) → pointer → version */
+    rte_wmb();
+    void *old = g_upf_cls_ctrl->active;
+    g_upf_cls_ctrl->active = new_snap;
+    rte_wmb();
+    uint32_t v = g_upf_cls_ctrl->version + 1u;
+    g_upf_cls_ctrl->version = v;
+    if (retired_out) *retired_out = old;
+    return v;
+}
 
 
 static void *g_cls_retired_snapshot = NULL;
@@ -59,8 +80,33 @@ bool UpfClsRebuildAndPublish(uint32_t *out_version) {
         UpfPDR *up = (UpfPDR *)n->val;
         if (!up) continue;
 
-        bool is_ul = UpfPdrIsUplink(up);
-        pdr_t r    = updk_pdr_to_cls_rule(up, is_ul);
+        bool is_uplink = false;     // default to downlink / CORE 
+
+        if (up->flags.pdi && up->pdi.flags.sourceInterface) {
+
+            UTLT_Debug("CreatePDR: PDI.SourceInterface IE present, value=%u", up->pdi.sourceInterface);
+
+            switch (up->pdi.sourceInterface) {
+            case 0:        
+                // N3 side (Uplink: UE → UPF)  
+                is_uplink = true;  
+                break;
+            case 1:
+                // N6 side  (Downlink: DN → UE)
+                is_uplink = false;
+                break;
+
+            default:  // unexpected value ⇒ treating as downlink
+                UTLT_Warning("CreatePDR: unexpected SourceInterface=%u – treating as CORE",
+                            up->pdi.sourceInterface);
+                break;
+            }
+        } else {
+            /* Spec violation: Source-Interface missing – assume downlink */
+            UTLT_Warning("CreatePDR: SourceInterface IE missing – treating as CORE");
+        }
+
+        pdr_t r    = updk_pdr_to_cls_rule(up, is_uplink);
 
         //r.descriptor = (uintptr_t)up;       // or: (uintptr_t)up->pdrId
         r.descriptor = (uintptr_t)up->pdrId;
@@ -1158,10 +1204,6 @@ Status UpfN4HandleRemovePdr(UpfSession *session, uint16_t nPDRID) {
                 "UpfPDRDeregisterToSessionByIDEx failed for PDR[%u]", pdrID);
 
     UpfPDR *upfPdr = d.pdr;   /* pointer to the removed PDR */
-    
-    if (upf_cls_del_pdr(upfPdr) != 0) {
-        UTLT_Warning("Classifier delete failed (not found) for PDRId=%u", pdrID);      
-    }
 
     UpfPDRGlobalRemove(upfPdr);
  

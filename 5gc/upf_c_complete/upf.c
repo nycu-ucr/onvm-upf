@@ -30,8 +30,6 @@
 #include "onvm_nflib.h"
 #include "onvm_pkt_helper.h"
 
-#define NF_TAG "upf_c"
-
 #include "upf_init.h"
 #include "utlt_debug.h"
 #include "utlt_network.h"
@@ -39,6 +37,12 @@
 #include "n4_onvm_pfcp_path.h"
 
 #include "pfcp_path.h"
+
+#include "upf_cls_ctrl.h"
+
+#define NF_TAG "upf_c"
+
+
 
 
 static Status parseArgs(int argc, char *argv[]);

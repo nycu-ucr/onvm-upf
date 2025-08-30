@@ -29,6 +29,8 @@
 #include "updk/init.h"
 #include "updk/rule.h"
 
+#include "upf_cls_ctrl.h"
+
 #define MAX_NUM_OF_SUBNET       16
 
 static UpfContext self;

@@ -28,6 +28,7 @@
 
 #include "upf_events.h"
 #include "upf_context.h"
+#include "upf_cls_ctrl.h"
 
 #include "n4_dispatcher.h"
 
@@ -48,12 +49,12 @@ msg_handler(void *msg_data, struct onvm_nf_local_ctx *nf_local_ctx) {
         return;
     }
 
-    switch ((uint32_t)e->type) {
+    switch ((uint32_t)msg->type) {
 
         case EVT_CLS_GC_ACK: {
             uint32_t ver = (uint32_t)msg->arg0;
             UpfClsOnAckFree(ver);    /* frees retired snapshot if version matches */
-            rte_free(msg);           /* receiver frees Event on success */
+            //rte_free(msg);           /* receiver frees Event on success */
             return;
         }
         default:

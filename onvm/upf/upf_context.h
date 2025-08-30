@@ -8,9 +8,6 @@
 
 #include <rte_malloc.h>
 
-
-#include "onvm_nflib.h"
-
 #include "utlt_list.h"
 #include "utlt_buff.h"
 #include "utlt_event.h"
@@ -35,21 +32,7 @@
 extern "C" {
 #endif /* __cplusplus */
 
-// Named memzone holding the authoritative classifier pointer + version
-#define MZ_UPF_CLS_CTRL "UPF_CLS_CTRL_SLOT"
-
-typedef struct upf_cls_ctrl_s {
-    void    *active;     // current immutable classifier snapshot 
-    uint32_t version;    // increasing publish counter
-} upf_cls_ctrl_t;
-
-// Process-local pointer to the shared control slot (set by UpfClsCtrlInit)
-extern upf_cls_ctrl_t *g_upf_cls_ctrl;
-
 extern list_t *g_all_pdr_list;
-
-// Map/create the control slot (called once per process after onvm_nflib_init)
-int UpfClsCtrlInit(void);
 
 
 typedef struct _UpfUeIp      UpfUeIp;
@@ -173,7 +156,7 @@ typedef struct {
 /* Sender frees the Event ONLY on send failure.
    Receiver frees on success */
 
-static inline int UpfSendEvt1(uint16_t dest_sid, uint32_t type, uintptr_t a0) {
+/* static inline int UpfSendEvt1(uint16_t dest_sid, uint32_t type, uintptr_t a0) {
     Event *e = (Event *)rte_calloc("upf_evt", 1, sizeof(*e), 0);
     if (!e) return -1;
     e->type = (uintptr_t)type;
@@ -196,7 +179,7 @@ static inline int UpfSendEvt2(uint16_t dest_sid, uint32_t type, uintptr_t a0, ui
     if (rc < 0) rte_free(e);
     return rc;
 }
-
+ */
 
 
 UpfContext *Self();

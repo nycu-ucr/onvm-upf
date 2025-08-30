@@ -1,5 +1,3 @@
-#include "upf_context.h"
-
 #define __STDC_FORMAT_MACROS
 #include <inttypes.h>
 
@@ -15,6 +13,8 @@
 #include <rte_malloc.h>
 #include <rte_memory.h>
 #include <rte_memzone.h>
+
+#include "upf_context.h"
 
 #ifdef RTE_MACHINE_CPUFLAG_SSE4_2
 #include <rte_hash_crc.h>
