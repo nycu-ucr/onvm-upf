@@ -50,6 +50,11 @@
 #include "../classifiers/upf_cls_adapter.h"
 #include "../classifiers/classifier_wrapper.h"
 
+// for logging
+
+#include <rte_hexdump.h>
+#include <rte_memory.h>
+
 
 #define NF_TAG "upf_u"
 
@@ -137,11 +142,11 @@ typedef struct {
 static upf_cls_local_t g_cls_local = {0};
 
 /* Flip to the latest published snapshot (called at burst boundary) */
-static inline void UpfClsMaybeFlipAndAck(void) {
+/* static inline void UpfClsMaybeFlipAndAck(void) {
     if (likely(!g_cls_local.flip_pending)) {
         return;
     }
-    /* Pair with UPF-C's rte_wmb before publishing; read pointer then version */
+    // Pair with UPF-C's rte_wmb before publishing; read pointer then version
     rte_rmb();
     void    *new_ptr = g_upf_cls_ctrl ? g_upf_cls_ctrl->active  : NULL;
     uint32_t new_ver = g_upf_cls_ctrl ? g_upf_cls_ctrl->version : 0;
@@ -152,7 +157,44 @@ static inline void UpfClsMaybeFlipAndAck(void) {
 
     // ACK back to UPF-C with the new version we observed
     (void)UpfSendEvt1(UPF_C_SERVICE_ID, EVT_CLS_GC_ACK, (uintptr_t)new_ver);
+} */
+
+// for logging
+static inline void UpfClsMaybeFlipAndAck(void) {
+    if (likely(!g_cls_local.flip_pending)) return;
+
+    rte_rmb();
+    void    *new_ptr = g_upf_cls_ctrl ? g_upf_cls_ctrl->active  : NULL;
+    uint32_t new_ver = g_upf_cls_ctrl ? g_upf_cls_ctrl->version : 0;
+    if (unlikely(!new_ptr)) {
+        UTLT_Warning("CLS flip requested but ctrl.active==NULL (ctrl.ver=%u)", new_ver);
+        return;
+    }
+
+    /* NEW: deep flip diagnostics BEFORE we start using it */
+    void *handle = new_ptr;
+    void *engine = *(void**)handle;              /* first word in handle */
+    void *vptr   = engine ? *(void**)engine : NULL;  /* first word in engine = vtable ptr */
+
+    UTLT_Info("CLS flip:  handle=%p iova=%"PRIu64"  engine=%p iova=%"PRIu64"  vptr=%p iova=%"PRIu64" ver=%u",
+              handle, (uint64_t)rte_mem_virt2iova(handle),
+              engine, (uint64_t)rte_mem_virt2iova(engine),
+              vptr,   (uint64_t)rte_mem_virt2iova(vptr),
+              new_ver);
+
+    if (handle) rte_hexdump(stdout, "DP cls_handle head", handle, 32);
+    if (engine) rte_hexdump(stdout, "DP engine head",     engine, 32);
+
+    g_cls_local.ptr = new_ptr;
+    g_cls_local.ver = new_ver;
+    g_cls_local.flip_pending = 0;
+
+    (void)UpfSendEvt1(UPF_C_SERVICE_ID, EVT_CLS_GC_ACK, (uintptr_t)new_ver);
 }
+
+
+
+
 
 /* static inline const UPDK_PDR *UpfLookupPdr(const ps_packet_t *key) {
     const cls_handle_t *snap = (const cls_handle_t *)g_cls_local.ptr;
@@ -168,7 +210,14 @@ static inline void UpfClsMaybeFlipAndAck(void) {
 
 static inline uint16_t UpfClassifyGetPdrId(const ps_packet_t *key) {
     const cls_handle_t *snap = (const cls_handle_t *)g_cls_local.ptr;
-    if (!snap) return 0;
+    if (unlikely(!snap)) {
+        UTLT_Warning("CLS classify: no snapshot yet (ver=%u) — dropping", g_cls_local.ver);
+        return 0;
+    }
+    
+    // logging block
+    void *engine = *(void**)snap;
+    UTLT_Debug("CLS classify: snap=%p engine=%p ver=%u", (void*)snap, engine, g_cls_local.ver);
 
     uint32_t  precedence = 0;
     uintptr_t pdrId     = 0;
@@ -1558,6 +1607,14 @@ msg_handler(void *msg_data, struct onvm_nf_local_ctx *nf_local_ctx) {
     if (e && (uint32_t)e->type == EVT_CLS_GC_REQ) {
         g_cls_local.pending_ver = (uint32_t)e->arg0;
         g_cls_local.flip_pending = 1;      // The actual flip happens at burst boundary
+
+        // logging block
+
+        UTLT_Info("EVT_CLS_GC_REQ: requested_ver=%u ctrl.active=%p ctrl.ver=%u",
+          (uint32_t)e->arg0,
+          (void*)(g_upf_cls_ctrl ? g_upf_cls_ctrl->active : NULL),
+          (g_upf_cls_ctrl ? g_upf_cls_ctrl->version : 0));
+
         //rte_free(e);                       // Receiver frees Event on success
         return;
     }

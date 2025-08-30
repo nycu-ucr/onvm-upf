@@ -46,6 +46,11 @@
 #include "../classifiers/upf_cls_adapter.h"
 
 
+// for logging
+#include <inttypes.h>
+#include <rte_hexdump.h>
+
+
 
 /* Publish a freshly built immutable snapshot into the shared control slot.
  * Returns the new monotonically increasing version.
@@ -132,6 +137,30 @@ bool UpfClsRebuildAndPublish(uint32_t *out_version) {
 
     void *retired = NULL;
     uint32_t ver  = upf_cls_publish((void *)snap, &retired);
+
+    // logging block
+
+    void *retired = NULL;
+    uint32_t ver  = upf_cls_publish((void *)snap, &retired);
+    g_cls_retired_snapshot = retired;
+    g_cls_retired_version  = ver;
+
+    /* NEW: deep publish diagnostics */
+    void *handle = (void *)snap;                  /* published handle */
+    void *engine = handle ? *(void**)handle : NULL;      /* first word in handle */
+    void *vptr   = engine ? *(void**)engine : NULL;      /* first word in engine = vtable ptr (if C++) */
+
+    UTLT_Info("CLS publish: handle=%p iova=%"PRIu64"  engine=%p iova=%"PRIu64"  vptr=%p",
+            handle, (uint64_t)rte_mem_virt2iova(handle),
+            engine, (uint64_t)rte_mem_virt2iova(engine),
+            vptr);
+
+    if (handle) rte_hexdump(stdout, "CP cls_handle head", handle, 32);
+    if (engine) rte_hexdump(stdout, "CP engine head",     engine, 32);
+
+    // logging block
+
+
     g_cls_retired_snapshot = retired;
     g_cls_retired_version  = ver;
 
@@ -146,6 +175,9 @@ bool UpfClsRebuildAndPublish(uint32_t *out_version) {
 //  C-plane msg handler will free on ACK via this
 void UpfClsOnAckFree(uint32_t ver) {
     if (ver == g_cls_retired_version && g_cls_retired_snapshot) {
+        // logging block
+        UTLT_Info("CLS GC: ACK ver=%u, freeing retired snapshot %p",
+                  ver, g_cls_retired_snapshot);
         cls_destroy((cls_handle_t*)g_cls_retired_snapshot);
         g_cls_retired_snapshot = NULL;
     }

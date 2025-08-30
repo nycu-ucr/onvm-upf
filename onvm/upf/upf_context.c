@@ -11,7 +11,6 @@
 
 #include <rte_byteorder.h>
 #include <rte_memzone.h>
-#include <rte_memory.h>
 #include <rte_malloc.h>
 
 #include "utlt_debug.h"
@@ -30,6 +29,12 @@
 #include "updk/rule.h"
 
 #include "upf_cls_ctrl.h"
+
+// for logging
+
+#include <inttypes.h>
+#include <rte_hexdump.h>
+
 
 #define MAX_NUM_OF_SUBNET       16
 
@@ -85,6 +90,13 @@ int UpfClsCtrlInit(void) {
         ctrl->version = 0;
     }
     g_upf_cls_ctrl = (upf_cls_ctrl_t *)mz->addr;
+
+    UTLT_Info("CLS_CTRL mapped: slot=%p iova=%" PRIu64 " active=%p ver=%u",
+          (void*)g_upf_cls_ctrl,
+          (uint64_t)rte_mem_virt2iova(g_upf_cls_ctrl),
+          (void*)g_upf_cls_ctrl->active,
+          g_upf_cls_ctrl->version);
+
     return 0;
 }
 
