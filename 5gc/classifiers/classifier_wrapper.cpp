@@ -9,9 +9,6 @@
 #include "PartitionSort/PartitionSort.h"
 #include "TupleSpaceSearch/TupleSpaceSearch.h"
 
-// logging block... remove after test
-#include <rte_malloc.h>
-
 
 #if CLS_SELECTED_BACKEND == CLS_BACKEND_PS
 struct cls_handle_t { PartitionSort *ps; };

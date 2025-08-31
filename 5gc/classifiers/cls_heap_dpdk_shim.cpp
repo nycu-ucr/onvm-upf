@@ -4,9 +4,6 @@
 #include <rte_malloc.h>
 #include <rte_memory.h>
 
-// for logging
-#include <cstdio>
-
 static inline std::size_t round_up_align(std::size_t a) {
     // DPDK expects power-of-two, >= cacheline
     if (a < RTE_CACHE_LINE_SIZE) a = RTE_CACHE_LINE_SIZE;
@@ -30,21 +27,17 @@ void* operator new[](std::size_t n) {
     throw std::bad_alloc();
 }
 void  operator delete(void* p) noexcept {
-    if (p) std::fprintf(stderr, "[shim] delete %p\n", p);
     if (p) rte_free(p); 
 }
 void  operator delete[](void* p) noexcept {
-    if (p) std::fprintf(stderr, "[shim] delete[] %p\n", p);
      if (p) rte_free(p); 
 }
 
 /* ---------- Sized delete (C++14/17) ---------- */
 void  operator delete(void* p, std::size_t) noexcept {
-    if (p) std::fprintf(stderr, "[shim] sized delete %p\n", p);
      if (p) rte_free(p); 
 }
 void  operator delete[](void* p, std::size_t) noexcept {
-    if (p) std::fprintf(stderr, "[shim] sized delete[] %p\n", p);
     if (p) rte_free(p);
 }
 
@@ -56,11 +49,9 @@ void* operator new[](std::size_t n, const std::nothrow_t&) noexcept {
     return rte_malloc("cls", n, RTE_CACHE_LINE_SIZE);
 }
 void  operator delete (void* p, const std::nothrow_t&) noexcept {
-    if (p) std::fprintf(stderr, "[shim] delete 1 %p\n", p);
     if (p) rte_free(p); 
 }
 void  operator delete[](void* p, const std::nothrow_t&) noexcept {
-    if (p) std::fprintf(stderr, "[shim] delete 2 %p\n", p);
      if (p) rte_free(p);
 }
 
@@ -76,21 +67,17 @@ void* operator new[](std::size_t n, std::align_val_t al) {
     throw std::bad_alloc();
 }
 void  operator delete (void* p, std::align_val_t) noexcept {
-    if (p) std::fprintf(stderr, "[shim] delete 3 %p\n", p);
      if (p) rte_free(p);
 }
 void  operator delete[](void* p, std::align_val_t) noexcept {
-    if (p) std::fprintf(stderr, "[shim] delete 4 %p\n", p);
     if (p) rte_free(p);
 }
 
 /* ---------- Sized + aligned delete (C++17) ---------- */
 void  operator delete (void* p, std::size_t, std::align_val_t) noexcept {
-    if (p) std::fprintf(stderr, "[shim] delete 5 %p\n", p);
      if (p) rte_free(p);
 }
 void  operator delete[](void* p, std::size_t, std::align_val_t) noexcept {
-    if (p) std::fprintf(stderr, "[shim] delete 6 %p\n", p);
      if (p) rte_free(p); 
 }
 
@@ -104,10 +91,8 @@ void* operator new[](std::size_t n, std::align_val_t al, const std::nothrow_t&) 
     return rte_malloc("cls", n, a);
 }
 void  operator delete (void* p, std::align_val_t, const std::nothrow_t&) noexcept {
-    if (p) std::fprintf(stderr, "[shim] delete 7 %p\n", p);
     if (p) rte_free(p);
 }
 void  operator delete[](void* p, std::align_val_t, const std::nothrow_t&) noexcept {
-    if (p) std::fprintf(stderr, "[shim] delete 8 %p\n", p);
      if (p) rte_free(p);
 }

@@ -39,7 +39,6 @@ void PartitionSort::InsertRule(const Rule& one_rule) {
 }
 
 uintptr_t PartitionSort::InsertRuleReturnDescriptor(const Rule& one_rule) {
-    printf("=================501======================");
     try {
         for (auto* mitree : mitrees) {
             bool pri_change = false;
@@ -61,7 +60,6 @@ uintptr_t PartitionSort::InsertRuleReturnDescriptor(const Rule& one_rule) {
 		// Populating descriptorIndexMap, so that I can delete by descriptor in O(1)
 
         descriptorIndexMap[one_rule.descriptor] = rules.size() - 1;
-        printf("=================512======================");
         return one_rule.descriptor;
 
     } catch (const std::bad_alloc&) {

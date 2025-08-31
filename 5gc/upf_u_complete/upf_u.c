@@ -736,7 +736,7 @@ GetPdrByUeIpAddress(struct rte_mbuf *pkt, uint32_t ue_ip)
     key.source_if = SRC_IF_CORE;
     key.is_uplink = false;
 
-    printf("DBG2: srcIf=%u (port=%u)\n", key.source_if, pkt->port);
+    // printf("DBG2: srcIf=%u (port=%u)\n", key.source_if, pkt->port);
     
     /* UTLT_Debug("DL key → teid=%u UE_IP=%s/%u sport=%u dport=%u proto=%u "
                "spi=%u flow_label=%u ni=0x%08x qfi=%u srcIf=%u",
@@ -768,186 +768,6 @@ GetPdrByUeIpAddress(struct rte_mbuf *pkt, uint32_t ue_ip)
 }
 
 
-
-/* UPDK_PDR *
-GetPdrByTeid(struct rte_mbuf *pkt, uint32_t td)
-{
-    // 1) Build full-5-tuple + extras key
-    ps_packet_t key = {0};
-    
-    // uint8_t *pkt_data = rte_pktmbuf_mtod(pkt, uint8_t *);
-
-    // Outer IPv4/UDP 
-    struct rte_ipv4_hdr *outer4 = onvm_pkt_ipv4_hdr(pkt);
-    if (!outer4) return NULL;
-
-    UTLT_Debug("Outer IPv4:   src=%s dst=%s",
-               ip4(rte_be_to_cpu_32(outer4->src_addr)),
-               ip4(rte_be_to_cpu_32(outer4->dst_addr)));
-    
-    struct rte_udp_hdr  *outerU = onvm_pkt_udp_hdr(pkt);
-    if (!outerU) return NULL;
-
-
-    // GTP-U header (outer IPv4/UDP already parsed)
-    uint8_t outer_ihl = (outer4->version_ihl & 0x0F) * 4;
-
-    /// byte offset from start-of-mbuf data to GTP-U fixed header
-    size_t gtp_off = sizeof(struct rte_ether_hdr) + outer_ihl + sizeof(*outerU);
-
-    // quick sanity: must have at least an 8-byte fixed header
-    // Ensure we can read the fixed GTP header
-    if (rte_pktmbuf_data_len(pkt) < gtp_off + sizeof(struct rte_gtp_hdr))
-        return NULL;   // malformed packet
-
-    // typed pointer to the GTP-U fixed header 
-    // Overlay the GTP struct and pull out TEID
-    struct rte_gtp_hdr *gh = rte_pktmbuf_mtod_offset(pkt, struct rte_gtp_hdr *, gtp_off);
-
-    uint8_t  gtp_flags = *(uint8_t *)gh;
-
-    UTLT_Debug("GTP-U flags=0x%02x", gtp_flags);
-    UTLT_Debug("S=%u, PN=%u, E=%u",
-            !!(gtp_flags & 0x02), !!(gtp_flags & 0x01), !!(gtp_flags & 0x04));
-
-
-    key.teid = rte_be_to_cpu_32(gh->teid);
-
-    // full GTP-U header length (fixed + opt fields + ext hdrs) 
-    // Figure out exactly how big the full GTP header is
-    uint16_t gh_len = get_gtpu_header_len(pkt); 
-
-    // Ensure there’s room for the inner IPv4 header
-    if (rte_pktmbuf_data_len(pkt) < gtp_off + gh_len + sizeof(struct rte_ipv4_hdr))
-        return NULL;
-
-    // pointer to encapsulated inner PDU (IPv4, IPv6, etc.)
-    // uint8_t *inner_ptr = rte_pktmbuf_mtod_offset(pkt, uint8_t *, gtp_off + gh_len);
-    // struct rte_ipv4_hdr *inner4 = (struct rte_ipv4_hdr *)inner_ptr;
-    
-    // Inner IPv4 + UDP (the “true” 5-tuple)
-    struct rte_ipv4_hdr *inner4 = rte_pktmbuf_mtod_offset( pkt, struct rte_ipv4_hdr *, gtp_off + gh_len);
-    uint8_t inner_ihl = (inner4->version_ihl & 0x0F) * 4;
-
-    UTLT_Debug("Inner IPv4:   src=%s dst=%s proto=%u",
-               ip4(rte_be_to_cpu_32(inner4->src_addr)),
-               ip4(rte_be_to_cpu_32(inner4->dst_addr)),
-               inner4->next_proto_id);
-
-    // Ensure there’s room for the inner UDP header
-    if (rte_pktmbuf_data_len(pkt) < gtp_off + gh_len + inner_ihl + sizeof(struct rte_udp_hdr))
-        return NULL;
-
-    struct rte_udp_hdr *innerU = rte_pktmbuf_mtod_offset( pkt, struct rte_udp_hdr *, gtp_off + gh_len + inner_ihl);
-    
-    //struct rte_udp_hdr *innerU = (struct rte_udp_hdr *)(inner_ptr + inner_ihl);
-
-    // fill classifier key
-    key.ue_ip    = rte_be_to_cpu_32(inner4->src_addr);
-    key.src_ip   = rte_be_to_cpu_32(inner4->src_addr);
-    key.dst_ip   = rte_be_to_cpu_32(inner4->dst_addr);
-    key.src_port = rte_be_to_cpu_16(innerU->src_port);
-    key.dst_port = rte_be_to_cpu_16(innerU->dst_port);
-    key.proto    = inner4->next_proto_id;
-    key.tos_tc   = inner4->type_of_service;
-    
-    // SPI (ESP)
-    key.spi = 0;
-
-    // SPI (Security Parameter Index) is explicitly for matching IPsec ESP packets
-
-    // if (inner4->next_proto_id == IPPROTO_ESP) {
-    //    uintptr_t off = (inner_ptr + inner_ihl) - pkt_data;
-     //   if (rte_pktmbuf_pkt_len(pkt) >= off + sizeof(uint32_t)) {
-       //     struct esp_hdr { uint32_t spi, seq; } *esp;
-         //   esp = (void*)(pkt_data + off);
-           // key.spi = rte_be_to_cpu_32(esp->spi);
-        //}
-    //}
-
-    // Flow-label (only applicable to IPv6 traffic)
-    key.flow_label = 0;
-
-    key.ni_hash = 0;
-
-
-    key.qfi = 0;  // default: wildcard
-
-    key.is_uplink = true;
-
-    // If GTP-U Extension Headers are present, walk the chain looking for type 0x85
-    if (gh->e) {
-        // start parsing right after the fixed GTP-U header... extp now points to the first extension header
-        uint8_t *extp = (uint8_t *)gh + sizeof(struct rte_gtp_hdr); 
-        uint8_t *pkt_end = rte_pktmbuf_mtod(pkt, uint8_t *) + pkt->data_len;  // end of the packet buffer
-        int      max_exts = 16;  // safety cap ==> prevents an infinite loop if the extension chain is malformed
-
-        while (max_exts-- > 0 && extp + 2 < pkt_end) {
-            uint8_t type = extp[0];
-            uint8_t len  = extp[1];
-
-            if (type == GTPV1_NEXT_EXT_HDR_TYPE_00) {
-                // 0x00 = No more extension headers
-                break;
-            }
-            if (type == GTPV1_NEXT_EXT_HDR_TYPE_85) {
-                // Type 0x85: PDU Session Container => contains QFI.
-                // 0x85 = PDU Session Container => QFI in low 6 bits of octet 2
-                // extp[2]: First byte of the container payload
-                // & 0x3F: Mask out the upper 2 bits => extract 6-bit QFI
-                key.qfi = extp[2] & 0x3F;
-                break;
-            }
-            // advance by (len+1)*4 bytes to next ext header
-            extp += (len + 1) * 4;
-            if (extp >= pkt_end) {
-                // gone past packet end
-                break;
-            }
-        }
-    }
-
-
-    // key.source_if = PortToSourceInterface(pkt->port);
-    key.source_if = SRC_IF_ACCESS;
-
-    
-    printf("DBG: srcIf=%u (port=%u)\n", key.source_if, pkt->port);
-
-    printf("DBG→Classifier key:\n");
-    printf("    teid        = %u\n", key.teid);
-    printf("    ue_ip       = %s\n", ip4(key.ue_ip));
-    printf("    src_ip      = %s\n", ip4(key.src_ip));
-    printf("    dst_ip      = %s\n", ip4(key.dst_ip));
-    printf("    src_port    = %u\n", key.src_port);
-    printf("    dst_port    = %u\n", key.dst_port);
-    printf("    proto       = %u\n", key.proto);
-    printf("    tos_tc      = %u\n", key.tos_tc);
-    printf("    spi         = %u\n", key.spi);
-    printf("    flow_label  = %u\n", key.flow_label);
-    printf("    ni_hash     = 0x%08x\n", key.ni_hash);
-    printf("    qfi         = %u\n", key.qfi);
-    printf("    source_if   = %u\n", key.source_if);
-    printf("    is_uplink   = %s\n", key.is_uplink ? "true" : "false");
-
-
-
-    const UPDK_PDR *pdr = upf_cls_lookup(&key);
-    if (!pdr) {
-        return NULL;
-    }
-
-    UpfSession *session = UpfSessionFindByTeid(td);
-    printf("DBG: session=%p\n", (void*)session);
-    if (session) {
-        ConfigureQerFlows(session, pdr, pkt->port, key.ue_ip, true);
-    }
-
-    return (UPDK_PDR*)pdr;
-}
- */
-
-
 static inline const char *
 ip4_to_buf(uint32_t be_addr, char buf[16]) {
   inet_ntop(AF_INET, &be_addr, buf, 16);
@@ -962,140 +782,6 @@ static void dump_gtpu(const uint8_t *start, size_t len, size_t gtp_off) {
     }
     printf("\n------------------------------------------\n");
 }
-
-/* UPDK_PDR *GetPdrByTeid(struct rte_mbuf *pkt, uint32_t td) {
-    char o_src[16], o_dst[16], i_src[16], i_dst[16], ue_s[16], dn_s[16];
-    uint16_t data_len = rte_pktmbuf_data_len(pkt);
-
-    // Outer IPv4
-    struct rte_ipv4_hdr *outer4 = onvm_pkt_ipv4_hdr(pkt);
-    if (!outer4) return NULL;
-    UTLT_Debug("Outer IPv4 src=%s dst=%s totlen=%u",
-               ip4_to_buf(outer4->src_addr, o_src),
-               ip4_to_buf(outer4->dst_addr, o_dst),
-               data_len);
-
-    // Outer UDP (must be GTP-U)
-    struct rte_udp_hdr *outerU = onvm_pkt_udp_hdr(pkt);
-    if (!outerU) return NULL;
-    if (outerU->dst_port != rte_cpu_to_be_16(2152)) return NULL;
-
-    uint8_t outer_ihl = (outer4->version_ihl & 0x0F) * 4;
-    size_t  gtp_off   = sizeof(struct rte_ether_hdr) + outer_ihl + sizeof(*outerU);
-    if (data_len < gtp_off + sizeof(struct rte_gtp_hdr))
-        return NULL;
-
-    // GTP-U
-    uint8_t *base = rte_pktmbuf_mtod(pkt, uint8_t *) + gtp_off;
-    struct rte_gtp_hdr *gh = (struct rte_gtp_hdr *)base;
-    uint8_t  flags   = *(uint8_t *)gh;
-    uint32_t teid_be = gh->teid;
-
-    bool e  = flags & 0x04;
-    uint16_t payload_offset = 8;
-    uint8_t *p = base + payload_offset;
-    uint8_t qfi = 0;
-
-    if (e) {
-        payload_offset += 2; p += 2;  // Seq + Reserved
-        payload_offset += 1; p += 1;  // N-PDU
-        uint8_t next_type = *p++;
-        payload_offset += 1;
-
-        uint8_t *end = rte_pktmbuf_mtod(pkt, uint8_t *) + data_len;
-        int max_ext = 16;
-
-        while (next_type && max_ext-- > 0 && p + 1 < end) {
-            uint8_t ext_len = p[0];
-            uint16_t ext_sz = (ext_len * 4) + 2;
-            if (p + ext_sz > end) break;
-            if (next_type == GTPV1_NEXT_EXT_HDR_TYPE_85 && ext_sz >= 6)
-                qfi = p[2] & 0x3F;
-            next_type = p[ext_sz - 1];
-            p += ext_sz;
-            payload_offset += ext_sz;
-        }
-    }
-
-    UTLT_Debug("GTP flags=0x%02x E=%d payload_offset=%u TEID=%u",
-               flags, e, payload_offset, rte_be_to_cpu_32(teid_be));
-
-    // Raw dump for verification
-    size_t dbg_len = (data_len - gtp_off > 64) ? 64 : data_len - gtp_off;
-    dump_gtpu(base, dbg_len, gtp_off);
-
-    // Fallback: verify payload start looks like IPv4, else scan around
-    uint8_t *inner_ptr = base + payload_offset;
-    if ((inner_ptr[0] >> 4) != 4 || (inner_ptr[0] & 0x0F) < 5) {
-        UTLT_Warning("Non-IPv4 start at offset %u (0x%02x), scanning for IPv4...",
-                     payload_offset, inner_ptr[0]);
-        int found = 0;
-        for (int delta = -4; delta <= 4; delta++) {
-            if (payload_offset + delta < 0) continue;
-            uint8_t *cand = base + payload_offset + delta;
-            if ((cand[0] >> 4) == 4 && (cand[0] & 0x0F) >= 5) {
-                UTLT_Warning("Adjusted payload_offset from %u to %u", payload_offset, payload_offset + delta);
-                payload_offset += delta;
-                inner_ptr = cand;
-                found = 1;
-                break;
-            }
-        }
-        if (!found) {
-            UTLT_Error("Failed to locate a valid IPv4 header near offset %u", payload_offset);
-            return NULL;
-        }
-    }
-
-    // Inner IPv4
-    if (data_len < gtp_off + payload_offset + sizeof(struct rte_ipv4_hdr))
-        return NULL;
-    struct rte_ipv4_hdr *inner4 = (struct rte_ipv4_hdr *)inner_ptr;
-    uint8_t inner_ihl = (inner4->version_ihl & 0x0F) * 4;
-
-    // Inner UDP
-    if (data_len < gtp_off + payload_offset + inner_ihl + sizeof(struct rte_udp_hdr))
-        return NULL;
-    struct rte_udp_hdr *innerU = rte_pktmbuf_mtod_offset(pkt, struct rte_udp_hdr *,
-                                    gtp_off + payload_offset + inner_ihl);
-
-    UTLT_Debug("Inner IPv4 src=%s dst=%s proto=%u QFI=%u",
-               ip4_to_buf(inner4->src_addr, i_src),
-               ip4_to_buf(inner4->dst_addr, i_dst),
-               inner4->next_proto_id, qfi);
-
-    // Build classifier key
-    ps_packet_t key = {0};
-    key.teid      = rte_be_to_cpu_32(teid_be);
-    key.ue_ip     = rte_be_to_cpu_32(inner4->src_addr);
-    key.src_ip    = key.ue_ip;
-    key.dst_ip    = rte_be_to_cpu_32(inner4->dst_addr);
-    key.src_port  = rte_be_to_cpu_16(innerU->src_port);
-    key.dst_port  = rte_be_to_cpu_16(innerU->dst_port);
-    key.proto     = inner4->next_proto_id;
-    key.tos_tc    = inner4->type_of_service;
-    key.qfi       = qfi;
-    key.source_if = SRC_IF_ACCESS;
-    key.is_uplink = true;
-
-    printf("DBG→Key teid=%u ue=%s dst=%s qfi=%u sport=%u dport=%u proto=%u\n",
-           key.teid,
-           ip4_to_buf(htonl(key.ue_ip), ue_s),
-           ip4_to_buf(htonl(key.dst_ip), dn_s),
-           key.qfi,
-           key.src_port,
-           key.dst_port,
-           key.proto);
-
-    // Lookup
-    const UPDK_PDR *pdr = upf_cls_lookup(&key);
-    if (!pdr) return NULL;
-    UpfSession *session = UpfSessionFindByTeid(td);
-    if (session)
-        ConfigureQerFlows(session, pdr, pkt->port, key.ue_ip, true);
-
-    return (UPDK_PDR *)pdr;
-} */
 
 UPDK_PDR *GetPdrByTeid(struct rte_mbuf *pkt, uint32_t td) {
     char o_src[16], o_dst[16], i_src[16], i_dst[16], ue_s[16], dn_s[16];
@@ -1131,7 +817,7 @@ UPDK_PDR *GetPdrByTeid(struct rte_mbuf *pkt, uint32_t td) {
 
     // Dump for verification
     size_t dbg_len = (data_len > 64) ? 64 : data_len;
-    dump_gtpu(base, dbg_len, (size_t)(base - rte_pktmbuf_mtod(pkt, uint8_t *)));
+    // dump_gtpu(base, dbg_len, (size_t)(base - rte_pktmbuf_mtod(pkt, uint8_t *)));
 
     // Fallback: verify payload start looks like IPv4, else scan nearby
     uint8_t *inner_ptr = base + payload_offset;
@@ -1188,7 +874,7 @@ UPDK_PDR *GetPdrByTeid(struct rte_mbuf *pkt, uint32_t td) {
     key.source_if = SRC_IF_ACCESS;
     key.is_uplink = true;
 
-    printf(
+    /* printf(
     "DBG→Classifier Key:\n"
     "    teid        = %u\n"
     "    ue_ip       = %s\n"
@@ -1217,7 +903,7 @@ UPDK_PDR *GetPdrByTeid(struct rte_mbuf *pkt, uint32_t td) {
     key.ni_hash,
     key.qfi,
     key.source_if,
-    key.is_uplink ? "true" : "false");
+    key.is_uplink ? "true" : "false"); */
 
 
     uint16_t pdr_id = UpfClassifyGetPdrId(&key);
@@ -1226,7 +912,7 @@ UPDK_PDR *GetPdrByTeid(struct rte_mbuf *pkt, uint32_t td) {
         return NULL;
     }
 
-    printf("PDR ID from Classifier = %" PRIu16 "\n", pdr_id);
+    // printf("PDR ID from Classifier = %" PRIu16 "\n", pdr_id);
     
     UpfSession *session = UpfSessionFindByTeid(td);
     if (!session) return NULL;

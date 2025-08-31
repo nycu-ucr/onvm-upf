@@ -600,12 +600,7 @@ std::pair<bool, std::vector<int>> SortableRulesetPartitioner::FastGreedyFieldSel
 
 	if (!all_partitions.empty()) {
 		same_size = (all_partitions[0].size() == rules.size());
-	} else {
-		printf("DBG: all_partitions is EMPTY at return-point!\n");
 	}
-
-	printf("DBG: all_partitions.size() = %zu  -> same_size = %d\n",
-		all_partitions.size(), same_size);
 
 	return std::make_pair(same_size, current_field);
 
