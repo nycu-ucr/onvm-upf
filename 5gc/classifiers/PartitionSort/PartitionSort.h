@@ -2,9 +2,11 @@
 #define  PSORT_H
 
 #include <stdint.h>
+#include "../cls_c_compat_alloc.h"
 #include "OptimizedMITree.h"
 #include "../Simulation.h"
 #include "SortableRulesetPartitioner.h"
+
 
 #define DEBUG_ASSERT 0
 

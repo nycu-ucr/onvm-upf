@@ -22,8 +22,10 @@
 // Returns the cache line size (in bytes) of the processor, or 0 on failure
 
 #include <climits>
-
 #include <stddef.h>
+
+#include "../cls_c_compat_alloc.h"
+
 size_t cache_line_size();
 
 #if defined(__APPLE__)

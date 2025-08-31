@@ -9,6 +9,9 @@
 #include "PartitionSort/PartitionSort.h"
 #include "TupleSpaceSearch/TupleSpaceSearch.h"
 
+// logging block... remove after test
+#include <rte_malloc.h>
+
 
 #if CLS_SELECTED_BACKEND == CLS_BACKEND_PS
 struct cls_handle_t { PartitionSort *ps; };
@@ -133,7 +136,7 @@ cls_handle_t *cls_create(cls_backend_t /*backend_ignored_if_compiletime_selected
 }
 
 /* Destroy a snapshot handle (called in UPF-C after GC_ACK). */
-void cls_destroy(cls_handle_t *h) {
+/* void cls_destroy(cls_handle_t *h) {
     if (!h) return;
 #if CLS_SELECTED_BACKEND == CLS_BACKEND_PS
     delete h->ps;   h->ps = nullptr;
@@ -143,6 +146,19 @@ void cls_destroy(cls_handle_t *h) {
     delete h->ptss; h->ptss = nullptr;
 #endif
     delete h;
+} */
+
+void cls_destroy(cls_handle_t *h) {
+    if (!h) return;
+#if CLS_SELECTED_BACKEND == CLS_BACKEND_PS
+    delete h->ps;
+#elif CLS_SELECTED_BACKEND == CLS_BACKEND_TSS
+    delete h->tss;
+#else
+    delete h->ptss;
+#endif
+    // explicitly free the handle storage as raw memory
+    rte_free(h);
 }
 
 /* Insert one PDR (converted to a C++ Rule) into the snapshot being built. */

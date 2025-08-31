@@ -1,4 +1,5 @@
 #include "red_black_tree.h"
+#include "../cls_c_compat_alloc.h"
 
 static constexpr uint32_t ANY32 = 0xFFFFFFFFu;
 static constexpr uint16_t ANY16 = 0xFFFFu;

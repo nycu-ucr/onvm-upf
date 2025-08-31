@@ -1,5 +1,6 @@
 #include <cstdint>
 #include "stack.h"
+#include "../cls_c_compat_alloc.h"
 
 int StackNotEmpty(stk_stack* theStack)
 {

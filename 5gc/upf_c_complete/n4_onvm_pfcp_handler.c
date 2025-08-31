@@ -138,10 +138,23 @@ bool UpfClsRebuildAndPublish(uint32_t *out_version) {
     void *retired = NULL;
     uint32_t ver  = upf_cls_publish((void *)snap, &retired);
 
-    
+    // remove this later after testing
+    if (likely(ver != 0)) {  // or: if (publish_succeeded)
+        __atomic_store_n(&g_cls_retired_snapshot, retired, __ATOMIC_RELEASE);
+        __atomic_store_n(&g_cls_retired_version,  ver,     __ATOMIC_RELEASE);
 
-    g_cls_retired_snapshot = retired;
-    g_cls_retired_version  = ver;
+        // (optional) log
+        UTLT_Info("CLS publish: retired=%p ver=%u", retired, ver);
+
+        // Now notify DP to flip
+        UpfSendEvt1(UPF_U_SERVICE_ID, EVT_CLS_GC_REQ, ver);
+    } else {
+        // publish failed: DO NOT touch g_cls_retired_* and DO NOT send REQ
+    }
+    
+    // open this later after testing
+    /* g_cls_retired_snapshot = retired;
+    g_cls_retired_version  = ver; */
 
     // logging block
     /* NEW: deep publish diagnostics */
@@ -169,7 +182,7 @@ bool UpfClsRebuildAndPublish(uint32_t *out_version) {
 
 
 //  C-plane msg handler will free on ACK via this
-void UpfClsOnAckFree(uint32_t ver) {
+/* void UpfClsOnAckFree(uint32_t ver) {
     if (ver == g_cls_retired_version && g_cls_retired_snapshot) {
         // logging block
         UTLT_Info("CLS GC: ACK ver=%u, freeing retired snapshot %p",
@@ -177,6 +190,22 @@ void UpfClsOnAckFree(uint32_t ver) {
         cls_destroy((cls_handle_t*)g_cls_retired_snapshot);
         g_cls_retired_snapshot = NULL;
     }
+} */
+
+void UpfClsOnAckFree(uint32_t ver) {
+    // Acquire load so we compare against a coherent value
+    uint32_t rver = __atomic_load_n(&g_cls_retired_version, __ATOMIC_ACQUIRE);
+    if (ver != rver) return;
+
+    // Atomic exchange to NULL to make it double-free proof
+    void *to_free = __atomic_exchange_n(&g_cls_retired_snapshot, NULL, __ATOMIC_ACQ_REL);
+    if (!to_free) return;  // already freed
+
+    UTLT_Info("CLS GC: ACK ver=%u, freeing retired snapshot %p", ver, to_free);
+    cls_destroy((cls_handle_t*)to_free);
+
+    // Optional: clear version (release) so duplicate ACKs are cheap no-ops
+    __atomic_store_n(&g_cls_retired_version, 0, __ATOMIC_RELEASE);
 }
 
 
