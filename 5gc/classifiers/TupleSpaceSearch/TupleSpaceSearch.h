@@ -3,11 +3,23 @@
 
 #define POINTER_SIZE_BYTES 4
 
-#include "../Simulation.h"
-#include "cmap.h"
-#include "../PartitionSort/Common.h"
+#include <vector>
 #include <unordered_map>
 #include <fstream>
+#include <set>
+#include <algorithm>
+#include <iterator>
+#include <utility>
+#include <cstdint>
+
+#include "cmap.h"
+#include "../PartitionSort/Common.h"
+#include "../ElementaryClasses.h"
+#include "../cls_no_virtual.h"
+
+using Memory = std::uint32_t;
+
+
 struct Tuple {
 	friend class TupleSpaceSearch;
     friend class PriorityTupleSpaceSearch;
@@ -72,10 +84,10 @@ public:
 	std::multiset<int> priority_container;
 };
 
-class TupleSpaceSearch : public PacketClassifier {
+class TupleSpaceSearch{
 	
 public:
-	virtual ~TupleSpaceSearch() {
+	~TupleSpaceSearch() {
 		for (auto p : all_tuples) {
 			p.second.Destroy();
 		}
@@ -94,7 +106,7 @@ public:
 	int MemoryAccess() const {
 		return WorstAccesses();
 	}
-	virtual int WorstAccesses() const;
+	int WorstAccesses() const;
 	Memory MemSizeBytes() const {
 		int ruleSizeBytes = 19; // TODO variables sizes
 		int sizeBytes = 0;
@@ -127,7 +139,7 @@ public:
 		}
 		log << std::endl;
 	}
-	virtual int GetNumberOfTuples() const {
+	int GetNumberOfTuples() const {
 		return all_tuples.size();
 	}
 	size_t NumTables() const { return GetNumberOfTuples(); }
@@ -207,5 +219,9 @@ private:
 	std::vector<PriorityTuple *> priority_tuples_vector;
 };
 
+
+CLS_ENSURE_NO_VIRTUAL(TupleSpaceSearch);
+CLS_ENSURE_NO_VIRTUAL(PriorityTuple);
+CLS_ENSURE_NO_VIRTUAL(PriorityTupleSpaceSearch);
 
 #endif

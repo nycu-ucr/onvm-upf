@@ -1,16 +1,24 @@
 #ifndef  PSORT_H
 #define  PSORT_H
 
-#include <stdint.h>
-#include "../cls_c_compat_alloc.h"
+
+#include <cstdint>
+#include <vector>
+#include <array>
+#include <unordered_map>
+#include <algorithm>   
+
+#include "../cls_no_virtual.h"
 #include "OptimizedMITree.h"
-#include "../Simulation.h"
 #include "SortableRulesetPartitioner.h"
+#include "../ElementaryClasses.h"
 
 
 #define DEBUG_ASSERT 0
 
-class PartitionSort : public PacketClassifier {
+using Memory = std::uint32_t;
+
+class PartitionSort final {
 
 public:
 
@@ -20,7 +28,7 @@ public:
     // }
 	~PartitionSort() {
 		for (auto x : mitrees) {
-			free(x);
+			delete x;
 		}
 	}
 
@@ -42,7 +50,7 @@ public:
 			query++;
 			result = std::max(t->ClassifyAPacket(packet), result);
 		}
-		QueryUpdate(query);
+		// QueryUpdate(query);
 		return result;
 		
 	}  
@@ -65,7 +73,7 @@ public:
 				best = m;
 			/* If need tie-breaking on equal priority, handle it here */
 		}
-		QueryUpdate(query);
+		// QueryUpdate(query);
 		return best;
 	}
 
@@ -117,4 +125,7 @@ protected:
 	}
 
 };
+
+CLS_ENSURE_NO_VIRTUAL(PartitionSort);
+
 #endif

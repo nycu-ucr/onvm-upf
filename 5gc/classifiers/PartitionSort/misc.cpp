@@ -1,4 +1,5 @@
 #include "misc.h"
+#include "../cls_c_compat_alloc.h"
 
 /***********************************************************************/
 /*  FUNCTION:  void Assert(int assertion, char* error)  */

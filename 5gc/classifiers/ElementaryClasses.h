@@ -11,6 +11,9 @@
 #include <chrono> 
 #include <array>
 #include <stdint.h>
+
+#include "cls_c_compat_alloc.h"
+
 #define FieldSA 0
 #define FieldDA 1
 #define FieldSP 2

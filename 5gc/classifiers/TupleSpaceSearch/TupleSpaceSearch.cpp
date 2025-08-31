@@ -212,7 +212,7 @@ int TupleSpaceSearch::ClassifyAPacket(const Packet& packet) {
 		priority = std::max(priority, result);
 		query++;
 	}
-	QueryUpdate(query);
+	// QueryUpdate(query);
 	return priority;
 }
 
@@ -445,7 +445,7 @@ int PriorityTupleSpaceSearch::ClassifyAPacket(const Packet& packet) {
 		q++;
 		priority = priority > result ? priority : result;
 	}
-	QueryUpdate(q);
+	// QueryUpdate(q);
 	return priority;
 }
 

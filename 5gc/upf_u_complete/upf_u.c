@@ -698,15 +698,28 @@ GetPdrByUeIpAddress(struct rte_mbuf *pkt, uint32_t ue_ip)
     struct rte_ipv4_hdr *outer4 = onvm_pkt_ipv4_hdr(pkt);
     if (!outer4) return NULL;
     struct rte_udp_hdr  *outerU = onvm_pkt_udp_hdr(pkt);
-    if (!outerU) return NULL;
+
     key.src_ip = rte_be_to_cpu_32(outer4->src_addr);
     key.dst_ip = rte_be_to_cpu_32(outer4->dst_addr);
     key.tos_tc = outer4->type_of_service;
 
     key.teid    = 0;        /* Downlink: no GTP */
     key.ue_ip   = ue_ip;
-    key.src_port= rte_be_to_cpu_16(outerU->src_port);
-    key.dst_port= rte_be_to_cpu_16(outerU->dst_port);
+
+    uint16_t sp = 0, dp = 0;
+    
+    key.proto = outer4->next_proto_id;
+
+    if (key.proto == IPPROTO_UDP) {
+        const struct rte_udp_hdr *uh = onvm_pkt_udp_hdr(pkt);
+        if (uh) {                      // <-- do NOT return on NULL
+            sp = rte_be_to_cpu_16(uh->src_port);
+            dp = rte_be_to_cpu_16(uh->dst_port);
+        }
+    }
+
+    key.src_port= sp;
+    key.dst_port= dp;
     key.proto   = outer4->next_proto_id;
 
     /* SPI (ESP) */
@@ -1429,30 +1442,15 @@ packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm_nf_
     UpfClsMaybeFlipAndAck();
 
     UPDK_PDR *pdr = NULL;
-    // Step 1: Identify if it is a uplink packet or downlink packet
-    // char *src_address = convertToIpAddress(iph->src_addr);
-    //UTLT_Info("Src IP is %s\n", src_address);
-    //char *dst_address = convertToIpAddress(iph->dst_addr);
-    //UTLT_Info("Dst IP is %s\n", dst_address);
-    
-    char src_buf[16], dst_buf[16], self_buf[16];
 
-    inet_ntop(AF_INET, &(iph->src_addr), src_buf, sizeof(src_buf));
-    inet_ntop(AF_INET, &(iph->dst_addr), dst_buf, sizeof(dst_buf));
-    inet_ntop(AF_INET, &SELF_IP, self_buf, sizeof self_buf);
+    char *src_address = convertToIpAddress(iph->src_addr);
+    UTLT_Info("Src IP is %s\n", src_address);
+    char *dst_address = convertToIpAddress(iph->dst_addr);
+    UTLT_Info("Dst IP is %s\n", dst_address);
 
-    UTLT_Info("Src IP  = %s", src_buf);
-    UTLT_Info("Dst IP  = %s", dst_buf);
-    UTLT_Info("SELF IP = %s", self_buf);
-    
-    
-    //UTLT_Info("SELF IP is %s\n", convertToIpAddress(SELF_IP));
 
     if (iph->dst_addr == SELF_IP) {  //
-        // UTLT_Info("It is uplink\n");
-        // UTLT_Info("It is uplink. Src -> %s | Dst -> %s | Self -> %s\n", convertToIpAddress(iph->src_addr), convertToIpAddress(iph->dst_addr), convertToIpAddress(SELF_IP));
-
-        UTLT_Info("It is uplink. Src -> %s | Dst -> %s | Self -> %s", src_buf, dst_buf, self_buf);
+        UTLT_Info("It is uplink\n");
 
         struct rte_udp_hdr *udp_header = onvm_pkt_udp_hdr(pkt);
         if (udp_header == NULL) {
@@ -1465,21 +1463,13 @@ packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm_nf_
         pdr = GetPdrByTeid(pkt, teid);
 
     } else {
-        // UTLT_Info("It is downlink, dst is %d\n", rte_cpu_to_be_32(iph->dst_addr));
-        UTLT_Info("It is downlink. Src -> %s | Dst -> %s\n", convertToIpAddress(iph->src_addr), convertToIpAddress(iph->dst_addr));
-
-        struct timespec ts;
-        timespec_get(&ts, TIME_UTC);
-        // UTLT_Info("(%d) Time: %ld.%09ld\n", rte_cpu_to_be_32(iph->dst_addr), ts.tv_sec, ts.tv_nsec);
-        UTLT_Info("(%s) Time: %ld.%09ld\n", convertToIpAddress(iph->dst_addr), ts.tv_sec, ts.tv_nsec);
-        //  Step 2: Get PDR rule
+        UTLT_Info("It is downlink, dst is %s\n", convertToIpAddress(iph->dst_addr));
         pdr = GetPdrByUeIpAddress(pkt, rte_cpu_to_be_32(iph->dst_addr));
         GetQerByUEIpAddress(rte_cpu_to_be_32(iph->dst_addr), convertToIpAddress(iph->dst_addr));
         is_dl = true;
     }
 
     if (!pdr) {
-        // UTLT_Error("no PDR found for %d, skip\n", rte_cpu_to_be_32(iph->dst_addr));
         UTLT_Error("no PDR found for %s, skip\n", convertToIpAddress(iph->dst_addr));
         // TODO(vivek): what to do?
         return 0;

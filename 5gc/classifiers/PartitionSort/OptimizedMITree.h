@@ -1,12 +1,21 @@
 #ifndef  OPTMITREE_H
 #define  OPTMITREE_H
 
+
+#include <cstdint>
+#include <vector>
+#include <set>
+#include <algorithm>
+#include <cstdio>
+
 #include "red_black_tree.h"
 #include "SortableRulesetPartitioner.h"
-#include "../Simulation.h"
+#include "../ElementaryClasses.h"
+#include "../cls_no_virtual.h"
 
+using Memory = std::uint32_t;
 
-class OptimizedMITree : public ClassifierTable  {
+class OptimizedMITree final  {
 
 public:
 	OptimizedMITree(const SortableRuleset& rules) {
@@ -188,6 +197,6 @@ private:
 };
 
 
-
+CLS_ENSURE_NO_VIRTUAL(OptimizedMITree);
 
 #endif
