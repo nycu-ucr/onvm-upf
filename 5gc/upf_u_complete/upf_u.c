@@ -52,8 +52,8 @@
 
 // for logging
 
-#include <rte_hexdump.h>
-#include <rte_memory.h>
+/* #include <rte_hexdump.h>
+#include <rte_memory.h> */
 
 
 #define NF_TAG "upf_u"
@@ -171,19 +171,19 @@ static inline void UpfClsMaybeFlipAndAck(void) {
         return;
     }
 
-    /* NEW: deep flip diagnostics BEFORE we start using it */
+    /* // NEW: deep flip diagnostics BEFORE we start using it
     void *handle = new_ptr;
-    void *engine = *(void**)handle;              /* first word in handle */
-    void *vptr   = engine ? *(void**)engine : NULL;  /* first word in engine = vtable ptr */
+    void *engine = *(void**)handle;              // first word in handle
+    void *vptr   = engine ? *(void**)engine : NULL;  // first word in engine = vtable ptr */
 
-    UTLT_Info("CLS flip:  handle=%p iova=%"PRIu64"  engine=%p iova=%"PRIu64"  vptr=%p iova=%"PRIu64" ver=%u",
+    /* UTLT_Info("CLS flip:  handle=%p iova=%"PRIu64"  engine=%p iova=%"PRIu64"  vptr=%p iova=%"PRIu64" ver=%u",
               handle, (uint64_t)rte_mem_virt2iova(handle),
               engine, (uint64_t)rte_mem_virt2iova(engine),
               vptr,   (uint64_t)rte_mem_virt2iova(vptr),
-              new_ver);
+              new_ver); */
 
-    if (handle) rte_hexdump(stdout, "DP cls_handle head", handle, 32);
-    if (engine) rte_hexdump(stdout, "DP engine head",     engine, 32);
+    //if (handle) rte_hexdump(stdout, "DP cls_handle head", handle, 32);
+    // if (engine) rte_hexdump(stdout, "DP engine head",     engine, 32);
 
     g_cls_local.ptr = new_ptr;
     g_cls_local.ver = new_ver;
@@ -874,36 +874,36 @@ UPDK_PDR *GetPdrByTeid(struct rte_mbuf *pkt, uint32_t td) {
     key.source_if = SRC_IF_ACCESS;
     key.is_uplink = true;
 
-    /* printf(
-    "DBG→Classifier Key:\n"
-    "    teid        = %u\n"
-    "    ue_ip       = %s\n"
-    "    src_ip      = %s\n"
-    "    dst_ip      = %s\n"
-    "    src_port    = %u\n"
-    "    dst_port    = %u\n"
-    "    proto       = %u\n"
-    "    tos_tc      = %u\n"
-    "    spi         = %u\n"
-    "    flow_label  = %u\n"
-    "    ni_hash     = 0x%08x\n"
-    "    qfi         = %u\n"
-    "    source_if   = %u\n"
-    "    is_uplink   = %s\n",
-    key.teid,
-    ip4_to_buf(htonl(key.ue_ip), ue_s),
-    ip4_to_buf(htonl(key.src_ip), o_dst),   // reuse buffers or add new ones
-    ip4_to_buf(htonl(key.dst_ip), dn_s),
-    key.src_port,
-    key.dst_port,
-    key.proto,
-    key.tos_tc,
-    key.spi,
-    key.flow_label,
-    key.ni_hash,
-    key.qfi,
-    key.source_if,
-    key.is_uplink ? "true" : "false"); */
+    //  printf(
+    // "DBG→Classifier Key:\n"
+    // "    teid        = %u\n"
+    // "    ue_ip       = %s\n"
+    // "    src_ip      = %s\n"
+    // "    dst_ip      = %s\n"
+    // "    src_port    = %u\n"
+    // "    dst_port    = %u\n"
+    // "    proto       = %u\n"
+    // "    tos_tc      = %u\n"
+    // "    spi         = %u\n"
+    // "    flow_label  = %u\n"
+    // "    ni_hash     = 0x%08x\n"
+    // "    qfi         = %u\n"
+    // "    source_if   = %u\n"
+    // "    is_uplink   = %s\n",
+    // key.teid,
+    // ip4_to_buf(htonl(key.ue_ip), ue_s),
+    // ip4_to_buf(htonl(key.src_ip), o_dst),   // reuse buffers or add new ones
+    // ip4_to_buf(htonl(key.dst_ip), dn_s),
+    // key.src_port,
+    // key.dst_port,
+    // key.proto,
+    // key.tos_tc,
+    // key.spi,
+    // key.flow_label,
+    // key.ni_hash,
+    // key.qfi,
+    // key.source_if,
+    // key.is_uplink ? "true" : "false");
 
 
     uint16_t pdr_id = UpfClassifyGetPdrId(&key);
@@ -922,8 +922,7 @@ UPDK_PDR *GetPdrByTeid(struct rte_mbuf *pkt, uint32_t td) {
     ConfigureQerFlows(session, pdr, pkt->port, key.ue_ip, true);
 
     return pdr;
-}
-
+} 
 
 
 

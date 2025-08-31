@@ -47,8 +47,8 @@
 
 
 // for logging
-#include <inttypes.h>
-#include <rte_hexdump.h>
+/* #include <inttypes.h>
+#include <rte_hexdump.h> */
 
 
 
@@ -152,23 +152,23 @@ bool UpfClsRebuildAndPublish(uint32_t *out_version) {
         // publish failed: DO NOT touch g_cls_retired_* and DO NOT send REQ
     }
     
-    // open this later after testing
+    // open this later after testing atomic (I did not)
     /* g_cls_retired_snapshot = retired;
     g_cls_retired_version  = ver; */
 
-    // logging block
-    /* NEW: deep publish diagnostics */
-    void *handle = (void *)snap;                  /* published handle */
-    void *engine = handle ? *(void**)handle : NULL;      /* first word in handle */
-    void *vptr   = engine ? *(void**)engine : NULL;      /* first word in engine = vtable ptr (if C++) */
+    /* // logging block
+    // deep publish diagnostics
+    void *handle = (void *)snap;                  // published handle
+    void *engine = handle ? *(void**)handle : NULL;      // first word in handle
+    void *vptr   = engine ? *(void**)engine : NULL;      // first word in engine = vtable ptr (if C++) */
 
-    UTLT_Info("CLS publish: handle=%p iova=%"PRIu64"  engine=%p iova=%"PRIu64"  vptr=%p",
+    /* UTLT_Info("CLS publish: handle=%p iova=%"PRIu64"  engine=%p iova=%"PRIu64"  vptr=%p",
             handle, (uint64_t)rte_mem_virt2iova(handle),
             engine, (uint64_t)rte_mem_virt2iova(engine),
             vptr);
 
     if (handle) rte_hexdump(stdout, "CP cls_handle head", handle, 32);
-    if (engine) rte_hexdump(stdout, "CP engine head",     engine, 32);
+    if (engine) rte_hexdump(stdout, "CP engine head",     engine, 32); */
 
     // logging block
 
