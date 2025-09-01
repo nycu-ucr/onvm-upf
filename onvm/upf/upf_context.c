@@ -85,10 +85,14 @@ int UpfClsCtrlInit(void) {
             MZ_UPF_CLS_CTRL, sizeof(upf_cls_ctrl_t),
             SOCKET_ID_ANY, RTE_MEMZONE_2MB, RTE_CACHE_LINE_SIZE);
         if (!mz) return -1;
+
+        /* We are the creator: initialize to a stable, empty state.
+           version must be EVEN (stable). 0 is perfect. */
         upf_cls_ctrl_t *ctrl = (upf_cls_ctrl_t *)mz->addr;
-        ctrl->active  = NULL;   /* safety default: U-plane drops until publish */
-        ctrl->version = 0;
+        __atomic_store_n(&ctrl->active,  NULL, __ATOMIC_RELEASE);
+        __atomic_store_n(&ctrl->version, 0u,   __ATOMIC_RELEASE);
     }
+
     g_upf_cls_ctrl = (upf_cls_ctrl_t *)mz->addr;
 
     // logging block

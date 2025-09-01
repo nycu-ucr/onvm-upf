@@ -54,7 +54,7 @@ static inline int UpfSendEvt1(uint16_t dest_sid, uint32_t type, uintptr_t a0) {
     e->argc = 1;
     e->arg0 = a0;
     int rc = onvm_nflib_send_msg_to_nf(dest_sid, e);
-    //if (rc < 0) rte_free(e);
+    if (rc < 0) rte_free(e);
     return rc;
 }
 

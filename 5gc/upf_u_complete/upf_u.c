@@ -93,7 +93,7 @@ static inline int UpfSendEvt1(uint16_t dest_sid, uint32_t type, uintptr_t a0) {
     e->argc = 1;
     e->arg0 = a0;
     int rc = onvm_nflib_send_msg_to_nf(dest_sid, e);
-    // if (rc < 0) rte_free(e);
+    if (rc < 0) rte_free(e);
     return rc;
 }
 
@@ -159,8 +159,8 @@ static upf_cls_local_t g_cls_local = {0};
     (void)UpfSendEvt1(UPF_C_SERVICE_ID, EVT_CLS_GC_ACK, (uintptr_t)new_ver);
 } */
 
-// for logging
-static inline void UpfClsMaybeFlipAndAck(void) {
+
+/* static inline void UpfClsMaybeFlipAndAck(void) {
     if (likely(!g_cls_local.flip_pending)) return;
 
     rte_rmb();
@@ -171,16 +171,16 @@ static inline void UpfClsMaybeFlipAndAck(void) {
         return;
     }
 
-    /* // NEW: deep flip diagnostics BEFORE we start using it
-    void *handle = new_ptr;
-    void *engine = *(void**)handle;              // first word in handle
-    void *vptr   = engine ? *(void**)engine : NULL;  // first word in engine = vtable ptr */
+    // // NEW: deep flip diagnostics BEFORE we start using it
+    // void *handle = new_ptr;
+    // void *engine = *(void**)handle;              // first word in handle
+    // void *vptr   = engine ? *(void**)engine : NULL;  // first word in engine = vtable ptr
 
-    /* UTLT_Info("CLS flip:  handle=%p iova=%"PRIu64"  engine=%p iova=%"PRIu64"  vptr=%p iova=%"PRIu64" ver=%u",
-              handle, (uint64_t)rte_mem_virt2iova(handle),
-              engine, (uint64_t)rte_mem_virt2iova(engine),
-              vptr,   (uint64_t)rte_mem_virt2iova(vptr),
-              new_ver); */
+    // UTLT_Info("CLS flip:  handle=%p iova=%"PRIu64"  engine=%p iova=%"PRIu64"  vptr=%p iova=%"PRIu64" ver=%u",
+    //           handle, (uint64_t)rte_mem_virt2iova(handle),
+    //           engine, (uint64_t)rte_mem_virt2iova(engine),
+    //           vptr,   (uint64_t)rte_mem_virt2iova(vptr),
+    //           new_ver);
 
     //if (handle) rte_hexdump(stdout, "DP cls_handle head", handle, 32);
     // if (engine) rte_hexdump(stdout, "DP engine head",     engine, 32);
@@ -190,8 +190,49 @@ static inline void UpfClsMaybeFlipAndAck(void) {
     g_cls_local.flip_pending = 0;
 
     (void)UpfSendEvt1(UPF_C_SERVICE_ID, EVT_CLS_GC_ACK, (uintptr_t)new_ver);
-}
+} */
 
+
+// Flip to the latest published snapshot (called at burst boundary)
+static inline void UpfClsMaybeFlipAndAck(void) {
+    if (likely(!g_cls_local.flip_pending))
+        return;
+
+    // Seqlock read: accept only a stable, even version that doesn't change
+    void *new_ptr = NULL;
+    uint32_t v1, v2;
+
+    for (;;) {
+        v1 = __atomic_load_n(&g_upf_cls_ctrl->version, __ATOMIC_ACQUIRE);
+        if (unlikely(v1 & 1u)) {          // writer in progress
+            rte_pause();                   // be polite to the core
+            continue;
+        }
+
+        // Load pointer after seeing an even version
+        new_ptr = __atomic_load_n((void * const *)&g_upf_cls_ctrl->active, __ATOMIC_ACQUIRE);
+
+        // Re-check version; must be the same even number
+        v2 = __atomic_load_n(&g_upf_cls_ctrl->version, __ATOMIC_ACQUIRE);
+        if (likely(v1 == v2 && !(v2 & 1u)))
+            break;
+
+        // Changed under us; retry
+        rte_pause();
+    }
+
+    if (unlikely(!new_ptr)) {
+        UTLT_Warning("CLS flip requested but ctrl.active==NULL (ctrl.ver=%u)", v2);
+        return;
+    }
+
+    // Commit locally & ACK the exact stable version observed
+    g_cls_local.ptr = new_ptr;
+    g_cls_local.ver = v2;
+    g_cls_local.flip_pending = 0;
+
+    (void)UpfSendEvt1(UPF_C_SERVICE_ID, EVT_CLS_GC_ACK, (uintptr_t)v2);
+}
 
 
 
@@ -227,6 +268,19 @@ static inline uint16_t UpfClassifyGetPdrId(const ps_packet_t *key) {
     }
 
     return (uint16_t)pdrId;
+}
+
+static inline const UPDK_PDR *UpfClassifyGetPdrPtr(const ps_packet_t *key) {
+    const cls_handle_t *snap = (const cls_handle_t *)g_cls_local.ptr;
+    if (unlikely(!snap)) {
+        UTLT_Warning("CLS classify: no snapshot yet (ver=%u) — dropping", g_cls_local.ver);
+        return NULL;
+    }
+    uint32_t  precedence = 0;
+    uintptr_t descriptor     = 0;
+    int hit = cls_classify_packet((cls_handle_t *)snap, key, &precedence, &descriptor);
+    if (hit != 1 || descriptor == 0) return NULL;
+    return (const UPDK_PDR *)descriptor;
 }
 
 
@@ -751,19 +805,22 @@ GetPdrByUeIpAddress(struct rte_mbuf *pkt, uint32_t ue_ip)
         (unsigned)key.source_if
     ); */
 
-    uint16_t pdr_id = UpfClassifyGetPdrId(&key);
+    /* uint16_t pdr_id = UpfClassifyGetPdrId(&key);
     if (pdr_id == 0) {
+        UTLT_Error("Couldn't classify the packet to a PDR");
+        return NULL;
+    } */
+
+    const UPDK_PDR *pdr = UpfClassifyGetPdrPtr(&key);
+    if (!pdr) {
         UTLT_Error("Couldn't classify the packet to a PDR");
         return NULL;
     }
 
     UpfSession *session = UpfSessionFindByUeIP(ue_ip);
-    if (!session) return NULL;
-    
-    const UPDK_PDR *pdr = UpfPDRFindByID(session, pdr_id);
-
-    ConfigureQerFlows(session, pdr, pkt->port, key.ue_ip, false);
-
+    if (session) {
+        ConfigureQerFlows(session, pdr, pkt->port, key.ue_ip, false);
+    }
     return pdr;
 }
 
@@ -906,25 +963,27 @@ UPDK_PDR *GetPdrByTeid(struct rte_mbuf *pkt, uint32_t td) {
     // key.is_uplink ? "true" : "false");
 
 
-    uint16_t pdr_id = UpfClassifyGetPdrId(&key);
+    /* uint16_t pdr_id = UpfClassifyGetPdrId(&key);
     if (pdr_id == 0) {
         UTLT_Error("Couldn't classify the packet to a PDR");
         return NULL;
-    }
+    } */
 
     // printf("PDR ID from Classifier = %" PRIu16 "\n", pdr_id);
+
+    const UPDK_PDR *pdr = UpfClassifyGetPdrPtr(&key);
+    if (!pdr) {
+        UTLT_Error("Couldn't classify the packet to a PDR");
+        return NULL;
+    }
     
     UpfSession *session = UpfSessionFindByTeid(td);
-    if (!session) return NULL;
+    if (session) {
+        ConfigureQerFlows(session, pdr, pkt->port, key.ue_ip, true);
+    }
     
-    const UPDK_PDR *pdr = UpfPDRFindByID(session, pdr_id);
-
-    ConfigureQerFlows(session, pdr, pkt->port, key.ue_ip, true);
-
     return pdr;
 } 
-
-
 
 void *
 GetQerByUEIpAddress(uint32_t ue_ip, char *IP) {
@@ -1290,7 +1349,7 @@ msg_handler(void *msg_data, struct onvm_nf_local_ctx *nf_local_ctx) {
           (void*)(g_upf_cls_ctrl ? g_upf_cls_ctrl->active : NULL),
           (g_upf_cls_ctrl ? g_upf_cls_ctrl->version : 0));
 
-        //rte_free(e);                       // Receiver frees Event on success
+        rte_free(e);
         return;
     }
 
@@ -1298,6 +1357,7 @@ msg_handler(void *msg_data, struct onvm_nf_local_ctx *nf_local_ctx) {
     struct onvm_nf *nf = nf_local_ctx->nf;
 
     if (buffer_length <= 0) {
+        if (e) rte_free(e);
         return;
     }
 
@@ -1321,6 +1381,7 @@ msg_handler(void *msg_data, struct onvm_nf_local_ctx *nf_local_ctx) {
     onvm_pkt_flush_all_nfs(nf->nf_tx_mgr, nf);
     UTLT_Debug("Sending out %u packets\n", buffer_length);
     buffer_length = 0;
+    if (e) rte_free(e);
 }
 
 uint64_t last_p = NULL;
