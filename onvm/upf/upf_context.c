@@ -44,39 +44,55 @@ static uint64_t g_sessionIdPool = 1;
 
 upf_cls_ctrl_t *g_upf_cls_ctrl = NULL;
 
-list_t *g_all_pdr_list = NULL;
+/* Flat vector registry for all PDRs (control-plane only) */
+static UpfPDR   **g_all_pdr_vec = NULL;
+static uint32_t   g_all_pdr_len = 0;
+static uint32_t   g_all_pdr_cap = 0;
+
+static inline void _pdr_vec_ensure(uint32_t need_extra) {
+    uint32_t need = g_all_pdr_len + need_extra;
+    if (need <= g_all_pdr_cap) return;
+    uint32_t new_cap = g_all_pdr_cap ? g_all_pdr_cap : 64;
+    while (new_cap < need) new_cap <<= 1;              /* geometric growth */
+    UpfPDR **nv = (UpfPDR **)rte_realloc(g_all_pdr_vec,
+                                         new_cap * sizeof(*nv),
+                                         RTE_CACHE_LINE_SIZE);
+    UTLT_Assert(nv, return, "OOM growing PDR vector to %u", new_cap);
+    g_all_pdr_vec = nv;
+    g_all_pdr_cap = new_cap;
+}
 
 
 void UpfPDRGlobalInit(void) {
-    if (!g_all_pdr_list) {
-        g_all_pdr_list = list_new();
-    }
+    g_all_pdr_vec = NULL;
+    g_all_pdr_len = 0;
+    g_all_pdr_cap = 0;
 }
 
 void UpfPDRGlobalAdd(UpfPDR *pdr) {
-    if (!pdr) {
-        return;
-    }
-    if (!g_all_pdr_list) {
-        g_all_pdr_list = list_new();
-    }
-    list_rpush(g_all_pdr_list, list_node_new(pdr));
+    if (!pdr) return;
+    _pdr_vec_ensure(1);
+    g_all_pdr_vec[g_all_pdr_len++] = pdr;
 }
 
+/* O(1) remove via swap-with-last; order is not important for rebuilds */
 void UpfPDRGlobalRemove(UpfPDR *pdr) {
-    if (!g_all_pdr_list || !pdr) {
-        return;
-    }
-    list_iterator_t *it = list_iterator_new(g_all_pdr_list, LIST_HEAD);
-    for (list_node_t *n; (n = list_iterator_next(it)); ) {
-        if ((UpfPDR *)n->val == pdr) { 
-            list_remove(g_all_pdr_list, n);
-            break;
+    if (!pdr || g_all_pdr_len == 0) return;
+    for (uint32_t i = 0; i < g_all_pdr_len; ++i) {
+        if (g_all_pdr_vec[i] == pdr) {
+            uint32_t last = g_all_pdr_len - 1;
+            g_all_pdr_vec[i] = g_all_pdr_vec[last];
+            g_all_pdr_len = last;
+            return;
         }
     }
-    list_iterator_destroy(it);
 }
 
+/* Read-only view for rebuilds (single-threaded CP) */
+void UpfPDRGlobalGet(UpfPDR ***out_vec, uint32_t *out_len) {
+    if (out_vec) *out_vec = g_all_pdr_vec;
+    if (out_len) *out_len = g_all_pdr_len;
+}
 
 int UpfClsCtrlInit(void) {
     const struct rte_memzone *mz = rte_memzone_lookup(MZ_UPF_CLS_CTRL);

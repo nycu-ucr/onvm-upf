@@ -223,9 +223,12 @@ Status UpfQERDeregisterToSessionByID(UpfSession *session, uint16_t id);//impleme
 
 UpfDeregResult UpfPDRDeregisterToSessionByIDEx(UpfSession *session, uint16_t id);
 
+/* ---- Global PDR flat-vector API (CP only) ---- */
 void UpfPDRGlobalInit(void);
 void UpfPDRGlobalAdd(UpfPDR *pdr);
 void UpfPDRGlobalRemove(UpfPDR *pdr);
+/* Expose a read-only view for rebuilds */
+void UpfPDRGlobalGet(UpfPDR ***out_vec, uint32_t *out_len);
 
 #ifdef __cplusplus
 }

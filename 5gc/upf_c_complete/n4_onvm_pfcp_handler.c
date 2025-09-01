@@ -265,46 +265,39 @@ bool UpfClsRebuildAndPublish(uint32_t *out_version) {
         UTLT_Error("Classifier snapshot create failed");
         return false;
     }
+    
+    UpfPDR **arr = NULL;
+    uint32_t len = 0;
+    UpfPDRGlobalGet(&arr, &len);
 
-    list_iterator_t *it = list_iterator_new(g_all_pdr_list, LIST_HEAD);
-    for (list_node_t *n; it && (n = list_iterator_next(it)); ) {
-        UpfPDR *up = (UpfPDR *)n->val;
+    for (uint32_t i = 0; i < len; ++i) {
+        UpfPDR *up = arr[i];
         if (!up) continue;
 
-        bool is_uplink = false;  /* default to downlink / CORE */
-
+        bool is_uplink = false;  /* default: CORE (downlink) */
         if (up->flags.pdi && up->pdi.flags.sourceInterface) {
-            UTLT_Debug("CreatePDR: PDI.SourceInterface IE present, value=%u",
-                       up->pdi.sourceInterface);
             switch (up->pdi.sourceInterface) {
-            case 0: /* ACCESS (N3) → Uplink UE→UPF */
-                is_uplink = true;  break;
-            case 1: /* CORE   (N6) → Downlink DN→UE */
-                is_uplink = false; break;
-            default:
-                UTLT_Warning("CreatePDR: unexpected SourceInterface=%u – treating as CORE",
-                             up->pdi.sourceInterface);
-                break;
+                case 0: is_uplink = true;  break;  /* ACCESS / UL */
+                case 1: is_uplink = false; break;  /* CORE   / DL */
+                default:
+                    UTLT_Warning("CreatePDR: unexpected SourceInterface=%u – treating as CORE",
+                                up->pdi.sourceInterface);
+                    break;
             }
         } else {
-            /* Spec violation: Source-Interface missing – assume downlink */
             UTLT_Warning("CreatePDR: SourceInterface IE missing – treating as CORE");
         }
 
         pdr_t r = updk_pdr_to_cls_rule(up, is_uplink);
-
-        /* Pointer/descriptor cookie: publish the exact UpfPDR* */
-        r.descriptor = (uintptr_t)up;
+        r.descriptor = (uintptr_t)up;   /* pointer cookie */
 
         uintptr_t desc = cls_insert_rule(snap, &r);
         if (unlikely(desc == 0)) {
             UTLT_Error("cls_insert_rule failed for PDR id=%u", (unsigned)up->pdrId);
-            if (it) list_iterator_destroy(it);
             cls_destroy(snap);
             return false;
         }
     }
-    if (it) list_iterator_destroy(it);
 
     /* Publish with seqlock; version is even & monotonically increasing */
     void    *retired = NULL;
