@@ -316,7 +316,36 @@ const char *ip4(uint32_t host_ip) {
     return inet_ntop(AF_INET, &a, buf, sizeof(buf)) ? buf : "<err>";
 }
 
-static inline void
+uint32_t charStr2MaskedIP(char *str, uint32_t *prefix_val){
+    char ip_str[INET_ADDRSTRLEN];
+    uint32_t prefix_len, subnet;
+
+    sscanf(str, "%[^/]/%d", ip_str, &prefix_len);
+    struct in_addr ip_addr;
+    inet_pton(AF_INET, ip_str, &ip_addr);
+    
+    if (prefix_val) *prefix_val = prefix_len;
+    return IP_MASKED(ip_addr.s_addr, prefix_len);
+}
+
+static inline int SourceInterfaceToPort(source_interface_t srcIf) {
+    UTLT_Debug("SourceInterfaceToPort: called with srcIf=%u", (unsigned)srcIf);
+    switch (srcIf) {
+      case SRC_IF_ACCESS:
+        return 0;
+      case SRC_IF_CORE:
+      case SRC_IF_SGI_LAN:
+        return 1;
+      case SRC_IF_CP_FUNC:
+      case SRC_IF_LI_FUNC:
+        return -1;
+      default:
+        UTLT_Warning("SourceInterfaceToPort: invalid interface %u", (unsigned)srcIf);
+        return -1;
+    }
+}
+
+/* static inline void
 ConfigureQerFlows(UpfSession *session,
                  const UPDK_PDR *pdr,
                  uint8_t port,
@@ -368,6 +397,102 @@ ConfigureQerFlows(UpfSession *session,
                 UTLT_Info("TRTCM params: cir=%u pir=%u cbs=%u pbs=%u",
                           trtcm_params.cir, trtcm_params.pir,
                           trtcm_params.cbs, trtcm_params.pbs);
+                trTCMidx++;
+            }
+        }
+    }
+} */
+
+
+
+
+static inline void
+ConfigureQerFlows(UpfSession *session,
+                  const UPDK_PDR *pdr,
+                  uint8_t port,
+                  bool is_uplink)
+{
+    if (!session || !pdr || !session->qer_list) return;
+
+    int prefix_len = 0;
+    uint32_t fd_target = 0;
+    bool has_fd = false;
+
+    if (pdr->pdi.flags.sdfFilter && pdr->pdi.sdfFilter.flowDescription) {
+        const char *fd = pdr->pdi.sdfFilter.flowDescription;
+        const char *ip_str = strstr(fd, "from");
+        if (ip_str) {
+            ip_str += 5; // skip "from "
+            const char *end_ptr = strchr(ip_str, ' ');
+            size_t n = end_ptr ? (size_t)(end_ptr - ip_str) : strlen(ip_str);
+            if (n > 0 && n < 64) {
+                char tmp[64];
+                memcpy(tmp, ip_str, n);
+                tmp[n] = '\0';
+                if (strcmp(tmp, "any") != 0) {
+                    fd_target = charStr2MaskedIP(tmp, &prefix_len);
+                    has_fd = true;
+                }
+            }
+        }
+    }
+
+    uint32_t base = SourceInterfaceToPort(pdr->pdi.sourceInterface);
+    uint32_t key  = has_fd ? (base + fd_target) : base;
+
+    for (int i = 0; i < 2; i++) {
+        uint32_t qerId = pdr->qerId[i];
+        if (!qerId) continue;
+
+        for (list_node_t *node = session->qer_list->head; node; node = node->next) {
+            UpfQER *qer = (UpfQER *)node->val;
+            if (!qer || qer->qerId != qerId) continue;
+
+            // only add on miss, and only if MBR exists
+            if (ftSearch(key) < 0 && qer->flags.maximumBitrate) {
+                UTLT_Info("QER ID: %u key: %u", qerId, key);
+
+                struct rte_meter_trtcm_params trtcm_params = app_trtcm_params;
+
+                uint32_t mbr = is_uplink ? qer->maximumBitrate.ul : qer->maximumBitrate.dl;
+                trtcm_params.pir = mbr * 1000 / 8;
+
+                if (qer->flags.guaranteedBitrate) {
+                    uint32_t gbr = is_uplink ? qer->guaranteedBitrate.ul : qer->guaranteedBitrate.dl;
+                    trtcm_params.cir = gbr * 1000 / 8;
+                } else {
+                    trtcm_params.cir = is_uplink ? 0 : 1;  // preserve old defaults
+                }
+
+                if (!ftAddEntry(key, trTCMidx)) {
+                    UTLT_Warning("FT add failed");
+                }
+                UTLT_Info("Successfully add %u(%d) %u", key, hashFunc(key), trTCMidx);
+
+                // Match config profile to what color-check later uses:
+                // DL + SDF present → app_flow_trtcm_profile; else app_trtcm_profile
+                if (!is_uplink && has_fd) {
+                    rte_meter_trtcm_profile_config(&app_flow_trtcm_profile, &trtcm_params);
+                    rte_meter_trtcm_config(&app_flows[trTCMidx], &app_flow_trtcm_profile);
+                } else {
+                    rte_meter_trtcm_profile_config(&app_trtcm_profile, &trtcm_params);
+                    rte_meter_trtcm_config(&app_flows[trTCMidx], &app_trtcm_profile);
+                }
+
+                if (is_uplink) {
+                    UTLT_Info("Find MBR (UL: %lu) in QERs", qer->maximumBitrate.ul);
+                    if (qer->flags.guaranteedBitrate)
+                        UTLT_Info("Find GBR (UL: %lu) in QERs", qer->guaranteedBitrate.ul);
+                } else {
+                    UTLT_Info("Find MBR (DL: %lu) in QERs", qer->maximumBitrate.dl);
+                    if (qer->flags.guaranteedBitrate)
+                        UTLT_Info("Find GBR (DL: %lu) in QERs", qer->guaranteedBitrate.dl);
+                }
+
+                UTLT_Info("TRTCM params: %d %d %d %d\n",
+                          trtcm_params.cir, trtcm_params.pir,
+                          trtcm_params.cbs, trtcm_params.pbs);
+
                 trTCMidx++;
             }
         }
@@ -471,24 +596,6 @@ parseMAC(const char *config_path) {
 
 
 
-static inline int SourceInterfaceToPort(source_interface_t srcIf) {
-    UTLT_Debug("SourceInterfaceToPort: called with srcIf=%u", (unsigned)srcIf);
-    switch (srcIf) {
-      case SRC_IF_ACCESS:
-        return 0;
-      case SRC_IF_CORE:
-      case SRC_IF_SGI_LAN:
-        return 1;
-      case SRC_IF_CP_FUNC:
-      case SRC_IF_LI_FUNC:
-        return -1;
-      default:
-        UTLT_Warning("SourceInterfaceToPort: invalid interface %u", (unsigned)srcIf);
-        return -1;
-    }
-}
-
-
 static inline source_interface_t PortToSourceInterface(uint8_t port) {
     UTLT_Debug("PortToSourceInterface: called with port=%u", port);
     switch (port) {
@@ -579,17 +686,6 @@ trtcmPolicer(struct onvm_pkt_meta *meta, int color_result){
     return 0;
 }
 
-uint32_t charStr2MaskedIP(char *str, uint32_t *prefix_val){
-    char ip_str[INET_ADDRSTRLEN];
-    uint32_t prefix_len, subnet;
-
-    sscanf(str, "%[^/]/%d", ip_str, &prefix_len);
-    struct in_addr ip_addr;
-    inet_pton(AF_INET, ip_str, &ip_addr);
-    
-    if (prefix_val) *prefix_val = prefix_len;
-    return IP_MASKED(ip_addr.s_addr, prefix_len);
-}
 
 int hashFunc(uint32_t subnet) {
     return subnet % APP_FLOWS_MAX;
@@ -819,7 +915,7 @@ GetPdrByUeIpAddress(struct rte_mbuf *pkt, uint32_t ue_ip)
 
     UpfSession *session = UpfSessionFindByUeIP(ue_ip);
     if (session) {
-        ConfigureQerFlows(session, pdr, pkt->port, key.ue_ip, false);
+        ConfigureQerFlows(session, pdr, pkt->port, false);
     }
     return pdr;
 }
@@ -979,7 +1075,7 @@ UPDK_PDR *GetPdrByTeid(struct rte_mbuf *pkt, uint32_t td) {
     
     UpfSession *session = UpfSessionFindByTeid(td);
     if (session) {
-        ConfigureQerFlows(session, pdr, pkt->port, key.ue_ip, true);
+        ConfigureQerFlows(session, pdr, pkt->port, true);
     }
     
     return pdr;
