@@ -447,6 +447,16 @@ ConfigureQerFlows(UpfSession *session,
         for (list_node_t *node = session->qer_list->head; node; node = node->next) {
             UpfQER *qer = (UpfQER *)node->val;
             if (!qer || qer->qerId != qerId) continue;
+            
+            /* int idx = ftSearch(key);
+            if (idx >= 0) {
+                UTLT_Info("QER flow already exists: key=%u idx=%d (is_uplink=%d)", key, idx, (int)is_uplink);
+                continue; // nothing to configure
+            }
+
+            if (qer->flags.maximumBitrate) {
+                UTLT_Info("QER ID: %u key: %u", qerId, key);
+            } */
 
             // only add on miss, and only if MBR exists
             if (ftSearch(key) < 0 && qer->flags.maximumBitrate) {
@@ -461,7 +471,7 @@ ConfigureQerFlows(UpfSession *session,
                     uint32_t gbr = is_uplink ? qer->guaranteedBitrate.ul : qer->guaranteedBitrate.dl;
                     trtcm_params.cir = gbr * 1000 / 8;
                 } else {
-                    trtcm_params.cir = is_uplink ? 0 : 1;  // preserve old defaults
+                    trtcm_params.cir = is_uplink ? 0 : 1;
                 }
 
                 if (!ftAddEntry(key, trTCMidx)) {
