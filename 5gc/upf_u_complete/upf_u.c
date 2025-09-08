@@ -234,7 +234,33 @@ static inline void UpfClsMaybeFlipAndAck(void) {
     (void)UpfSendEvt1(UPF_C_SERVICE_ID, EVT_CLS_GC_ACK, (uintptr_t)v2);
 }
 
+static double lat_buf[100];
+static int lat_count = 0;
 
+static inline double cycles_to_us(uint64_t cyc) {
+    const double hz = (double)rte_get_tsc_hz();
+    return (cyc * 1e6) / hz;
+}
+
+static inline record_latency(double us) {
+    lat_buf[lat_count++] = us;
+
+    if (lat_count >= 100) {
+        // Print all collected values
+        printf("---- Latency batch ----\n");
+        double sum = 0.0;
+        for (int i = 0; i < 100; i++) {
+            printf("%2d: %.2f us, ", i, lat_buf[i]);
+            sum += lat_buf[i];
+        }
+        double avg = sum / 100.0;
+        printf("\nAverage latency: %.2f us\n", avg);
+        printf("-----------------------\n");
+
+        // Reset counter
+        lat_count = 0;
+    }
+}
 
 
 /* static inline const UPDK_PDR *UpfLookupPdr(const ps_packet_t *key) {
@@ -270,16 +296,85 @@ static inline uint16_t UpfClassifyGetPdrId(const ps_packet_t *key) {
     return (uint16_t)pdrId;
 }
 
+
+
+static inline void UpfLogPdrAddrs(const UPDK_PDR *pdr) {
+    int srcIf = -1;
+    char ue_ip[INET_ADDRSTRLEN] = "n/a";
+    char fd_from[64] = "n/a";
+    char fd_to[64]   = "n/a";
+
+    if (pdr->pdi.flags.sourceInterface)
+        srcIf = pdr->pdi.sourceInterface;
+
+    /* UE IP (if present) */
+    if (pdr->pdi.flags.ueIpAddress && pdr->pdi.ueIpAddress.flags.v4) {
+        inet_ntop(AF_INET, &pdr->pdi.ueIpAddress.ipv4, ue_ip, sizeof ue_ip);
+    }
+
+    /* Parse SDF flowDescription: ... from X to Y ...  (no in-place mutation) */
+    if (pdr->pdi.flags.sdfFilter && pdr->pdi.sdfFilter.flowDescription) {
+        const char *fd = pdr->pdi.sdfFilter.flowDescription;
+
+        const char *a = strstr(fd, "from ");
+        if (a) {
+            a += 5; /* skip "from " */
+            const char *e = strchr(a, ' ');
+            size_t n = e ? (size_t)(e - a) : strnlen(a, sizeof fd_from - 1);
+            if (n >= sizeof fd_from) n = sizeof fd_from - 1;
+            memcpy(fd_from, a, n); fd_from[n] = '\0';
+        }
+
+        const char *b = strstr(fd, "to ");
+        if (b) {
+            b += 3; /* skip "to " */
+            const char *e = strchr(b, ' ');
+            size_t n = e ? (size_t)(e - b) : strnlen(b, sizeof fd_to - 1);
+            if (n >= sizeof fd_to) n = sizeof fd_to - 1;
+            memcpy(fd_to, b, n); fd_to[n] = '\0';
+        }
+    }
+
+    /* Decide src/dst for log (UL: UE is src, DL: UE is dst) */
+    const char *src = "n/a", *dst = "n/a";
+    if (srcIf == 0) {           /* ACCESS / UL */
+        src = (strcmp(ue_ip, "n/a") ? ue_ip : fd_from);
+        dst = fd_to;
+    } else if (srcIf == 1) {    /* CORE / DL */
+        src = fd_from;
+        dst = (strcmp(ue_ip, "n/a") ? ue_ip : fd_to);
+    } else {
+        /* Unknown srcIf: just show parsed tokens */
+        src = fd_from; dst = fd_to;
+    }
+
+    UTLT_Info("PDR match: srcIf=%d src=%s dst=%s (UE=%s) pdr=%p", srcIf, src, dst, ue_ip, (const void*)pdr);
+}
+
+
+
+
 static inline const UPDK_PDR *UpfClassifyGetPdrPtr(const ps_packet_t *key) {
     const cls_handle_t *snap = (const cls_handle_t *)g_cls_local.ptr;
+    // cls_print_all_rules(g_cls_local.ptr);
     if (unlikely(!snap)) {
         UTLT_Warning("CLS classify: no snapshot yet (ver=%u) — dropping", g_cls_local.ver);
         return NULL;
     }
     uint32_t  precedence = 0;
     uintptr_t descriptor     = 0;
+
+    uint64_t t0 = rte_rdtsc_precise();
     int hit = cls_classify_packet((cls_handle_t *)snap, key, &precedence, &descriptor);
+    uint64_t t1 = rte_rdtsc_precise();
+
     if (hit != 1 || descriptor == 0) return NULL;
+
+    double us = cycles_to_us(t1 - t0);
+    record_latency(us);
+
+    // UTLT_Info("Classify Hit took: %.2f us", cycles_to_us(t1 - t0));
+
     return (const UPDK_PDR *)descriptor;
 }
 
@@ -844,6 +939,13 @@ updateTokenbyIndex(int index) {
     return;
 }
 
+static inline const char *
+ip4_to_buf(uint32_t be_addr, char buf[16]) {
+  inet_ntop(AF_INET, &be_addr, buf, 16);
+  return buf;
+}
+
+
 uint64_t seid = 0;
 uint16_t pdrId = 0;
 
@@ -897,11 +999,13 @@ GetPdrByUeIpAddress(struct rte_mbuf *pkt, uint32_t ue_ip)
     key.is_uplink = false;
 
     // printf("DBG2: srcIf=%u (port=%u)\n", key.source_if, pkt->port);
-    
-    /* UTLT_Debug("DL key → teid=%u UE_IP=%s/%u sport=%u dport=%u proto=%u "
+    char o_src[16], o_dst[16], o_ue[16];
+    UTLT_Debug("DL key → teid=%u UE_IP=%s SRC_IP=%s DST_IP=%s sport=%u dport=%u proto=%u "
                "spi=%u flow_label=%u ni=0x%08x qfi=%u srcIf=%u",
         key.teid,
-        ip4(key.ue_ip), 
+        ip4_to_buf(htonl(key.ue_ip), o_ue),
+        ip4_to_buf(htonl(key.src_ip), o_src),
+        ip4_to_buf(htonl(key.dst_ip), o_dst),
         key.src_port, key.dst_port,
         key.proto,
         key.spi,
@@ -909,7 +1013,7 @@ GetPdrByUeIpAddress(struct rte_mbuf *pkt, uint32_t ue_ip)
         key.ni_hash,
         key.qfi,
         (unsigned)key.source_if
-    ); */
+    );
 
     /* uint16_t pdr_id = UpfClassifyGetPdrId(&key);
     if (pdr_id == 0) {
@@ -923,6 +1027,8 @@ GetPdrByUeIpAddress(struct rte_mbuf *pkt, uint32_t ue_ip)
         return NULL;
     }
 
+    UpfLogPdrAddrs(pdr);
+
     UpfSession *session = UpfSessionFindByUeIP(ue_ip);
     if (session) {
         ConfigureQerFlows(session, pdr, pkt->port, false);
@@ -930,12 +1036,6 @@ GetPdrByUeIpAddress(struct rte_mbuf *pkt, uint32_t ue_ip)
     return pdr;
 }
 
-
-static inline const char *
-ip4_to_buf(uint32_t be_addr, char buf[16]) {
-  inet_ntop(AF_INET, &be_addr, buf, 16);
-  return buf;
-}
 
 static void dump_gtpu(const uint8_t *start, size_t len, size_t gtp_off) {
     printf("---- GTPU Dump (offset %zu, %zu bytes) ----\n", gtp_off, len);
@@ -1082,6 +1182,8 @@ UPDK_PDR *GetPdrByTeid(struct rte_mbuf *pkt, uint32_t td) {
         UTLT_Error("Couldn't classify the packet to a PDR");
         return NULL;
     }
+
+    UpfLogPdrAddrs(pdr);
     
     UpfSession *session = UpfSessionFindByTeid(td);
     if (session) {
@@ -1371,6 +1473,7 @@ packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm_nf_
     }
     AttachL2Header(pkt, is_dl);
     if (meta->action == ONVM_NF_ACTION_OUT && is_dl) {
+
         // check if the UE IP exists in the table and update the token
         int index = findIndexByUeIpAddress(rte_cpu_to_be_32(iph->dst_addr));
         if (index != -1) {
@@ -1389,6 +1492,7 @@ packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm_nf_
         struct rte_meter_trtcm_profile *trtcm_profile = NULL;
 
         char *ip_str = strstr(pdr->pdi.sdfFilter.flowDescription, "from");
+        
         if (ip_str != NULL) {
             ip_str += 5; // Skip "from "
             char *end_ptr = strchr(ip_str, ' ');

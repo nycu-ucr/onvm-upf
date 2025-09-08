@@ -1409,10 +1409,16 @@ stk_stack* RBEnumerate(rb_red_blk_tree* tree,const box& low, const box&  high) {
 void  RBSerializeIntoRulesRecursion(rb_red_blk_tree * treenode, rb_red_blk_node * node, int level, const std::vector<int>& fieldOrder, std::vector<box>& box_so_far, std::vector<Rule>& rules_so_far) {
 	if (level == fieldOrder.size() ) {
 		for (int n : treenode->priority_list) {
-			Rule r(fieldOrder.size());
+			/* Rule r(fieldOrder.size());
 			for (int i = 0; i < r.dim; i++){
 				r.range[fieldOrder[i]] = box_so_far[i];
+			} */
+			// hardcoded
+			Rule r(14);
+			for (size_t i = 0; i < fieldOrder.size(); ++i){
+				r.range[fieldOrder[i]] = box_so_far[i];
 			}
+
 			r.priority = n;
 			rules_so_far.push_back(r);
 		}
@@ -1421,9 +1427,14 @@ void  RBSerializeIntoRulesRecursion(rb_red_blk_tree * treenode, rb_red_blk_node 
 	if (treenode->count == 1) {
 		box_so_far.insert(std::end(box_so_far), begin(treenode->chain_boxes), end(treenode->chain_boxes));
 		for (int n : treenode->priority_list) {
-			Rule r(fieldOrder.size());
-
+		
+			/* Rule r(fieldOrder.size());
 			for (int i = 0; i < r.dim; i++){
+				r.range[fieldOrder[i]] = box_so_far[i];
+			} */
+			// hardcoded
+			Rule r(14);
+			for (size_t i = 0; i < fieldOrder.size(); ++i){
 				r.range[fieldOrder[i]] = box_so_far[i];
 			}
 			r.priority = n;

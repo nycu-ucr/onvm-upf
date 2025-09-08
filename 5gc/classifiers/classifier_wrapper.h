@@ -52,8 +52,8 @@ typedef struct {
     uint16_t  pdr_id;
     uint32_t  precedence;
     pdi_t     pdi;
-    uintptr_t descriptor;       /* back-pointer/cookie to DP view (hugepage) */
-    bool      is_uplink;        /* traffic direction flag */
+    uintptr_t descriptor;
+    bool      is_uplink;
 } pdr_t;
 
 /* Flat packet view for classification */

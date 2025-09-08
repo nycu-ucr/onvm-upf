@@ -56,8 +56,9 @@
 
 
 #define UPF_SYNTH_ENABLE     1          /* 0=off, 1=on (one-time per publish) */
-#define UPF_SYNTH_RULES      10000      /* extra rules to inject                 */
+#define UPF_SYNTH_RULES      20000      /* extra rules to inject                 */
 #define UPF_SYNTH_DIR_HINT   2
+#define UPF_SYNTH_INSERT_FIRST 1
 
 
 typedef struct {
@@ -273,6 +274,205 @@ static uint32_t g_cls_retired_version = 0;
 // }
 
 
+// bool UpfClsRebuildAndPublish(uint32_t *out_version) {
+//     cls_handle_t *snap = cls_create(CLS_SELECTED_BACKEND);
+//     if (!snap) {
+//         UTLT_Error("Classifier snapshot create failed");
+//         return false;
+//     }
+
+//     uint32_t inserted = 0;
+
+//     list_iterator_t *it = list_iterator_new(g_all_pdr_list, LIST_HEAD);
+//     for (list_node_t *n; it && (n = list_iterator_next(it)); ) {
+//         UpfPDR *up = (UpfPDR *)n->val;
+//         if (!up) continue;
+
+//         bool is_uplink = false;  /* default to downlink / CORE */
+
+//         if (up->flags.pdi && up->pdi.flags.sourceInterface) {
+//             UTLT_Debug("CreatePDR: PDI.SourceInterface IE present, value=%u",
+//                        up->pdi.sourceInterface);
+//             switch (up->pdi.sourceInterface) {
+//             case 0: /* ACCESS (N3) → Uplink UE→UPF */
+//                 is_uplink = true;  break;
+//             case 1: /* CORE   (N6) → Downlink DN→UE */
+//                 is_uplink = false; break;
+//             default:
+//                 UTLT_Warning("CreatePDR: unexpected SourceInterface=%u – treating as CORE",
+//                              up->pdi.sourceInterface);
+//                 break;
+//             }
+//         } else {
+//             /* Spec violation: Source-Interface missing – assume downlink */
+//             UTLT_Warning("CreatePDR: SourceInterface IE missing – treating as CORE");
+//         }
+
+//         pdr_t r = updk_pdr_to_cls_rule(up, is_uplink);
+
+//         /* Pointer/descriptor cookie: publish the exact UpfPDR* */
+//         r.descriptor = (uintptr_t)up;
+
+//         uintptr_t desc = cls_insert_rule(snap, &r);
+//         if (unlikely(desc == 0)) {
+//             UTLT_Error("cls_insert_rule failed for PDR id=%u", (unsigned)up->pdrId);
+//             if (it) list_iterator_destroy(it);
+//             cls_destroy(snap);
+//             return false;
+//         }
+//     }
+
+//     if (UPF_SYNTH_ENABLE && UPF_SYNTH_RULES > 0) {
+//         UpfPDR *tmpl = UpfGetTemplatePdr();
+//         if (!tmpl) {
+//             UTLT_Warning("Synthetic rules requested but no template PDR yet");
+//         } else {
+//             for (uint32_t i = 0; i < (uint32_t)UPF_SYNTH_RULES; ++i) {
+//                 /* 1) STACK copy of the template */
+//                 UpfPDR tmp = *tmpl;
+
+//                 /* 2) Direction hint */
+//                 if (tmp.flags.pdi && tmp.pdi.flags.sourceInterface) {
+//                     if (UPF_SYNTH_DIR_HINT == 0)       tmp.pdi.sourceInterface = 1;         /* CORE/DL */
+//                     else if (UPF_SYNTH_DIR_HINT == 1)  tmp.pdi.sourceInterface = 0;         /* ACCESS/UL */
+//                     else                                tmp.pdi.sourceInterface = (uint8_t)((i & 1) ? 0 : 1);
+//                 }
+
+//                 /* 3) Make the key UNMATCHABLE with real traffic */
+//                 if (tmp.flags.pdi && tmp.pdi.flags.ueIpAddress && tmp.pdi.ueIpAddress.flags.v4) {
+//                     /* TEST-NET ranges to avoid collisions with your lab IPs */
+//                     uint32_t base = (i & 1) ? RTE_IPV4(198,51,100,0) : RTE_IPV4(203,0,113,0);
+//                     uint32_t ip   = base + ((i % 200) + 1u);                        /* .1..200 */
+//                     tmp.pdi.ueIpAddress.ipv4.s_addr = htonl(ip);
+//                 } else if (tmp.flags.pdi && tmp.pdi.flags.fTeid) {
+//                     tmp.pdi.fTeid.teid = (uint32_t)(0xC0FFEE00u ^ i);
+//                 } else {
+//                     /* Nothing to vary: leave as-is; still unlikely to collide.
+//                     (PDI.SourceInterface should exist; if not, rule stays “exotic”) */
+//                 }
+
+//                 /* 4) Cosmetic: harmless synthetic id (not used in datapath) */
+//                 tmp.pdrId = (uint16_t)(0x8000u | (i & 0x7FFF));
+
+//                 /* 5) Adapter needs direction for this rule */
+//                 bool is_uplink = false;
+//                 if (tmp.flags.pdi && tmp.pdi.flags.sourceInterface)
+//                     is_uplink = (tmp.pdi.sourceInterface == 0); /* 0=ACCESS(UL), 1=CORE(DL) */
+
+//                 /* 6) Insert: cookie points to the REAL template PDR (stable in session) */
+//                 pdr_t r = updk_pdr_to_cls_rule(&tmp, is_uplink);
+//                 r.descriptor = (uintptr_t)tmpl;
+
+//                 if (unlikely(cls_insert_rule(snap, &r) == 0)) {
+//                     UTLT_Error("cls_insert_rule failed for synthetic idx=%u", i);
+//                     cls_destroy(snap);
+//                     return false;
+//                 }
+//                 inserted++;
+//             }
+//             UTLT_Info("Synthetic rules: added %u using template PDR id=%u",
+//                     (uint32_t)UPF_SYNTH_RULES, (unsigned)tmpl->pdrId);
+//         }
+//     }
+
+
+//     if (it) list_iterator_destroy(it);
+
+//     /* Publish with seqlock; version is even & monotonically increasing */
+//     void    *retired = NULL;
+//     uint32_t ver     = upf_cls_publish((void *)snap, &retired);
+
+//     /* Cache the retired snapshot only if there was one */
+//     if (retired) {
+//         __atomic_store_n(&g_cls_retired_snapshot, retired, __ATOMIC_RELEASE);
+//         __atomic_store_n(&g_cls_retired_version,  ver,     __ATOMIC_RELEASE);
+//         // UTLT_Info("CLS publish: new=%p retired=%p ver=%u", snap, retired, ver);
+//     } else {
+//         // UTLT_Info("CLS publish: new=%p retired=<none> ver=%u", snap, ver);
+//     }
+
+//     /* Notify DP exactly once to flip to this version */
+//     UpfSendEvt1(UPF_U_SERVICE_ID, EVT_CLS_GC_REQ, (uintptr_t)ver);
+
+//     UTLT_Info("CLS publish: ver=%u rules=%u retired=%p", ver, inserted, retired);
+
+//     if (out_version) *out_version = ver;
+//     return true;
+// }
+
+
+
+// Helper: insert all REAL PDRs from the global catalog into 'snap'
+static inline uint32_t InsertAllRealPdrs(cls_handle_t *snap) {
+    uint32_t inserted = 0;
+    if (!g_all_pdr_list) return 0;
+
+    for (list_node_t *n = g_all_pdr_list->head; n; n = n->next) {
+        UpfPDR *up = (UpfPDR *)n->val;
+        if (!up) continue;
+
+        bool is_uplink = false;
+        if (up->flags.pdi && up->pdi.flags.sourceInterface)
+            is_uplink = (up->pdi.sourceInterface == 0); // 0=ACCESS(UL), 1=CORE(DL)
+
+        pdr_t r = updk_pdr_to_cls_rule(up, is_uplink);
+        r.descriptor = (uintptr_t)up; // pointer cookie to the REAL PDR
+
+        if (unlikely(cls_insert_rule(snap, &r) == 0)) {
+            UTLT_Error("cls_insert_rule failed for real PDR id=%u", (unsigned)up->pdrId);
+            return (uint32_t)-1; // signal error
+        }
+        inserted++;
+    }
+    return inserted;
+}
+
+// Helper: add 10k synthetic rules that do NOT match your real traffic
+static inline uint32_t InsertSyntheticPdrs(cls_handle_t *snap) {
+    if (!g_all_pdr_list || !g_all_pdr_list->head) return 0;
+    UpfPDR *tmpl = (UpfPDR *)g_all_pdr_list->head->val;
+    if (!tmpl) return 0;
+
+    uint32_t inserted = 0;
+    for (uint32_t i = 0; i < (uint32_t)UPF_SYNTH_RULES; ++i) {
+        UpfPDR tmp = *tmpl; // stack copy
+
+        // Direction hint (optional)
+        if (tmp.flags.pdi && tmp.pdi.flags.sourceInterface) {
+            if (UPF_SYNTH_DIR_HINT == 0)       tmp.pdi.sourceInterface = 1;      // DL
+            else if (UPF_SYNTH_DIR_HINT == 1)  tmp.pdi.sourceInterface = 0;      // UL
+            else                                tmp.pdi.sourceInterface = (i & 1) ? 0 : 1;
+        }
+
+        // Make keys unmatchable with live traffic
+        if (tmp.flags.pdi && tmp.pdi.flags.ueIpAddress && tmp.pdi.ueIpAddress.flags.v4) {
+            uint32_t base = (i & 1) ? RTE_IPV4(198,51,100,0) : RTE_IPV4(203,0,113,0);
+            uint32_t ip   = base + ((i % 200) + 1u);
+            tmp.pdi.ueIpAddress.ipv4.s_addr = htonl(ip);
+        } else if (tmp.flags.pdi && tmp.pdi.flags.fTeid) {
+            tmp.pdi.fTeid.teid = (uint32_t)(0xC0FFEE00u ^ i);
+        }
+
+        tmp.pdrId = (uint16_t)(0x8000u | (i & 0x7FFF)); // cosmetic
+
+        bool is_uplink = false;
+        if (tmp.flags.pdi && tmp.pdi.flags.sourceInterface)
+            is_uplink = (tmp.pdi.sourceInterface == 0);
+
+        pdr_t r = updk_pdr_to_cls_rule(&tmp, is_uplink);
+        r.descriptor = (uintptr_t)tmpl; // cookie points to a REAL PDR
+
+        if (unlikely(cls_insert_rule(snap, &r) == 0)) {
+            UTLT_Error("cls_insert_rule failed for synthetic idx=%u", i);
+            return (uint32_t)-1;
+        }
+        inserted++;
+    }
+    return inserted;
+}
+
+
+
 bool UpfClsRebuildAndPublish(uint32_t *out_version) {
     cls_handle_t *snap = cls_create(CLS_SELECTED_BACKEND);
     if (!snap) {
@@ -280,37 +480,97 @@ bool UpfClsRebuildAndPublish(uint32_t *out_version) {
         return false;
     }
 
-    uint32_t inserted = 0;
+    uint32_t rules = 0;  /* total inserted (real + synthetic) */
 
+    uint32_t real_rules_num = 0;
+
+    list_iterator_t *it_tmp = list_iterator_new(g_all_pdr_list, LIST_HEAD);
+    for (list_node_t *n; it_tmp && (n = list_iterator_next(it_tmp)); ) {
+        UpfPDR *up_tmp = (UpfPDR *)n->val;
+        if (!up_tmp) continue;
+        real_rules_num++;
+    }
+
+    UTLT_Info("Real Rules Number: %u", real_rules_num);
+
+    if (it_tmp) list_iterator_destroy(it_tmp);
+
+    /* ---------------- optional: SYNTHETIC FIRST ---------------- */
+#if UPF_SYNTH_ENABLE && (UPF_SYNTH_INSERT_FIRST == 1)
+    
+    if (UPF_SYNTH_RULES > 0 && real_rules_num > 3) {
+        UpfPDR *tmpl = UpfGetTemplatePdr();
+        if (!tmpl) {
+            UTLT_Warning("Synthetic rules requested but no template PDR yet");
+        } else {
+            for (uint32_t i = 0; i < (uint32_t)UPF_SYNTH_RULES; ++i) {
+                UpfPDR tmp = *tmpl;  /* stack copy */
+
+                /* Direction hint */
+                if (tmp.flags.pdi && tmp.pdi.flags.sourceInterface) {
+                    if (UPF_SYNTH_DIR_HINT == 0)       tmp.pdi.sourceInterface = 1;      /* CORE/DL */
+                    else if (UPF_SYNTH_DIR_HINT == 1)  tmp.pdi.sourceInterface = 0;      /* ACCESS/UL */
+                    else                                tmp.pdi.sourceInterface = (uint8_t)((i & 1) ? 0 : 1);
+                }
+
+                /* Make the key UNMATCHABLE with real traffic */
+                if (tmp.flags.pdi && tmp.pdi.flags.ueIpAddress && tmp.pdi.ueIpAddress.flags.v4) {
+                    uint32_t base = (i & 1) ? RTE_IPV4(198,51,100,0) : RTE_IPV4(203,0,113,0);
+                    uint32_t ip   = base + ((i % 200) + 1u);  /* .1..200 */
+                    tmp.pdi.ueIpAddress.ipv4.s_addr = htonl(ip);
+                } else if (tmp.flags.pdi && tmp.pdi.flags.fTeid) {
+                    tmp.pdi.fTeid.teid = (uint32_t)(0xC0FFEE00u ^ i);
+                }
+
+                /* Cosmetic id (not used in datapath) */
+                tmp.pdrId = (uint16_t)(0x8000u | (i & 0x7FFF));
+
+                bool is_uplink = false;
+                if (tmp.flags.pdi && tmp.pdi.flags.sourceInterface)
+                    is_uplink = (tmp.pdi.sourceInterface == 0); /* 0=ACCESS(UL), 1=CORE(DL) */
+
+                pdr_t r = updk_pdr_to_cls_rule(&tmp, is_uplink);
+                r.descriptor = (uintptr_t)tmpl; /* cookie → REAL template PDR */
+
+                if (unlikely(cls_insert_rule(snap, &r) == 0)) {
+                    UTLT_Error("cls_insert_rule failed for synthetic idx=%u", i);
+                    cls_destroy(snap);
+                    return false;
+                }
+                rules++;
+            }
+            UTLT_Info("Synthetic rules: added %u using template PDR id=%u",
+                      (uint32_t)UPF_SYNTH_RULES, (unsigned)tmpl->pdrId);
+        }
+    }
+#endif /* SYNTH FIRST */
+
+    /* ---------------- REAL PDRs INSERTION ---------------- */
     list_iterator_t *it = list_iterator_new(g_all_pdr_list, LIST_HEAD);
     for (list_node_t *n; it && (n = list_iterator_next(it)); ) {
         UpfPDR *up = (UpfPDR *)n->val;
         if (!up) continue;
-
-        bool is_uplink = false;  /* default to downlink / CORE */
-
+        
+        bool is_uplink = false;
         if (up->flags.pdi && up->pdi.flags.sourceInterface) {
             UTLT_Debug("CreatePDR: PDI.SourceInterface IE present, value=%u",
                        up->pdi.sourceInterface);
             switch (up->pdi.sourceInterface) {
-            case 0: /* ACCESS (N3) → Uplink UE→UPF */
-                is_uplink = true;  break;
-            case 1: /* CORE   (N6) → Downlink DN→UE */
-                is_uplink = false; break;
-            default:
-                UTLT_Warning("CreatePDR: unexpected SourceInterface=%u – treating as CORE",
-                             up->pdi.sourceInterface);
-                break;
+                case 0: is_uplink = true;  break; 
+                case 1: is_uplink = false; break;
+                default:
+                    UTLT_Warning("CreatePDR: unexpected SourceInterface=%u – treating as CORE",
+                                up->pdi.sourceInterface);
+                    break;
             }
         } else {
-            /* Spec violation: Source-Interface missing – assume downlink */
             UTLT_Warning("CreatePDR: SourceInterface IE missing – treating as CORE");
         }
 
         pdr_t r = updk_pdr_to_cls_rule(up, is_uplink);
-
-        /* Pointer/descriptor cookie: publish the exact UpfPDR* */
         r.descriptor = (uintptr_t)up;
+
+        UTLT_Info("Rule descriptor=%p", (void*)r.descriptor);
 
         uintptr_t desc = cls_insert_rule(snap, &r);
         if (unlikely(desc == 0)) {
@@ -319,46 +579,39 @@ bool UpfClsRebuildAndPublish(uint32_t *out_version) {
             cls_destroy(snap);
             return false;
         }
+        rules++;
     }
+    if (it) list_iterator_destroy(it);
 
-    if (UPF_SYNTH_ENABLE && UPF_SYNTH_RULES > 0) {
+    /* ---------------- optional: SYNTHETIC LAST ---------------- */
+    //  && (real_rules_num > 3)
+if (UPF_SYNTH_ENABLE && (UPF_SYNTH_INSERT_FIRST == 0) && (real_rules_num > 3)) {
+    if (UPF_SYNTH_RULES > 0) {
         UpfPDR *tmpl = UpfGetTemplatePdr();
         if (!tmpl) {
             UTLT_Warning("Synthetic rules requested but no template PDR yet");
         } else {
             for (uint32_t i = 0; i < (uint32_t)UPF_SYNTH_RULES; ++i) {
-                /* 1) STACK copy of the template */
                 UpfPDR tmp = *tmpl;
 
-                /* 2) Direction hint */
                 if (tmp.flags.pdi && tmp.pdi.flags.sourceInterface) {
-                    if (UPF_SYNTH_DIR_HINT == 0)       tmp.pdi.sourceInterface = 1;         /* CORE/DL */
-                    else if (UPF_SYNTH_DIR_HINT == 1)  tmp.pdi.sourceInterface = 0;         /* ACCESS/UL */
+                    if (UPF_SYNTH_DIR_HINT == 0)       tmp.pdi.sourceInterface = 1;
+                    else if (UPF_SYNTH_DIR_HINT == 1)  tmp.pdi.sourceInterface = 0;
                     else                                tmp.pdi.sourceInterface = (uint8_t)((i & 1) ? 0 : 1);
                 }
-
-                /* 3) Make the key UNMATCHABLE with real traffic */
                 if (tmp.flags.pdi && tmp.pdi.flags.ueIpAddress && tmp.pdi.ueIpAddress.flags.v4) {
-                    /* TEST-NET ranges to avoid collisions with your lab IPs */
                     uint32_t base = (i & 1) ? RTE_IPV4(198,51,100,0) : RTE_IPV4(203,0,113,0);
-                    uint32_t ip   = base + ((i % 200) + 1u);                        /* .1..200 */
+                    uint32_t ip   = base + ((i % 200) + 1u);
                     tmp.pdi.ueIpAddress.ipv4.s_addr = htonl(ip);
                 } else if (tmp.flags.pdi && tmp.pdi.flags.fTeid) {
                     tmp.pdi.fTeid.teid = (uint32_t)(0xC0FFEE00u ^ i);
-                } else {
-                    /* Nothing to vary: leave as-is; still unlikely to collide.
-                    (PDI.SourceInterface should exist; if not, rule stays “exotic”) */
                 }
-
-                /* 4) Cosmetic: harmless synthetic id (not used in datapath) */
                 tmp.pdrId = (uint16_t)(0x8000u | (i & 0x7FFF));
 
-                /* 5) Adapter needs direction for this rule */
                 bool is_uplink = false;
                 if (tmp.flags.pdi && tmp.pdi.flags.sourceInterface)
-                    is_uplink = (tmp.pdi.sourceInterface == 0); /* 0=ACCESS(UL), 1=CORE(DL) */
+                    is_uplink = (tmp.pdi.sourceInterface == 0);
 
-                /* 6) Insert: cookie points to the REAL template PDR (stable in session) */
                 pdr_t r = updk_pdr_to_cls_rule(&tmp, is_uplink);
                 r.descriptor = (uintptr_t)tmpl;
 
@@ -367,33 +620,25 @@ bool UpfClsRebuildAndPublish(uint32_t *out_version) {
                     cls_destroy(snap);
                     return false;
                 }
-                inserted++;
+                rules++;
             }
             UTLT_Info("Synthetic rules: added %u using template PDR id=%u",
-                    (uint32_t)UPF_SYNTH_RULES, (unsigned)tmpl->pdrId);
+                      (uint32_t)UPF_SYNTH_RULES, (unsigned)tmpl->pdrId);
         }
     }
+}
 
-
-    if (it) list_iterator_destroy(it);
-
-    /* Publish with seqlock; version is even & monotonically increasing */
+    /* ---------------- publish & notify ---------------- */
     void    *retired = NULL;
     uint32_t ver     = upf_cls_publish((void *)snap, &retired);
 
-    /* Cache the retired snapshot only if there was one */
     if (retired) {
         __atomic_store_n(&g_cls_retired_snapshot, retired, __ATOMIC_RELEASE);
         __atomic_store_n(&g_cls_retired_version,  ver,     __ATOMIC_RELEASE);
-        // UTLT_Info("CLS publish: new=%p retired=%p ver=%u", snap, retired, ver);
-    } else {
-        // UTLT_Info("CLS publish: new=%p retired=<none> ver=%u", snap, ver);
     }
 
-    /* Notify DP exactly once to flip to this version */
     UpfSendEvt1(UPF_U_SERVICE_ID, EVT_CLS_GC_REQ, (uintptr_t)ver);
-
-    UTLT_Info("CLS publish: ver=%u rules=%u retired=%p", ver, inserted, retired);
+    UTLT_Info("CLS publish: ver=%u rules=%u retired=%p", ver, rules, retired);
 
     if (out_version) *out_version = ver;
     return true;
