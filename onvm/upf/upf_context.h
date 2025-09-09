@@ -140,7 +140,10 @@ typedef struct _UpfSession {
     list_t          *qer_list;
 
     bool srr_flag;
+    bool synth_head_filled;
 } UpfSession;
+
+static uint32_t g_synth_pdr_count = 20000;
 
 UpfContext *Self();
 Status UpfContextInit();

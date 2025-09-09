@@ -32,6 +32,7 @@ static UpfContext self;
 static _Bool upfContextInitialized = 0;
 static uint64_t g_sessionIdPool = 1;
 
+
 UpfContext *Self() {
     return &self;
 }
@@ -161,6 +162,8 @@ Status UpfPDRRegisterToSession(UpfSession *session, UpfPDR *pdr) {
     UTLT_Assert(session->pdr_list, return STATUS_ERROR, "PDR list not initialized");
 
     list_rpush(session->pdr_list, list_node_new(pdr));
+
+    return STATUS_OK;
 }
 
 Status UpfFARRegisterToSession(UpfSession *session, UpfFAR * far) {
@@ -251,6 +254,8 @@ UpfSession *UpfSessionAdd(PfcpUeIpAddr *ueIp,
     // DumpUpfSession();
     //use to check srr flag
     session->srr_flag = false;
+
+    session->synth_head_filled = false;
 
     session->teid = rte_cpu_to_be_32(teid->teid);
     session->pdn.paa.pdnType = pdnType;

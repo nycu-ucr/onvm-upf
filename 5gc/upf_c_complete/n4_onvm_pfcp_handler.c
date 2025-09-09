@@ -22,6 +22,8 @@
 #include <arpa/inet.h>
 #include <net/if.h>
 
+#include <rte_cycles.h>
+
 #include "onvm_nflib.h"
 
 #include "utlt_list.h"
@@ -235,6 +237,94 @@ Status _ConvertCreatePDRTlvToRule(UpfPDR *upfPdr, CreatePDR *createPdr) {
     return STATUS_OK;
 }
 
+
+static inline uint32_t mk_testnet198(uint32_t i) {
+    // 198.18.0.0/15 test net, in network byte order
+    uint32_t a = (198u<<24) | (18u<<16) | ((i>>8)&0xFFu)<<8 | (i & 0xFFu);
+    return htonl(a);
+}
+
+/* static void inject_synth_pdrs_at_head(UpfSession *s, const UpfPDR *tpl, uint32_t n)
+{
+    for (uint32_t i = 0; i < n; i++) {
+        UpfPDR *p = rte_calloc(NULL, 1, sizeof(*p), 0);
+        *p = *tpl;                  // start from template to keep structure sane
+
+        // Give them unique IDs but below 65535
+        p->pdrId = (uint16_t)(50000 + (i % 15000));
+        p->precedence = 1;
+
+        // Make sure they NEVER match in your old scan:
+        p->pdi.flags.sourceInterface = 0;      // <-- scanner ignores if this bit is 0
+        // Also point them away from real UE:
+        p->pdi.flags.ueIpAddress = 1;
+        p->pdi.ueIpAddress.flags.v4 = 1;
+        p->pdi.ueIpAddress.flags.v6 = 0;
+        p->pdi.ueIpAddress.ipv4.s_addr = mk_testnet198(i);
+
+        // Defensive: no actions if they ever matched by mistake
+        p->flags.farId = 0; p->far = NULL;
+        memset(p->qerId, 0, sizeof(p->qerId)); p->qer = NULL;
+
+        // Insert at head so they precede all real PDRs
+        list_lpush(s->pdr_list, list_node_new(p));
+    }
+    UTLT_Info("Synthetic PDRs: inserted %u at head for session %lu",
+              n, (unsigned long)s->smfSeid);
+} */
+
+static void inject_synth_pdrs_at_head(UpfSession *s, const UpfPDR *tpl, uint32_t n)
+{
+    uint64_t total_cyc = 0;
+    uint32_t inserted  = 0;
+
+    for (uint32_t i = 0; i < n; i++) {
+        UpfPDR *p = rte_calloc(NULL, 1, sizeof(*p), 0);
+        if (!p) break;
+        *p = *tpl;  // template keeps structure sane
+
+        // Give them unique IDs but below 65535
+        p->pdrId = (uint16_t)(50000 + (i % 15000));
+        p->precedence = 1;
+
+        // Make sure they NEVER match in the old scan:
+        p->pdi.flags.sourceInterface = 0;  // scanner ignores if this bit is 0
+        p->pdi.flags.ueIpAddress = 1;
+        p->pdi.ueIpAddress.flags.v4 = 1;
+        p->pdi.ueIpAddress.flags.v6 = 0;
+        p->pdi.ueIpAddress.ipv4.s_addr = mk_testnet198(i);
+
+        // Defensive: no actions if they ever matched by mistake
+        p->flags.farId = 0; p->far = NULL;
+        memset(p->qerId, 0, sizeof(p->qerId)); p->qer = NULL;
+
+        // --- measure linked-list insertion (node alloc + push-at-head) ---
+        uint64_t t0 = rte_rdtsc_precise();
+
+        list_node_t *node = list_node_new(p);
+        if (!node) { rte_free(p); continue; }
+        list_lpush(s->pdr_list, node);
+
+        uint64_t t1 = rte_rdtsc_precise();
+        total_cyc += (t1 - t0);
+        inserted++;
+        // --- end measurement ---
+    }
+
+    if (inserted) {
+        double hz = (double)rte_get_tsc_hz();
+        double avg_cyc = (double)total_cyc / (double)inserted;
+        double avg_ns  = (avg_cyc * 1e9) / hz;
+        UTLT_Info("[LL-INSERT] head: inserted=%u avg=%.0f cycles (%.2f ns) per insert",
+                  inserted, avg_cyc, avg_ns);
+    }
+
+    UTLT_Info("Synthetic PDRs: inserted %u at head for session %lu",
+              inserted, (unsigned long)s->smfSeid);
+}
+
+
+
 Status UpfN4HandleCreatePdr(UpfSession *session, CreatePDR *createPdr) {
     UTLT_Debug("Handle Create PDR");
 
@@ -257,6 +347,11 @@ Status UpfN4HandleCreatePdr(UpfSession *session, CreatePDR *createPdr) {
     UTLT_Assert(_ConvertCreatePDRTlvToRule(upfPdr, createPdr) == STATUS_OK,
         return STATUS_ERROR, "Convert PDR TLV To Rule is failed");
 
+    if (!session->synth_head_filled && g_synth_pdr_count) {
+        inject_synth_pdrs_at_head(session, upfPdr, g_synth_pdr_count);
+        session->synth_head_filled = true;
+    }
+
     if (upfPdr->flags.farId) {
         upfPdr->far = UpfFARFindByID(session, upfPdr->farId);
         UTLT_Assert(upfPdr->far, rte_free(upfPdr); return STATUS_ERROR, "FAR ID[%u] does NOT exist in UPF Context", upfPdr->farId);
@@ -277,9 +372,59 @@ Status UpfN4HandleCreatePdr(UpfSession *session, CreatePDR *createPdr) {
     }
 
     // Register PDR to Session
-    UTLT_Assert(UpfPDRRegisterToSession(session, upfPdr),
-                return STATUS_ERROR,
-                "UpfPDRRegisterToSession failed");
+    UTLT_Assert(UpfPDRRegisterToSession(session, upfPdr) == STATUS_OK,
+            rte_free(upfPdr); return STATUS_ERROR,
+            "UpfPDRRegisterToSession failed");
+
+    {
+        // remember which sessions we've already dumped
+        static UpfSession *seen[1024];
+        static int nseen = 0;
+
+        int already = 0;
+        for (int i = 0; i < nseen; ++i) {
+            if (seen[i] == session) { already = 1; break; }
+        }
+        if (!already) {
+            if (nseen < (int)(sizeof(seen)/sizeof(seen[0]))) seen[nseen++] = session;
+
+            UTLT_Info("[PDR-DUMP] session=%lu list_len=%u — first 10 from head:",
+                    (unsigned long)session->smfSeid,
+                    (unsigned)(session->pdr_list ? session->pdr_list->len : 0));
+
+            #include <rte_byteorder.h>
+            char ue[16];
+            int i = 0;
+            for (list_node_t *node = session->pdr_list ? session->pdr_list->head : NULL;
+                node && i < 10; node = node->next, ++i) {
+
+                const UpfPDR *p = (const UpfPDR *)node->val;
+
+                ue[0] = '-'; ue[1] = '\0';
+                if (p->pdi.flags.ueIpAddress && p->pdi.ueIpAddress.flags.v4) {
+                    uint32_t a = rte_be_to_cpu_32(p->pdi.ueIpAddress.ipv4.s_addr);
+                    snprintf(ue, sizeof ue, "%u.%u.%u.%u",
+                            (a>>24)&0xFF, (a>>16)&0xFF, (a>>8)&0xFF, a&0xFF);
+                }
+
+                const char *fd = (p->pdi.sdfFilter.flowDescription &&
+                                p->pdi.sdfFilter.flowDescription[0])
+                                ? p->pdi.sdfFilter.flowDescription : "-";
+
+                UTLT_Info("[PDR %02d] id=%u prec=%u srcIf=%s(%u) UE=%s teid=%u fd=\"%s\"",
+                        i,
+                        (unsigned)p->pdrId,
+                        (unsigned)p->precedence,
+                        p->pdi.flags.sourceInterface ? (p->pdi.sourceInterface==0?"Access":"Core") : "-",
+                        p->pdi.flags.sourceInterface ? (unsigned)p->pdi.sourceInterface : 255u,
+                        ue,
+                        (unsigned)(p->pdi.flags.fTeid ? p->pdi.fTeid.teid : 0u),
+                        fd);
+            }
+        }
+    }
+
+
     return STATUS_OK;
 }
 

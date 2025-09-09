@@ -68,6 +68,28 @@ static struct rte_ether_addr dn_eth;
 static struct rte_ether_addr cn_dn_eth;
 static struct rte_ether_addr cn_ue_eth;
 
+static double lat_buf[100];
+static int lat_count = 0;
+
+static inline double cycles_to_us(uint64_t cyc) {
+    const double hz = (double)rte_get_tsc_hz();
+    return (cyc * 1e6) / hz;
+}
+
+static inline void record_latency(double us) {
+    lat_buf[lat_count++] = us;
+    if (lat_count >= 100) {
+        double sum = 0.0;
+        for (int i = 0; i < 100; i++) {
+            printf("%2d: %.2f us, ", i, lat_buf[i]);
+            sum += lat_buf[i];
+        }
+        double avg = sum / 100.0;
+        printf("\n---- LL-BENCH ----\nAverage latency: %.2f us\n------------------\n", avg);
+        lat_count = 0;
+    }
+}
+
 uint8_t DnMac[RTE_ETHER_ADDR_LEN];
 uint8_t AnMac[RTE_ETHER_ADDR_LEN];
 int SELF_IP;
@@ -476,6 +498,10 @@ GetPdrByUeIpAddress(struct rte_mbuf *pkt, uint32_t ue_ip) { // dl
     UpfPDR *pdr = NULL, *target_pdr = NULL;
     struct rte_ipv4_hdr *iph = NULL;
     uint32_t prefix_len = 0, fd_target = 0;
+
+    /* START timing: linked-list classification path */
+    uint64_t t0 = rte_rdtsc_precise();
+
     while (node) {
         pdr = (UpfPDR *)node->val;
         node = node->next;
@@ -506,7 +532,11 @@ GetPdrByUeIpAddress(struct rte_mbuf *pkt, uint32_t ue_ip) { // dl
         }
     }
     pdr = target_pdr;
+
     if (pdr) {
+        uint64_t t1 = rte_rdtsc_precise();
+        record_latency(cycles_to_us(t1 - t0));
+        /* END timing */
         seid = session->smfSeid;
         pdrId = pdr->pdrId;
         for (int i=0; i<2; i++){
@@ -604,6 +634,11 @@ GetPdrByTeid(struct rte_mbuf *pkt, uint32_t td) {
     UpfPDR *pdr = NULL, *target_pdr = NULL;
     struct rte_ipv4_hdr *iph = NULL;
     uint32_t prefix_len = 0, fd_target = 0;
+
+     /* START timing: linked-list classification path */
+    uint64_t t0 = rte_rdtsc_precise();
+
+
     while (node) {
         pdr = (UpfPDR *)node->val;
         node = node->next;
@@ -634,7 +669,12 @@ GetPdrByTeid(struct rte_mbuf *pkt, uint32_t td) {
         }
     }
     pdr = target_pdr;
+
     if (pdr) {
+
+        uint64_t t1 = rte_rdtsc_precise();
+        record_latency(cycles_to_us(t1 - t0));
+
         seid = session->smfSeid;
         pdrId = pdr->pdrId;
         for (int i=0; i<2; i++){
