@@ -309,15 +309,25 @@ static void inject_synth_pdrs_at_head(UpfSession *s, const UpfPDR *tpl, uint32_t
         total_cyc += (t1 - t0);
         inserted++;
         // --- end measurement ---
+
+        if (inserted && inserted%100 == 0) {
+            double hz = (double)rte_get_tsc_hz();
+            double avg_cyc = (double)total_cyc / (double)100;
+            double avg_ns  = (avg_cyc * 1e9) / hz;
+            UTLT_Info("[LL-INSERT] head: inserted=%u avg=%.0f cycles (%.2f ns) per insert",
+                    inserted, avg_cyc, avg_ns);
+            total_cyc = 0;
+        }
+
     }
 
-    if (inserted) {
+    /* if (inserted) {
         double hz = (double)rte_get_tsc_hz();
         double avg_cyc = (double)total_cyc / (double)inserted;
         double avg_ns  = (avg_cyc * 1e9) / hz;
         UTLT_Info("[LL-INSERT] head: inserted=%u avg=%.0f cycles (%.2f ns) per insert",
                   inserted, avg_cyc, avg_ns);
-    }
+    } */
 
     UTLT_Info("Synthetic PDRs: inserted %u at head for session %lu",
               inserted, (unsigned long)s->smfSeid);
