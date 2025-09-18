@@ -33,6 +33,12 @@
 #include <time.h>
 #include <unistd.h>
 
+#include <ctype.h>
+#include <rte_byteorder.h>
+#include <rte_udp.h>
+#include <rte_tcp.h>
+
+
 #include "gtp.h"
 #include "upf_context.h"
 
@@ -93,7 +99,7 @@ static inline void record_latency(double us) {
 
 /* Non-destructive token extractor: copies the token that follows `tok`
  * (e.g., "from " or "to ") into out[], returns true if found. */
-static inline bool parse_fd_tok(const char *fd, const char *tok,
+/* static inline bool parse_fd_tok(const char *fd, const char *tok,
                                 char *out, size_t out_sz) {
     const char *p, *e;
     size_t n;
@@ -103,14 +109,91 @@ static inline bool parse_fd_tok(const char *fd, const char *tok,
     p = strstr(fd, tok);
     if (!p) return false;
 
-    p += strlen(tok);                /* start of value */
-    e = strchr(p, ' ');              /* end at next space (or end of string) */
+    p += strlen(tok);                //start of value 
+    e = strchr(p, ' ');              // end at next space (or end of string) 
     n = e ? (size_t)(e - p) : strnlen(p, out_sz - 1);
     if (n >= out_sz) n = out_sz - 1;
 
     memcpy(out, p, n);
     out[n] = '\0';
     return true;
+} */
+
+
+/* Non-destructive token extractor: copies the token payload into out (NUL-terminated).
+   Returns 1 if found, 0 otherwise. */
+static int fd_copy_tok(const char *fd, const char *tok, char *out, size_t out_sz) {
+    if (!fd || !*fd || !tok || !*tok || out_sz == 0) return 0;
+    const char *p = strstr(fd, tok);
+    if (!p) return 0;
+    p += strlen(tok);
+    const char *e = strchr(p, ' ');
+    size_t n = e ? (size_t)(e - p) : strnlen(p, out_sz - 1);
+    if (n >= out_sz) n = out_sz - 1;
+    memcpy(out, p, n); out[n] = '\0';
+    return 1;
+}
+
+static int fd_contains_word(const char *fd, const char *w) {
+    if (!fd || !*fd) return 0;
+    return strstr(fd, w) != NULL; /* cheap heuristic */
+}
+
+static int fd_parse_port_range(const char *fd, const char *tok, uint16_t *lo, uint16_t *hi) {
+    char buf[32];
+    if (!fd_copy_tok(fd, tok, buf, sizeof buf)) return 0;
+    /* formats: "443" or "1000:2000" */
+    char *colon = strchr(buf, ':');
+    if (!colon) {
+        long v = strtol(buf, NULL, 10);
+        if (v < 0 || v > 65535) return 0;
+        *lo = *hi = (uint16_t)v;
+        return 1;
+    } else {
+        *colon = '\0';
+        long a = strtol(buf, NULL, 10);
+        long b = strtol(colon + 1, NULL, 10);
+        if (a < 0 || a > 65535 || b < 0 || b > 65535 || a > b) return 0;
+        *lo = (uint16_t)a; *hi = (uint16_t)b;
+        return 1;
+    }
+}
+
+static inline uint16_t pkt_l4_sport(const struct rte_mbuf *m, const struct rte_ipv4_hdr *iph) {
+    if (!iph) return 0;
+    const uint8_t proto = iph->next_proto_id;
+    if (proto == IPPROTO_TCP) {
+        const struct rte_tcp_hdr *th = (const struct rte_tcp_hdr *)
+            ((const uint8_t *)iph + sizeof(*iph));
+        return rte_be_to_cpu_16(th->src_port);
+    } else if (proto == IPPROTO_UDP) {
+        const struct rte_udp_hdr *uh = (const struct rte_udp_hdr *)
+            ((const uint8_t *)iph + sizeof(*iph));
+        return rte_be_to_cpu_16(uh->src_port);
+    }
+    return 0;
+}
+
+static inline uint16_t pkt_l4_dport(const struct rte_mbuf *m, const struct rte_ipv4_hdr *iph) {
+    if (!iph) return 0;
+    const uint8_t proto = iph->next_proto_id;
+    if (proto == IPPROTO_TCP) {
+        const struct rte_tcp_hdr *th = (const struct rte_tcp_hdr *)
+            ((const uint8_t *)iph + sizeof(*iph));
+        return rte_be_to_cpu_16(th->dst_port);
+    } else if (proto == IPPROTO_UDP) {
+        const struct rte_udp_hdr *uh = (const struct rte_udp_hdr *)
+            ((const uint8_t *)iph + sizeof(*iph));
+        return rte_be_to_cpu_16(uh->dst_port);
+    }
+    return 0;
+}
+
+/* ToS/TTC match: if you encode TTC as (mask<<8 | value), honor mask; else exact. */
+static int ttc_match(uint16_t ttc, uint8_t ip_tos) {
+    uint8_t val = (uint8_t)(ttc & 0xFF);
+    uint8_t msk = (uint8_t)((ttc >> 8) & 0xFF);
+    return msk ? ((ip_tos & msk) == (val & msk)) : (ip_tos == val);
 }
 
 
@@ -573,6 +656,9 @@ GetPdrByUeIpAddress(struct rte_mbuf *pkt, uint32_t ue_ip) { // dl
 
         /* must have PDI + sourceInterface; port must match */
         if (!p->flags.pdi || !p->pdi.flags.sourceInterface) continue;
+
+        //UTLT_Info("PKT Port: %d sourceInterface: %d", pkt_port, SourceInterfaceToPort(p->pdi.sourceInterface));
+
         if (SourceInterfaceToPort(p->pdi.sourceInterface) != pkt_port) continue;
 
         if (!fallback) fallback = p;
@@ -781,7 +867,10 @@ GetPdrByTeid(struct rte_mbuf *pkt, uint32_t td) {
         node = node->next;
 
         /* must have PDI + sourceInterface; port must match */
-        if (!p->flags.pdi || !p->pdi.flags.sourceInterface) continue;
+        //if (!p->flags.pdi || !p->pdi.flags.sourceInterface) continue;
+
+        // UTLT_Info("PKT Port: %d sourceInterface: %d", pkt_port, SourceInterfaceToPort(p->pdi.sourceInterface));
+
         if (SourceInterfaceToPort(p->pdi.sourceInterface) != pkt_port) continue;
 
         if (!fallback) fallback = p;
@@ -1261,7 +1350,7 @@ main(int argc, char *argv[]) {
     struct onvm_nf_local_ctx *nf_local_ctx;
     struct onvm_nf_function_table *nf_function_table;
     // UTLT_SetLogLevel("Panic"); // to eliminate log print influenced jitter
-    UTLT_SetLogLevel("warning"); // to eliminate log print influenced jitter
+    UTLT_SetLogLevel("debug"); // to eliminate log print influenced jitter
 
     nf_local_ctx = onvm_nflib_init_nf_local_ctx();
     onvm_nflib_start_signal_handler(nf_local_ctx, NULL);
