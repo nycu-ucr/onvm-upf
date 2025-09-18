@@ -496,13 +496,13 @@ GetPdrByUeIpAddress(struct rte_mbuf *pkt, uint32_t ue_ip) { // dl
 
     list_node_t *node = session->pdr_list->head;
     UpfPDR *pdr = NULL, *target_pdr = NULL;
-    struct rte_ipv4_hdr *iph = NULL;
+    // struct rte_ipv4_hdr *iph = NULL;
     uint32_t prefix_len = 0, fd_target = 0;
 
     /* START timing: linked-list classification path */
     uint64_t t0 = rte_rdtsc_precise();
 
-    while (node) {
+    /* while (node) {
         pdr = (UpfPDR *)node->val;
         node = node->next;
         if (pdr->flags.pdi) {
@@ -531,7 +531,93 @@ GetPdrByUeIpAddress(struct rte_mbuf *pkt, uint32_t ue_ip) { // dl
             }
         }
     }
+    pdr = target_pdr; */
+
+    /* cache packet header once */
+    struct rte_ipv4_hdr *iph = onvm_pkt_ipv4_hdr(pkt);
+    uint8_t ip_proto = iph ? iph->next_proto_id : 0;
+    uint8_t ip_tos   = iph ? iph->type_of_service : 0;
+    const int pkt_port = pkt->port;
+
+    UpfPDR *best = NULL;         /* best full match by precedence */
+    uint32_t best_prec = 0;
+    UpfPDR *fallback = NULL;     /* first iface-hit if no full match */
+
+    /* non-destructive token copy helper */
+    char tokbuf[64];
+    auto copy_tok = [&](const char *fd, const char *tok) -> const char * {
+        tokbuf[0] = '\0';
+        if (!fd || !*fd) return NULL;
+        const char *p = strstr(fd, tok);
+        if (!p) return NULL;
+        p += strlen(tok);
+        const char *e = strchr(p, ' ');
+        size_t n = e ? (size_t)(e - p) : strnlen(p, sizeof(tokbuf)-1);
+        if (n > sizeof(tokbuf)-1) n = sizeof(tokbuf)-1;
+        memcpy(tokbuf, p, n); tokbuf[n] = '\0';
+        return tokbuf;
+    };
+
+    while (node) {
+        UpfPDR *p = (UpfPDR *)node->val;
+        node = node->next;
+
+        /* must have PDI + sourceInterface; port must match */
+        if (!p->flags.pdi || !p->pdi.flags.sourceInterface) continue;
+        if (SourceInterfaceToPort(p->pdi.sourceInterface) != pkt_port) continue;
+
+        /* remember first iface-hit as fallback */
+        if (!fallback) fallback = p;
+
+        bool full = true;
+
+        /* UE IP check (DL: UE is dst unless sd==0 says source) */
+        if (full && p->pdi.flags.ueIpAddress && p->pdi.ueIpAddress.flags.v4 && iph) {  /* UE IP flags exist. */
+            /* sd bit: 0 => UE is Source, 1 => UE is Destination. */
+            uint8_t sd = p->pdi.ueIpAddress.flags.sd;                                   /* sd defined in struct. */
+            uint32_t ue_be = p->pdi.ueIpAddress.ipv4.s_addr;                            /* UE IPv4 in BE. */
+            uint32_t pkt_ue_be = sd ? iph->dst_addr : iph->src_addr;
+            if (pkt_ue_be != ue_be) full = false;
+        }
+
+        /* SDF Flow Description: 'from' and 'to' */
+        if (full && p->pdi.flags.sdfFilter && p->pdi.sdfFilter.flags.fd && iph) {
+            const char *fd = p->pdi.sdfFilter.flowDescription;
+            const char *from = copy_tok(fd, "from ");
+            const char *to   = copy_tok(fd, "to ");
+            if (from && strcmp(from, "any") != 0) {
+                uint32_t pre=0, want = charStr2MaskedIP((char*)from, &pre);
+                if (IP_MASKED(iph->src_addr, pre) != want) full = false;
+            }
+            if (full && to && strcmp(to, "any") != 0) {
+                uint32_t pre=0, want = charStr2MaskedIP((char*)to, &pre);
+                if (IP_MASKED(iph->dst_addr, pre) != want) full = false;
+            }
+
+            /* proto hint if present in fd */
+            if (full) {
+                if (strstr(fd, "tcp") && ip_proto != IPPROTO_TCP) full = false;
+                if (strstr(fd, "udp") && ip_proto != IPPROTO_UDP) full = false;
+            }
+        }
+
+        /* ToS/DSCP (exact compare; adjust if you use mask|val convention) */
+        if (full && p->pdi.flags.sdfFilter && p->pdi.sdfFilter.flags.ttc && iph) {
+            uint16_t ttc = p->pdi.sdfFilter.tosTrafficClass;
+            if ((uint8_t)ttc != ip_tos) full = false;
+        }
+
+        if (full) {
+            if (!best || p->precedence > best_prec) {
+                best = p; best_prec = p->precedence;
+            }
+        }
+    }
+
+    /* choose best full match, else iface fallback (keeps original behavior) */
+    target_pdr = best ? best : fallback;
     pdr = target_pdr;
+
 
     if (pdr) {
         uint64_t t1 = rte_rdtsc_precise();
@@ -632,14 +718,14 @@ GetPdrByTeid(struct rte_mbuf *pkt, uint32_t td) {
 
     list_node_t *node = session->pdr_list->head;
     UpfPDR *pdr = NULL, *target_pdr = NULL;
-    struct rte_ipv4_hdr *iph = NULL;
+    // struct rte_ipv4_hdr *iph = NULL;
     uint32_t prefix_len = 0, fd_target = 0;
 
      /* START timing: linked-list classification path */
     uint64_t t0 = rte_rdtsc_precise();
 
 
-    while (node) {
+    /* while (node) {
         pdr = (UpfPDR *)node->val;
         node = node->next;
         if (pdr->flags.pdi) {
@@ -668,7 +754,95 @@ GetPdrByTeid(struct rte_mbuf *pkt, uint32_t td) {
             }
         }
     }
+    pdr = target_pdr; */
+
+    /* cache packet header once */
+    struct rte_ipv4_hdr *iph = onvm_pkt_ipv4_hdr(pkt);
+    uint8_t ip_proto = iph ? iph->next_proto_id : 0;
+    uint8_t ip_tos   = iph ? iph->type_of_service : 0;
+    const int pkt_port = pkt->port;
+
+    UpfPDR *best = NULL;         /* best full match by precedence */
+    uint32_t best_prec = 0;
+    UpfPDR *fallback = NULL;     /* first iface-hit if no full match */
+
+    char tokbuf[64];
+    auto copy_tok = [&](const char *fd, const char *tok) -> const char * {
+        tokbuf[0] = '\0';
+        if (!fd || !*fd) return NULL;
+        const char *p = strstr(fd, tok);
+        if (!p) return NULL;
+        p += strlen(tok);
+        const char *e = strchr(p, ' ');
+        size_t n = e ? (size_t)(e - p) : strnlen(p, sizeof(tokbuf)-1);
+        if (n > sizeof(tokbuf)-1) n = sizeof(tokbuf)-1;
+        memcpy(tokbuf, p, n); tokbuf[n] = '\0';
+        return tokbuf;
+    };
+
+    while (node) {
+        UpfPDR *p = (UpfPDR *)node->val;
+        node = node->next;
+
+        /* must have PDI + sourceInterface; port must match */
+        if (!p->flags.pdi || !p->pdi.flags.sourceInterface) continue;
+        if (SourceInterfaceToPort(p->pdi.sourceInterface) != pkt_port) continue;
+
+        /* remember first iface-hit as fallback */
+        if (!fallback) fallback = p;
+
+        bool full = true;
+
+        /* TEID equality when present (UL tunnel) */
+        if (full && p->pdi.flags.fTeid) {
+            if (p->pdi.fTeid.teid != td) full = false;
+        }
+
+        /* UE IP side (UL: UE is src unless sd==1 says dest) */
+        if (full && p->pdi.flags.ueIpAddress && p->pdi.ueIpAddress.flags.v4 && iph) {
+            uint8_t sd = p->pdi.ueIpAddress.flags.sd;
+            uint32_t ue_be = p->pdi.ueIpAddress.ipv4.s_addr;
+            uint32_t pkt_ue_be = sd ? iph->dst_addr : iph->src_addr;
+            if (pkt_ue_be != ue_be) full = false;
+        }
+
+        /* SDF Flow Description: 'from' and 'to' */
+        if (full && p->pdi.flags.sdfFilter && p->pdi.sdfFilter.flags.fd && iph) {
+            const char *fd = p->pdi.sdfFilter.flowDescription;
+            const char *from = copy_tok(fd, "from ");
+            const char *to   = copy_tok(fd, "to ");
+            if (from && strcmp(from, "any") != 0) {
+                uint32_t pre=0, want = charStr2MaskedIP((char*)from, &pre);
+                if (IP_MASKED(iph->src_addr, pre) != want) full = false;
+            }
+            if (full && to && strcmp(to, "any") != 0) {
+                uint32_t pre=0, want = charStr2MaskedIP((char*)to, &pre);
+                if (IP_MASKED(iph->dst_addr, pre) != want) full = false;
+            }
+
+            if (full) {
+                if (strstr(fd, "tcp") && ip_proto != IPPROTO_TCP) full = false;
+                if (strstr(fd, "udp") && ip_proto != IPPROTO_UDP) full = false;
+            }
+        }
+
+        /* ToS/DSCP (exact compare; adjust if you encode mask|val) */
+        if (full && p->pdi.flags.sdfFilter && p->pdi.sdfFilter.flags.ttc && iph) {
+            uint16_t ttc = p->pdi.sdfFilter.tosTrafficClass;
+            if ((uint8_t)ttc != ip_tos) full = false;
+        }
+
+        if (full) {
+            if (!best || p->precedence > best_prec) {
+                best = p; best_prec = p->precedence;
+            }
+        }
+    }
+
+    /* choose best full match, else iface fallback */
+    target_pdr = best ? best : fallback;
     pdr = target_pdr;
+
 
     if (pdr) {
 
