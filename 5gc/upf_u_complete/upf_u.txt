@@ -4,3 +4,5 @@
 3c:fd:fe:ac:fb:0c
 # UPF ID Address
 192.168.1.2
+ACCESS_PORT=1
+CORE_PORT=0
