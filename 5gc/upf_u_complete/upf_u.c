@@ -181,7 +181,7 @@ parseMAC(const char *config_path) {
 
     fclose(file);
 
-    UTLT_Info("UPF port map (from upf_u.txt): ACCESS=%d CORE=%d SGI=%d",
+    UTLT_Debug("UPF port map (from upf_u.txt): ACCESS=%d CORE=%d SGI=%d",
               g_access_port, g_core_port, g_sgi_port);
 }
 
