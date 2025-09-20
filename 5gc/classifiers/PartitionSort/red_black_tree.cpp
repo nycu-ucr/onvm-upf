@@ -365,8 +365,10 @@ rb_red_blk_node * RBTreeInsertWithPathCompression(rb_red_blk_tree* tree, const s
 	rb_red_blk_node * y;
 	rb_red_blk_node * x;
 	rb_red_blk_node * newNode;
-	
-	if (level == fieldOrder.size()) {  
+
+	const int fieldOrderSize = (int)fieldOrder.size();
+
+	if (level == fieldOrderSize) {
 		tree->count++;
 		tree->PushMatch(priority, descriptor);   
 		return nullptr;
@@ -377,7 +379,7 @@ rb_red_blk_node * RBTreeInsertWithPathCompression(rb_red_blk_tree* tree, const s
 		tree->count++;
 		tree->PushMatch(priority, descriptor);
 		//level <= b.size() -1 
-		for (size_t i = level; i < fieldOrder.size(); i++)  
+		for (size_t i = level; i < fieldOrderSize; i++)
 			tree->chain_boxes.push_back(key[fieldOrder[i]]);
 		return nullptr;
 	}
@@ -385,7 +387,8 @@ rb_red_blk_node * RBTreeInsertWithPathCompression(rb_red_blk_tree* tree, const s
 		//path compression
 		auto temp_chain_boxes = tree->chain_boxes;
 		int xpriority =  tree->GetMaxPriority();
-		
+		uintptr_t xdesc = tree->GetMaxDescriptor();
+
 		//  tree->pq = std::priority_queue<int>();
 		tree->count++;
 		//  tree->PushPriority(priority);
@@ -408,14 +411,14 @@ rb_red_blk_node * RBTreeInsertWithPathCompression(rb_red_blk_tree* tree, const s
 
 		//unzipping the next level 
 
-		std::vector<int> naturalFieldOrder(fieldOrder.size());
+		std::vector<int> naturalFieldOrder(fieldOrderSize);
 		std::iota(begin(naturalFieldOrder), end(naturalFieldOrder), 0);
 		size_t run = 0; 
 		if (temp_chain_boxes[run][0] == key[fieldOrder[level + run]][0] && temp_chain_boxes[run][1] == key[fieldOrder[level + run]][1]) {
 			//  printf("[%u %u] vs. [%u %u]\n", temp_chain_boxes[run][0], temp_chain_boxes[run][1], key[fieldOrder[level + run]][0], key[fieldOrder[level + run]][1]);
 		
-			x = RBTreeInsert(tree, key, level + run++, fieldOrder, xpriority, descriptor);
-			if (level + run < fieldOrder.size()) {
+			x = RBTreeInsert(tree, key, level + run++, fieldOrder, xpriority, xdesc);
+			if (level + run < fieldOrderSize) {
 				while ((temp_chain_boxes[run][0] == key[fieldOrder[level + run]][0] && temp_chain_boxes[run][1] == key[fieldOrder[level + run]][1])) {
 
 					x->rb_tree_next_level = RBTreeCreate();
@@ -429,15 +432,15 @@ rb_red_blk_node * RBTreeInsertWithPathCompression(rb_red_blk_tree* tree, const s
 					run++;
 
 
-					if (level + run >= fieldOrder.size()) break;
+					if (level + run >= fieldOrderSize) break;
 				}
 			}
-			if (level + run >= fieldOrder.size()) {
+			if (level + run >= fieldOrderSize) {
 				x->rb_tree_next_level = RBTreeCreate(); 
 				x->rb_tree_next_level->count++;
 				x->rb_tree_next_level->PushMatch(priority, descriptor);
 				x->rb_tree_next_level->count++;
-				x->rb_tree_next_level->PushMatch(xpriority, descriptor);
+				x->rb_tree_next_level->PushMatch(xpriority, xdesc);
 			} else if (!(temp_chain_boxes[run][0] == key[fieldOrder[level + run]][0] && temp_chain_boxes[run][1] == key[fieldOrder[level + run]][1])) {
 				if (IsIntersect(temp_chain_boxes[run][0], temp_chain_boxes[run][1], key[fieldOrder[level + run]][0], key[fieldOrder[level + run]][1])) {
 					printf("Warning not intersect?\n");
@@ -462,14 +465,14 @@ rb_red_blk_node * RBTreeInsertWithPathCompression(rb_red_blk_tree* tree, const s
 					t.insert(end(t), begin(cb), end(cb));
 					return t;
 				};
-				auto z1 = RBTreeInsert(x->rb_tree_next_level, PrependChainbox(temp_chain_boxes, level), level + run, naturalFieldOrder, xpriority, descriptor); 
+				auto z1 = RBTreeInsert(x->rb_tree_next_level, PrependChainbox(temp_chain_boxes, level), level + run, naturalFieldOrder, xpriority, xdesc);
 				auto z2 = RBTreeInsert(x->rb_tree_next_level, key, level + run, fieldOrder, priority, descriptor); 
 
 				x->rb_tree_next_level->count = 2;
 
 				z1->rb_tree_next_level = RBTreeCreate(); 
 				z2->rb_tree_next_level = RBTreeCreate(); 
-				RBTreeInsertWithPathCompression(z1->rb_tree_next_level, PrependChainbox(temp_chain_boxes, level), level + run + 1, naturalFieldOrder, xpriority, descriptor);
+				RBTreeInsertWithPathCompression(z1->rb_tree_next_level, PrependChainbox(temp_chain_boxes, level), level + run + 1, naturalFieldOrder, xpriority, xdesc);
 				RBTreeInsertWithPathCompression(z2->rb_tree_next_level, key, level + run + 1, fieldOrder, priority, descriptor);
 
 			}
@@ -482,14 +485,14 @@ rb_red_blk_node * RBTreeInsertWithPathCompression(rb_red_blk_tree* tree, const s
 				return t;
 			};
 
-			auto z1 = RBTreeInsert(tree, PrependChainbox(temp_chain_boxes, level), level + run, naturalFieldOrder, xpriority, descriptor);
+			auto z1 = RBTreeInsert(tree, PrependChainbox(temp_chain_boxes, level), level + run, naturalFieldOrder, xpriority, xdesc);
 			auto z2 = RBTreeInsert(tree, key, level + run, fieldOrder, priority, descriptor);
 			tree->count = 2;
 
 			z1->rb_tree_next_level = RBTreeCreate(); 
 			z2->rb_tree_next_level = RBTreeCreate();
 
-			RBTreeInsertWithPathCompression(z1->rb_tree_next_level, PrependChainbox(temp_chain_boxes, level), level + run + 1, naturalFieldOrder, xpriority, descriptor);
+			RBTreeInsertWithPathCompression(z1->rb_tree_next_level, PrependChainbox(temp_chain_boxes, level), level + run + 1, naturalFieldOrder, xpriority, xdesc);
 			RBTreeInsertWithPathCompression(z2->rb_tree_next_level, key, level + run + 1, fieldOrder, priority, descriptor);
 
 		}
@@ -884,14 +887,15 @@ void RBTreePrint(rb_red_blk_tree* tree) {
 int RBExactQuery( rb_red_blk_tree*  tree, const Packet& q,int level, const std::vector<int>& fieldOrder) {
 
 	//printf("entering level %d - tree->GetMaxPriority =%d\n", level,tree->GetMaxPriority());
+	const int fieldOrderSize = (int)fieldOrder.size();
 
   //check if singleton
-	if (level == fieldOrder.size()) {
+	if (level == fieldOrderSize) {
 		return tree->GetMaxPriority();
 	}
   else if (tree->count == 1) {  
 	//  auto chain_boxes = tree->chain_boxes; 
-	  for (size_t i = level; i < fieldOrder.size(); i++) { 
+	  for (size_t i = level; i < fieldOrderSize; i++) {
 		  if (q[fieldOrder[i]] < tree->chain_boxes[i - level][0]) return -1;
 		  if (q[fieldOrder[i]] > tree->chain_boxes[i - level][1]) return -1;
 	  }
@@ -924,14 +928,15 @@ int RBExactQueryIterative(rb_red_blk_tree*  tree, const Packet& q, const std::ve
 	 
 	int level = 0;
 	int compVal;
-	while (true) { 
+	const int fieldOrderSize = (int)fieldOrder.size();
+	while (true) {
 		//check if singleton 
-		if (level == fieldOrder.size()) {
+		if (level == fieldOrderSize) {
 			return tree->GetMaxPriority();
 			//return tree->GetMaxMatch();
 		} else if (tree->count == 1) {
 			//  auto chain_boxes = tree->chain_boxes; 
-			for (size_t i = level; i < fieldOrder.size(); i++) {
+			for (size_t i = level; i < fieldOrderSize; i++) {
 				if (q[fieldOrder[i]] < tree->chain_boxes[i - level][0]) return -1;
 				if (q[fieldOrder[i]] > tree->chain_boxes[i - level][1]) return -1;
 			}
@@ -970,15 +975,16 @@ MatchResult RBExactQueryIterativeMod(
     const std::vector<int>& fieldOrder
 ) {
     int level = 0;
+	const int fieldOrderSize = (int)fieldOrder.size();
     while (true) {
         // 1) at leaf depth?
-        if (level == static_cast<int>(fieldOrder.size())) {
+        if (level == fieldOrderSize) {
             return tree->GetMaxMatch();
         }
 
         // 2) singleton chain?
         if (tree->count == 1) {
-            for (int i = level; i < static_cast<int>(fieldOrder.size()); ++i) {
+            for (int i = level; i < fieldOrderSize; ++i) {
                 const auto& interval = tree->chain_boxes[i - level];
                 auto v = q[fieldOrder[i]];
 
@@ -1013,6 +1019,81 @@ MatchResult RBExactQueryIterativeMod(
         ++level;
     }
 }
+
+
+/* MatchResult RBExactQueryIterativeMod(
+    rb_red_blk_tree* tree,
+    const Packet&        q,
+    const std::vector<int>& fieldOrder
+) {
+	#include <inttypes.h>
+    printf("=== RBExactQueryIterativeMod DEBUG ===\n");
+    printf("Packet: UE_IP=%u, SRC_IP=%u, DST_IP=%u, TEID=%u, SRC_IF=%u\n",
+           q[0], q[1], q[2], q[9], q[10]);
+
+    int level = 0;
+    while (true) {
+        printf("Level %d (field %d)\n", level, (level < fieldOrder.size()) ? fieldOrder[level] : -1);
+
+        if (level == static_cast<int>(fieldOrder.size())) {
+            MatchResult result = tree->GetMaxMatch();
+            printf("Leaf reached: priority=%d, descriptor=%lu\n", result.priority, result.descriptor);
+            return result;
+        }
+
+        if (tree->count == 1) {
+            printf("Singleton chain, checking intervals...\n");
+            for (int i = level; i < static_cast<int>(fieldOrder.size()); ++i) {
+                const auto& interval = tree->chain_boxes[i - level];
+                auto v = q[fieldOrder[i]];
+
+                printf("Field %d: value=%u, interval=[%u, %u]\n",
+                       fieldOrder[i], v, interval[0], interval[1]);
+
+                if (v == ANY32 || v == ANY16 || v == ANY8) {
+                    printf("Wildcard detected, skipping\n");
+                    continue;
+                }
+
+                if (v < interval[0] || v > interval[1]) {
+                    printf("Interval check FAILED\n");
+                    return MatchResult();
+                }
+            }
+            MatchResult result = tree->GetMaxMatch();
+            printf("Singleton matched: priority=%d, descriptor=%" PRIuPTR "\n", result.priority, result.descriptor);
+            return result;
+        }
+
+        // Rest of the function...
+        rb_red_blk_node* x = tree->root->left;
+        rb_red_blk_node* nil = tree->nil;
+        if (x == nil) {
+            printf("Empty tree at level %d\n", level);
+            return MatchResult();
+        }
+
+        int compVal = CompareQuery(x->key, q, level, fieldOrder);
+        printf("Initial CompareQuery result: %d\n", compVal);
+
+        while (compVal != 0) {
+            x = (compVal > 0 ? x->left : x->right);
+            printf("Moving %s\n", (compVal > 0) ? "left" : "right");
+            if (x == nil) {
+                printf("Reached nil node\n");
+                return MatchResult();
+            }
+            compVal = CompareQuery(x->key, q, level, fieldOrder);
+            printf("New CompareQuery result: %d\n", compVal);
+        }
+
+        tree = x->rb_tree_next_level;
+        ++level;
+    }
+}
+ */
+
+
 
 
 int RBExactQueryPriority(rb_red_blk_tree*  tree, const Packet& q, int level, const std::vector<int>& fieldOrder, int priority_so_far) {
@@ -1188,11 +1269,13 @@ void RBTreeDeleteWithPathCompression(rb_red_blk_tree*& tree, const std::vector<b
 					temp_tree->PopMatch(priority, descriptor);
 				}
 				int new_priority = temp_tree->GetMaxPriority();
+				uintptr_t  new_descriptor = temp_tree->GetMaxDescriptor();
+
 				RBTreeDestroy(tree);
 
 				tree = newtree;
 				tree->count = 1;
-				tree->PushMatch(new_priority, descriptor);
+				tree->PushMatch(new_priority, new_descriptor);
 				return ;
 			}
 			/*if (level + run == fieldOrder.size()) {
@@ -1407,7 +1490,8 @@ stk_stack* RBEnumerate(rb_red_blk_tree* tree,const box& low, const box&  high) {
 /***********************************************************************/
 
 void  RBSerializeIntoRulesRecursion(rb_red_blk_tree * treenode, rb_red_blk_node * node, int level, const std::vector<int>& fieldOrder, std::vector<box>& box_so_far, std::vector<Rule>& rules_so_far) {
-	if (level == fieldOrder.size() ) {
+	const int fieldOrderSize = (int)fieldOrder.size();
+	if (level == fieldOrderSize ) {
 		for (int n : treenode->priority_list) {
 			/* Rule r(fieldOrder.size());
 			for (int i = 0; i < r.dim; i++){
@@ -1415,7 +1499,7 @@ void  RBSerializeIntoRulesRecursion(rb_red_blk_tree * treenode, rb_red_blk_node 
 			} */
 			
 			Rule r(14);
-			for (size_t i = 0; i < fieldOrder.size(); ++i){
+			for (size_t i = 0; i < fieldOrderSize; ++i){
 				r.range[fieldOrder[i]] = box_so_far[i];
 			}
 
@@ -1434,7 +1518,7 @@ void  RBSerializeIntoRulesRecursion(rb_red_blk_tree * treenode, rb_red_blk_node 
 			} */
 
 			Rule r(14);
-			for (size_t i = 0; i < fieldOrder.size(); ++i){
+			for (size_t i = 0; i < fieldOrderSize; ++i){
 				r.range[fieldOrder[i]] = box_so_far[i];
 			}
 
