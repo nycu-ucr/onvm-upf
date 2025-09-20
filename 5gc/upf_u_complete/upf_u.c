@@ -105,6 +105,14 @@ uint8_t DnMac[RTE_ETHER_ADDR_LEN];
 uint8_t AnMac[RTE_ETHER_ADDR_LEN];
 int SELF_IP;
 
+enum { IF_UNKNOWN = -1 };
+
+static int16_t g_access_port = 0;
+static int16_t g_core_port   = 1;
+static int16_t g_sgi_port    = 1;
+
+
+
 struct rte_meter_trtcm_profile app_trtcm_profile;
 struct rte_meter_trtcm_profile app_flow_trtcm_profile;
 struct rte_meter_trtcm app_flows[APP_FLOWS_MAX];
@@ -329,19 +337,14 @@ uint32_t charStr2MaskedIP(char *str, uint32_t *prefix_val){
 }
 
 static inline int SourceInterfaceToPort(source_interface_t srcIf) {
-    UTLT_Debug("SourceInterfaceToPort: called with srcIf=%u", (unsigned)srcIf);
     switch (srcIf) {
-      case SRC_IF_ACCESS:
-        return 0;
-      case SRC_IF_CORE:
-      case SRC_IF_SGI_LAN:
-        return 1;
+      case SRC_IF_ACCESS:   return g_access_port;
+      case SRC_IF_CORE:     return g_core_port;
+      case SRC_IF_SGI_LAN:  return g_sgi_port;
       case SRC_IF_CP_FUNC:
       case SRC_IF_LI_FUNC:
-        return -1;
       default:
-        UTLT_Warning("SourceInterfaceToPort: invalid interface %u", (unsigned)srcIf);
-        return -1;
+        return IF_UNKNOWN;
     }
 }
 
@@ -549,8 +552,7 @@ parseIpv4Address(const char *addrStr) {
 
 void
 parseMAC(const char *config_path) {
-    FILE *file;
-    file = fopen(config_path, "r");
+    FILE *file = fopen(config_path, "r");
     if (file == NULL) {
         fprintf(stderr, "Error: failed to open file %s\n", config_path);
         exit(EXIT_FAILURE);
@@ -561,63 +563,70 @@ parseMAC(const char *config_path) {
     int DNvalues[6];
     int ANvalues[6];
 
-    while (fgets(line, 256, file) != NULL) {
+    while (fgets(line, sizeof(line), file) != NULL) {
         linenum++;
-        // printf("Line: %d    String: %s\n", linenum, line);
+
+        char *p = line;
+        while (*p == ' ' || *p == '\t') p++;
+
+        if (strncmp(p, "ACCESS_PORT=", 12) == 0) {
+            int v = atoi(p + 12);
+            if (v >= 0 && v <= UINT8_MAX) g_access_port = (int16_t)v;
+            continue;
+        }
+        if (strncmp(p, "CORE_PORT=", 10) == 0) {
+            int v = atoi(p + 10);
+            if (v >= 0 && v <= UINT8_MAX) {
+                g_core_port = (int16_t)v;
+                g_sgi_port  = (int16_t)v;
+            }
+            continue;
+        }
 
         if (linenum == 2) {
             /* DN MAC Address */
-            if (sscanf(line, "%x:%x:%x:%x:%x:%x%*c", &DNvalues[0], &DNvalues[1], &DNvalues[2], &DNvalues[3],
-                   &DNvalues[4], &DNvalues[5]) == 6) {
-                int i;
-                for (i = 0; i < 6; ++i) {
-                    // printf("%d -> %u\n", DNvalues[i], (uint8_t) DNvalues[i]);
-                    DnMac[i] = (uint8_t)DNvalues[i];
-                    // printf("%u\n", DnMac[i]);
-                }
+            if (sscanf(p, "%x:%x:%x:%x:%x:%x%*c",
+                       &DNvalues[0], &DNvalues[1], &DNvalues[2],
+                       &DNvalues[3], &DNvalues[4], &DNvalues[5]) == 6) {
+                for (int i = 0; i < 6; ++i) DnMac[i] = (uint8_t)DNvalues[i];
             } else {
-                fprintf(stderr, "[Parse MAC] could not parse %s\n", line);
+                fprintf(stderr, "[Parse MAC] could not parse DN MAC from: %s", p);
             }
         }
 
         if (linenum == 4) {
             /* AN MAC Address */
-            if (sscanf(line, "%x:%x:%x:%x:%x:%x%*c", &ANvalues[0], &ANvalues[1], &ANvalues[2], &ANvalues[3],
-                   &ANvalues[4], &ANvalues[5]) == 6) {
-                int j;
-                for (j = 0; j < 6; ++j) {
-                    // printf("%d -> %u\n", ANvalues[j], (uint8_t) ANvalues[j]);
-                    AnMac[j] = (uint8_t)ANvalues[j];
-                    // printf("%u\n", AnMac[j]);
-                }
+            if (sscanf(p, "%x:%x:%x:%x:%x:%x%*c",
+                       &ANvalues[0], &ANvalues[1], &ANvalues[2],
+                       &ANvalues[3], &ANvalues[4], &ANvalues[5]) == 6) {
+                for (int j = 0; j < 6; ++j) AnMac[j] = (uint8_t)ANvalues[j];
             } else {
-                fprintf(stderr, "[Parse MAC] could not parse %s\n", line);
+                fprintf(stderr, "[Parse MAC] could not parse AN MAC from: %s", p);
             }
         }
-        if ((linenum == 6)) {
-            if (parseIpv4Address(line)) {
+
+        if (linenum == 6) {
+            if (parseIpv4Address(p)) {
                 UTLT_Error("Parse IP address failed\n");
             }
         }
     }
 
     fclose(file);
-};
+
+    UTLT_Debug("UPF port map (from upf_u.txt): ACCESS=%d CORE=%d SGI=%d",
+              g_access_port, g_core_port, g_sgi_port);
+}
 
 
 
 static inline source_interface_t PortToSourceInterface(uint8_t port) {
-    UTLT_Debug("PortToSourceInterface: called with port=%u", port);
-    switch (port) {
-        case 0: return SRC_IF_ACCESS;      /* N3/Access */
-        case 1: return SRC_IF_CORE;        /* N6/Core */
-        // case 2: return SRC_IF_SGI_LAN;     /* if we ever attach SGi-LAN */
-        // case 3: return SRC_IF_CP_FUNC;     /* if we use port 3 for CP */
-        // case 4: return SRC_IF_LI_FUNC;     /* if we use port 4 for LI */
-        default: 
-            UTLT_Warning("PortToSourceInterface: unknown port %u, defaulting to ACCESS", port);
-            return SRC_IF_ACCESS;
-    }
+    if ((int)port == g_access_port)  return SRC_IF_ACCESS;
+    if ((int)port == g_core_port)    return SRC_IF_CORE;
+    if ((int)port == g_sgi_port)     return SRC_IF_SGI_LAN;
+    UTLT_Warning("PortToSourceInterface: unknown port %u (ACCESS=%d CORE=%d SGI=%d) — defaulting to ACCESS",
+                 port, g_access_port, g_core_port, g_sgi_port);
+    return SRC_IF_ACCESS;
 }
 
 

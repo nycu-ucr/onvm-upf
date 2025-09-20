@@ -1413,7 +1413,7 @@ void  RBSerializeIntoRulesRecursion(rb_red_blk_tree * treenode, rb_red_blk_node 
 			for (int i = 0; i < r.dim; i++){
 				r.range[fieldOrder[i]] = box_so_far[i];
 			} */
-			// hardcoded
+			
 			Rule r(14);
 			for (size_t i = 0; i < fieldOrder.size(); ++i){
 				r.range[fieldOrder[i]] = box_so_far[i];
@@ -1427,16 +1427,17 @@ void  RBSerializeIntoRulesRecursion(rb_red_blk_tree * treenode, rb_red_blk_node 
 	if (treenode->count == 1) {
 		box_so_far.insert(std::end(box_so_far), begin(treenode->chain_boxes), end(treenode->chain_boxes));
 		for (int n : treenode->priority_list) {
-
 			/* Rule r(fieldOrder.size());
+
 			for (int i = 0; i < r.dim; i++){
 				r.range[fieldOrder[i]] = box_so_far[i];
 			} */
-			// hardcoded
+
 			Rule r(14);
 			for (size_t i = 0; i < fieldOrder.size(); ++i){
 				r.range[fieldOrder[i]] = box_so_far[i];
 			}
+
 			r.priority = n;
 			rules_so_far.push_back(r);
 		}
