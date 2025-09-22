@@ -44,7 +44,7 @@ uintptr_t PartitionSort::InsertRuleReturnDescriptor(const Rule& one_rule) {
             bool pri_change = false;
             if (mitree->TryInsertion(one_rule, pri_change)) {
                 if (pri_change) InsertionSortMITrees();
-                mitree->ReconstructIfNumRulesLessThanOrEqualTo(10);
+                // mitree->ReconstructIfNumRulesLessThanOrEqualTo(10);
                 rules.emplace_back(one_rule, mitree);
                 descriptorIndexMap[one_rule.descriptor] = rules.size() - 1;
                 return one_rule.descriptor;
