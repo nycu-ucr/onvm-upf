@@ -242,7 +242,7 @@ static inline void UpfClsMaybeFlipAndAck(void) {
     (void)UpfSendEvt1(UPF_C_SERVICE_ID, EVT_CLS_GC_ACK, (uintptr_t)v2);
 }
 
-static double lat_buf[100];
+static double lat_buf[200];
 static int lat_count = 0;
 
 static inline double cycles_to_us(uint64_t cyc) {
@@ -253,15 +253,15 @@ static inline double cycles_to_us(uint64_t cyc) {
 static inline record_latency(double us) {
     lat_buf[lat_count++] = us;
 
-    if (lat_count >= 100) {
+    if (lat_count >= 200) {
         // Print all collected values
         printf("---- Latency batch ----\n");
         double sum = 0.0;
-        for (int i = 0; i < 100; i++) {
+        for (int i = 0; i < 200; i++) {
             printf("%2d: %.2f us, ", i, lat_buf[i]);
             sum += lat_buf[i];
         }
-        double avg = sum / 100.0;
+        double avg = sum / 200.0;
         printf("\nAverage latency: %.2f us\n", avg);
         printf("-----------------------\n");
 

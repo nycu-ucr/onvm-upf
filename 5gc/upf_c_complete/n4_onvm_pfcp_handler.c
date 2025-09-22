@@ -403,7 +403,7 @@ static uint32_t g_cls_retired_version = 0;
 
 
 // Helper: insert all REAL PDRs from the global catalog into 'snap'
-static inline uint32_t InsertAllRealPdrs(cls_handle_t *snap) {
+/* static inline uint32_t InsertAllRealPdrs(cls_handle_t *snap) {
     uint32_t inserted = 0;
     if (!g_all_pdr_list) return 0;
 
@@ -425,10 +425,10 @@ static inline uint32_t InsertAllRealPdrs(cls_handle_t *snap) {
         inserted++;
     }
     return inserted;
-}
+} */
 
 // Helper: add 10k synthetic rules that do NOT match your real traffic
-static inline uint32_t InsertSyntheticPdrs(cls_handle_t *snap) {
+/* static inline uint32_t InsertSyntheticPdrs(cls_handle_t *snap) {
     if (!g_all_pdr_list || !g_all_pdr_list->head) return 0;
     UpfPDR *tmpl = (UpfPDR *)g_all_pdr_list->head->val;
     if (!tmpl) return 0;
@@ -469,7 +469,7 @@ static inline uint32_t InsertSyntheticPdrs(cls_handle_t *snap) {
         inserted++;
     }
     return inserted;
-}
+} */
 
 
 

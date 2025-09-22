@@ -2,6 +2,7 @@
 #include <cinttypes>
 #include <cstdio>
 #include <arpa/inet.h>
+#include <rte_cycles.h>
 
 #include "classifier_wrapper.h"
 #include "ElementaryClasses.h"
@@ -162,9 +163,24 @@ void cls_destroy(cls_handle_t *h) {
 uintptr_t cls_insert_rule(cls_handle_t *h, const pdr_t *r) {
     if (!h || !r) return 0;
     Rule R = to_cpp_rule(r);
+    static uint64_t sum_cycles = 0;
+    static uint32_t count      = 0;
 #if CLS_SELECTED_BACKEND == CLS_BACKEND_PS
     // PartitionSort returns its descriptor
-    return h->ps->InsertRuleReturnDescriptor(R);
+    uint64_t t0 = rte_rdtsc_precise();
+    uintptr_t desc = h->ps->InsertRuleReturnDescriptor(R);
+    uint64_t dt = rte_rdtsc_precise() - t0;
+    sum_cycles += dt;
+    if (++count == 100) {
+        const uint64_t hz = rte_get_tsc_hz();
+        // avg_ns = (sum_cycles / 100) * 1e9 / hz
+        const double avg_ns = (double)sum_cycles * 1e9 / (double)(hz * 100ull);
+        // Use printf here since this is a C++ TU without UTLT headers.
+        printf("[PS] insert avg: %.1f ns over 100\n", avg_ns);
+        sum_cycles = 0;
+        count      = 0;
+    }
+    return desc;
 #elif CLS_SELECTED_BACKEND == CLS_BACKEND_TSS
     try {
         h->tss->InsertRule(R);
