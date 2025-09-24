@@ -244,36 +244,8 @@ static inline uint32_t mk_testnet198(uint32_t i) {
     return htonl(a);
 }
 
+
 /* static void inject_synth_pdrs_at_head(UpfSession *s, const UpfPDR *tpl, uint32_t n)
-{
-    for (uint32_t i = 0; i < n; i++) {
-        UpfPDR *p = rte_calloc(NULL, 1, sizeof(*p), 0);
-        *p = *tpl;                  // start from template to keep structure sane
-
-        // Give them unique IDs but below 65535
-        p->pdrId = (uint16_t)(50000 + (i % 15000));
-        p->precedence = 1;
-
-        // Make sure they NEVER match in your old scan:
-        p->pdi.flags.sourceInterface = 0;      // <-- scanner ignores if this bit is 0
-        // Also point them away from real UE:
-        p->pdi.flags.ueIpAddress = 1;
-        p->pdi.ueIpAddress.flags.v4 = 1;
-        p->pdi.ueIpAddress.flags.v6 = 0;
-        p->pdi.ueIpAddress.ipv4.s_addr = mk_testnet198(i);
-
-        // Defensive: no actions if they ever matched by mistake
-        p->flags.farId = 0; p->far = NULL;
-        memset(p->qerId, 0, sizeof(p->qerId)); p->qer = NULL;
-
-        // Insert at head so they precede all real PDRs
-        list_lpush(s->pdr_list, list_node_new(p));
-    }
-    UTLT_Info("Synthetic PDRs: inserted %u at head for session %lu",
-              n, (unsigned long)s->smfSeid);
-} */
-
-static void inject_synth_pdrs_at_head(UpfSession *s, const UpfPDR *tpl, uint32_t n)
 {
     uint64_t total_cyc = 0;
     uint32_t inserted  = 0;
@@ -319,6 +291,129 @@ static void inject_synth_pdrs_at_head(UpfSession *s, const UpfPDR *tpl, uint32_t
             total_cyc = 0;
         }
 
+    }
+
+    // if (inserted) {
+    //     double hz = (double)rte_get_tsc_hz();
+    //     double avg_cyc = (double)total_cyc / (double)inserted;
+    //     double avg_ns  = (avg_cyc * 1e9) / hz;
+    //     UTLT_Info("[LL-INSERT] head: inserted=%u avg=%.0f cycles (%.2f ns) per insert",
+    //               inserted, avg_cyc, avg_ns);
+    // }
+
+    UTLT_Info("Synthetic PDRs: inserted %u at head for session %lu",
+              inserted, (unsigned long)s->smfSeid);
+} */
+
+
+static inline uint32_t mk_other_from_ue(uint32_t ue_be) {
+    /* Derive a deterministic “other” addr; input/output are network byte order */
+    uint32_t host = rte_be_to_cpu_32(ue_be);
+    host ^= 0x005A5A5A;  /* simple reversible mix */
+    return rte_cpu_to_be_32(host);
+}
+
+static void inject_synth_pdrs_at_head(UpfSession *s, const UpfPDR *tpl, uint32_t n)
+{
+    uint64_t total_cyc = 0;
+    uint32_t inserted  = 0;
+
+    for (uint32_t i = 0; i < n; i++) {
+        UpfPDR *p = rte_calloc(NULL, 1, sizeof(*p), 0);
+        if (!p) break;
+        *p = *tpl;  // keep structure sane
+
+        // Unique but < 65535; keep precedence low
+        p->pdrId = (uint16_t)(50000 + (i % 15000));
+        p->precedence = 0xFFFFu;
+
+        // Ensure PDI container is considered
+        p->flags.pdi = 1;
+
+        // (1) SourceInterface: ENABLE so LS passes the port gate.
+        //     Copy from template to match the session’s direction.
+        p->pdi.flags.sourceInterface = 1;
+        p->pdi.sourceInterface = tpl->pdi.flags.sourceInterface
+                                   ? tpl->pdi.sourceInterface
+                                   : 1;
+
+        // (2) UE IPv4 present so UE check executes (TEST-NET address).
+        p->pdi.flags.ueIpAddress       = 1;
+        p->pdi.ueIpAddress.flags.v4    = 1;
+        p->pdi.ueIpAddress.flags.v6    = 0;
+        p->pdi.ueIpAddress.flags.sd    = 1;  // say UE is dst (harmless if UL)
+        p->pdi.ueIpAddress.ipv4.s_addr = mk_testnet198(i);
+
+        p->pdi.flags.fTeid = 1;
+        p->pdi.fTeid.flags.v4 = 1;
+        p->pdi.fTeid.teid = 0xDEADBEEFu;
+
+        // (3) SDF Filter fields to drive extra per-node work:
+        p->pdi.flags.sdfFilter         = 1;
+        // 3a) ToS/Traffic Class: RULE value == 0 (so LS rule-side check runs & passes)
+        p->pdi.sdfFilter.flags.ttc     = 1;
+        p->pdi.sdfFilter.tosTrafficClass = 0;
+        // 3b) SPI present but zero
+        p->pdi.sdfFilter.flags.spi     = 1;
+        p->pdi.sdfFilter.securityParameterIndex = 0;
+        // 3c) Flow Label present but zero
+        p->pdi.sdfFilter.flags.fl      = 1;
+        p->pdi.sdfFilter.flowLabel[0]  = 0;
+        p->pdi.sdfFilter.flowLabel[1]  = 0;
+        p->pdi.sdfFilter.flowLabel[2]  = 0;
+        // 3d) Flow Description present with a non-matching src (/32 in TEST-NET-3)
+        {
+            uint32_t oct = (i % 200) + 1;
+            char fd[sizeof(p->pdi.sdfFilter.flowDescription)];
+            int len = snprintf(fd, sizeof(fd),
+                               "permit out ip from 203.0.113.%u/32 to any udp", oct);
+            if (len < 0) len = 0;
+            size_t copy = (size_t) (len < (int)sizeof(p->pdi.sdfFilter.flowDescription)
+                                    ? len
+                                    : (int)sizeof(p->pdi.sdfFilter.flowDescription) - 1);
+            memcpy(p->pdi.sdfFilter.flowDescription, fd, copy);
+            p->pdi.sdfFilter.flowDescription[copy] = '\0';
+            p->pdi.sdfFilter.lenOfFlowDescription  = (uint16_t)copy;
+            p->pdi.sdfFilter.flags.fd = 1;
+        }
+
+        // (4) QFI present but zero (dummy compare/touch in LS)
+        p->pdi.flags.qfi = 1;
+        p->pdi.qfi = 0;
+
+        // (5) Network Instance present (short token; LS will "touch" it)
+        p->pdi.flags.networkInstance = 1;
+        {
+            const char *ni = "bench-ni";
+            size_t L = strnlen(ni, sizeof(p->pdi.networkInstance) - 1);
+            memcpy(p->pdi.networkInstance, ni, L);
+            p->pdi.networkInstance[L] = '\0';
+        }
+
+        // Safety: no actions/QER if ever matched by mistake
+        p->flags.farId = 0; p->far = NULL;
+        memset(p->qerId, 0, sizeof(p->qerId)); p->qer = NULL;
+
+        // --- measure linked-list insertion (same as your original) ---
+        uint64_t t0 = rte_rdtsc_precise();
+
+        list_node_t *node = list_node_new(p);
+        if (!node) { rte_free(p); break; }
+        list_lpush(s->pdr_list, node);
+
+        uint64_t t1 = rte_rdtsc_precise();
+        total_cyc += (t1 - t0);
+        inserted++;
+        // --- end measurement ---
+
+        if (inserted && (inserted % 100) == 0) {
+            double hz     = (double)rte_get_tsc_hz();
+            double avg_cyc= (double)total_cyc / 100.0;
+            double avg_ns = (avg_cyc * 1e9) / hz;
+            UTLT_Info("[LL-INSERT] head: inserted=%u avg=%.0f cycles (%.2f ns) per insert",
+                      inserted, avg_cyc, avg_ns);
+            total_cyc = 0;
+        }
     }
 
     /* if (inserted) {

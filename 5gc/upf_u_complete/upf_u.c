@@ -75,7 +75,7 @@ static struct rte_ether_addr dn_eth;
 static struct rte_ether_addr cn_dn_eth;
 static struct rte_ether_addr cn_ue_eth;
 
-static double lat_buf[100];
+static double lat_buf[200];
 static int lat_count = 0;
 
 static inline double cycles_to_us(uint64_t cyc) {
@@ -85,13 +85,13 @@ static inline double cycles_to_us(uint64_t cyc) {
 
 static inline void record_latency(double us) {
     lat_buf[lat_count++] = us;
-    if (lat_count >= 100) {
+    if (lat_count >= 200) {
         double sum = 0.0;
-        for (int i = 0; i < 100; i++) {
+        for (int i = 0; i < 200; i++) {
             printf("%2d: %.2f us, ", i, lat_buf[i]);
             sum += lat_buf[i];
         }
-        double avg = sum / 100.0;
+        double avg = sum / 200.0;
         printf("\n---- LL-BENCH ----\nAverage latency: %.2f us\n------------------\n", avg);
         lat_count = 0;
     }
@@ -536,6 +536,7 @@ uint16_t pdrId = 0;
 
 UPDK_PDR *
 GetPdrByUeIpAddress(struct rte_mbuf *pkt, uint32_t ue_ip_be) { /* DL */
+    
     UpfSession *session = UpfSessionFindByUeIP(ue_ip_be);
     UTLT_Assert(session, return NULL, "session not found error");
     UTLT_Assert(session->pdr_list, return NULL, "PDR list not initialized");
@@ -546,12 +547,11 @@ GetPdrByUeIpAddress(struct rte_mbuf *pkt, uint32_t ue_ip_be) { /* DL */
 
     const struct rte_ipv4_hdr *iph = onvm_pkt_ipv4_hdr(pkt);
     const uint8_t ip_proto = iph ? iph->next_proto_id : 0;
-    const uint8_t ip_tos   = iph ? iph->type_of_service : 0;
     const uint16_t pkt_port = pkt->port;
 
     list_node_t *node = session->pdr_list->head;
     UpfPDR *best = NULL, *fallback = NULL;
-    uint32_t best_prec = 0;
+    uint32_t best_prec = UINT32_MAX;
 
     /* carry the “from” masked-IP we used (for your QER key later) */
     uint32_t best_fd_target = 0;
@@ -560,59 +560,75 @@ GetPdrByUeIpAddress(struct rte_mbuf *pkt, uint32_t ue_ip_be) { /* DL */
         UpfPDR *p = (UpfPDR *)node->val;
         node = node->next;
 
-        if (!p->flags.pdi || !p->pdi.flags.sourceInterface) continue;
+        if (!p || !p->flags.pdi || !p->pdi.flags.sourceInterface) continue;
 
         /* DL runs on CORE/SGI; keep your existing port gate (runtime-configured) */
         if (SourceInterfaceToPort(p->pdi.sourceInterface) != pkt_port) continue;
 
-        if (!fallback) fallback = p;
+        if (!fallback && p->flags.farId) {
+            fallback = p;    // use first real PDR with an action as fallback
+        }
 
         bool full = true;
         uint32_t cur_fd_target = 0;
 
         /* ---- UE IP check (DL: UE is dst unless sd==0 says src) ---- */
         if (full && p->pdi.flags.ueIpAddress && p->pdi.ueIpAddress.flags.v4 && iph) {
-            uint8_t sd = p->pdi.ueIpAddress.flags.sd;      /* 0: UE is src, 1: UE is dst */
-            uint32_t want = p->pdi.ueIpAddress.ipv4.s_addr;/* BE */
+            uint8_t  sd   = p->pdi.ueIpAddress.flags.sd;         /* 0: UE is src, 1: UE is dst */
+            uint32_t want = p->pdi.ueIpAddress.ipv4.s_addr;      /* BE */
             uint32_t pkt_ue = sd ? iph->dst_addr : iph->src_addr;
             if (pkt_ue != want) full = false;
         }
 
-        /* ---- SDF: flowDescription 'from' / 'to' and proto (+ masks) ---- */
+        /* ---- SDF: flowDescription 'from' / 'to' (+ masks) ---- */
         if (full && p->pdi.flags.sdfFilter && p->pdi.sdfFilter.flags.fd && iph) {
             const char *fd = p->pdi.sdfFilter.flowDescription;
             char from_buf[64], to_buf[64];
+
             bool have_from = parse_fd_tok(fd, "from ", from_buf, sizeof from_buf);
             bool have_to   = parse_fd_tok(fd, "to ",   to_buf,   sizeof to_buf);
 
             if (have_from && strcmp(from_buf, "any") != 0) {
-                uint32_t pre=0, want = charStr2MaskedIP((char*)from_buf, &pre);
-                if (IP_MASKED(iph->src_addr, pre) != want) full = false;
-                cur_fd_target = want;
-            }
-            if (full && have_to && strcmp(to_buf, "any") != 0) {
-                uint32_t pre=0, want = charStr2MaskedIP((char*)to_buf, &pre);
-                if (IP_MASKED(iph->dst_addr, pre) != want) full = false;
+                uint32_t pre = 0, want = charStr2MaskedIP((char*)from_buf, &pre);
+                if (pre && IP_MASKED(iph->src_addr, pre) != want) full = false;
+                else cur_fd_target = want;
             }
 
-            if (full) {
-                if (strstr(fd, "tcp") && ip_proto != IPPROTO_TCP) full = false;
-                if (strstr(fd, "udp") && ip_proto != IPPROTO_UDP) full = false;
+            if (full && have_to && strcmp(to_buf, "any") != 0) {
+                uint32_t pre = 0, want = charStr2MaskedIP((char*)to_buf, &pre);
+                if (pre && IP_MASKED(iph->dst_addr, pre) != want) full = false;
             }
+            /* Note: PS adapter does not include L4 proto as a dimension; no proto hint check here. */
         }
 
-        /* ---- ToS / Traffic Class exact compare (if provided) ---- */
-        if (full && p->pdi.flags.sdfFilter && p->pdi.sdfFilter.flags.ttc && iph) {
-            uint16_t ttc = p->pdi.sdfFilter.tosTrafficClass;
-            if ((uint8_t)ttc != ip_tos) full = false;
+        /* ---- ToS / Traffic Class: RULE value must be 0 (no packet ToS read) ---- */
+        if (full && p->pdi.flags.sdfFilter && p->pdi.sdfFilter.flags.ttc) {
+            uint8_t rule_tos = (uint8_t)(p->pdi.sdfFilter.tosTrafficClass & 0xFFu);
+            if (rule_tos != 0u) full = false;
+        }
+
+        /* ---- Dummy touches for PS-aligned fields (no new packet parsing, no filtering) ---- */
+        if (p->pdi.flags.qfi) { volatile uint8_t __qfi = p->pdi.qfi; (void)__qfi; }
+        if (p->pdi.flags.networkInstance && p->pdi.networkInstance) {
+            volatile size_t __nlen = strnlen(p->pdi.networkInstance, 64); (void)__nlen;
+        }
+        if (p->pdi.flags.sdfFilter) {
+            if (p->pdi.sdfFilter.flags.fl) {
+                volatile uint32_t __fl = ((uint32_t)p->pdi.sdfFilter.flowLabel[0] << 16) |
+                                         ((uint32_t)p->pdi.sdfFilter.flowLabel[1] << 8)  |
+                                         ((uint32_t)p->pdi.sdfFilter.flowLabel[2]);
+                (void)__fl;
+            }
+            if (p->pdi.sdfFilter.flags.spi) {
+                volatile uint32_t __spi = p->pdi.sdfFilter.securityParameterIndex; (void)__spi;
+            }
         }
 
         /* pick highest precedence among full matches */
-        if (full) {
-            if (!best || p->precedence > best_prec) {
-                best = p; best_prec = p->precedence;
-                best_fd_target = cur_fd_target;
-            }
+        if (full && (!best || p->precedence < best_prec)) {
+            best = p;
+            best_prec = p->precedence;
+            best_fd_target = cur_fd_target;  // if you track it
         }
     }
 
@@ -636,8 +652,22 @@ GetPdrByUeIpAddress(struct rte_mbuf *pkt, uint32_t ue_ip_be) { /* DL */
             while (qnode) {
                 qer = (UpfQER *)qnode->val; qnode = qnode->next;
                 if (qer->qerId != qerId_) continue;
+                int fd_target = 0;
+                if (pdr->pdi.flags.sdfFilter && pdr->pdi.sdfFilter.flowDescription[0]) {
+                    const char *ip_str = strstr(pdr->pdi.sdfFilter.flowDescription, "from");
+                    if (ip_str) {
+                        ip_str += 5; /* skip "from " */
+                        char buf[64] = {0};
+                        size_t n = 0;
+                        while (ip_str[n] && ip_str[n] != ' ') n++;
+                        n = n < sizeof(buf)-1 ? n : sizeof(buf)-1;
+                        memcpy(buf, ip_str, n); buf[n] = 0;
+                        uint32_t prefix_len = 0;
+                        fd_target = charStr2MaskedIP(buf, &prefix_len);
+                    }
+                }
+                key = pdr->pdi.flags.sdfFilter ? (pkt->port + fd_target) : pkt->port;
 
-                key = pdr->pdi.flags.sdfFilter ? (pkt->port + best_fd_target) : pkt->port;
                 if (ftSearch(key) < 0 && qer->flags.maximumBitrate) {
                     UTLT_Info("QER ID: %d key: %d", qerId_, key);
                     struct rte_meter_trtcm_params trtcm_params = app_trtcm_params;
@@ -710,34 +740,40 @@ GetQerByUEIpAddress(uint32_t ue_ip, char *IP) {
 
 UPDK_PDR *
 GetPdrByTeid(struct rte_mbuf *pkt, uint32_t teid) { /* UL */
+    
+    uint64_t t0 = rte_rdtsc_precise();
+    
     UpfSession *session = UpfSessionFindByTeid(teid);
     UTLT_Assert(session, return NULL, "session not found error");
     UTLT_Assert(session->pdr_list, return NULL, "PDR list not initialized");
     UTLT_Assert(session->pdr_list->len, return NULL, "PDR list contains 0 rules");
 
-    /* START timing */
-    uint64_t t0 = rte_rdtsc_precise();
+    
 
     const struct rte_ipv4_hdr *iph = onvm_pkt_ipv4_hdr(pkt);
     const uint8_t ip_proto = iph ? iph->next_proto_id : 0;
-    const uint8_t ip_tos   = iph ? iph->type_of_service : 0;
     const uint16_t pkt_port = pkt->port;
 
     list_node_t *node = session->pdr_list->head;
     UpfPDR *best = NULL, *fallback = NULL;
-    uint32_t best_prec = 0;
+    uint32_t best_prec = UINT32_MAX; 
     uint32_t best_fd_target = 0;
+
+    /* START timing */
+    // uint64_t t0 = rte_rdtsc_precise();
 
     while (node) {
         UpfPDR *p = (UpfPDR *)node->val;
         node = node->next;
 
-        if (!p->flags.pdi || !p->pdi.flags.sourceInterface) continue;
+        if (!p || !p->flags.pdi || !p->pdi.flags.sourceInterface) continue;
 
         /* UL runs on ACCESS; keep your port gate */
         if (SourceInterfaceToPort(p->pdi.sourceInterface) != pkt_port) continue;
 
-        if (!fallback) fallback = p;
+        if (!fallback && p->flags.farId) {
+            fallback = p;
+        }
 
         bool full = true;
         uint32_t cur_fd_target = 0;
@@ -747,9 +783,9 @@ GetPdrByTeid(struct rte_mbuf *pkt, uint32_t teid) { /* UL */
             if (p->pdi.fTeid.teid != teid) full = false;
         }
 
-        /* ---- UE IP side (UL: UE is src unless sd==1 says dst) ---- */
+        /* ---- UE IP (UL: UE is src unless sd==1 says dst) ---- */
         if (full && p->pdi.flags.ueIpAddress && p->pdi.ueIpAddress.flags.v4 && iph) {
-            uint8_t sd = p->pdi.ueIpAddress.flags.sd;
+            uint8_t  sd   = p->pdi.ueIpAddress.flags.sd;
             uint32_t want = p->pdi.ueIpAddress.ipv4.s_addr; /* BE */
             uint32_t pkt_ue = sd ? iph->dst_addr : iph->src_addr;
             if (pkt_ue != want) full = false;
@@ -763,32 +799,44 @@ GetPdrByTeid(struct rte_mbuf *pkt, uint32_t teid) { /* UL */
             bool have_to   = parse_fd_tok(fd, "to ",   to_buf,   sizeof to_buf);
 
             if (have_from && strcmp(from_buf, "any") != 0) {
-                uint32_t pre=0, want = charStr2MaskedIP((char*)from_buf, &pre);
-                if (IP_MASKED(iph->src_addr, pre) != want) full = false;
-                cur_fd_target = want;
+                uint32_t pre = 0, want = charStr2MaskedIP((char*)from_buf, &pre);
+                if (pre && IP_MASKED(iph->src_addr, pre) != want) full = false;
+                else cur_fd_target = want;
             }
             if (full && have_to && strcmp(to_buf, "any") != 0) {
-                uint32_t pre=0, want = charStr2MaskedIP((char*)to_buf, &pre);
-                if (IP_MASKED(iph->dst_addr, pre) != want) full = false;
+                uint32_t pre = 0, want = charStr2MaskedIP((char*)to_buf, &pre);
+                if (pre && IP_MASKED(iph->dst_addr, pre) != want) full = false;
             }
+            /* Note: PS adapter does not include L4 proto as a dimension; no proto hint check here. */
+        }
 
-            if (full) {
-                if (strstr(fd, "tcp") && ip_proto != IPPROTO_TCP) full = false;
-                if (strstr(fd, "udp") && ip_proto != IPPROTO_UDP) full = false;
+        /* ---- ToS / Traffic Class: RULE value must be 0 (no packet ToS read) ---- */
+        if (full && p->pdi.flags.sdfFilter && p->pdi.sdfFilter.flags.ttc) {
+            uint8_t rule_tos = (uint8_t)(p->pdi.sdfFilter.tosTrafficClass & 0xFFu);
+            if (rule_tos != 0u) full = false;
+        }
+
+        /* ---- Dummy touches for PS-aligned fields (no new packet parsing, no filtering) ---- */
+        if (p->pdi.flags.qfi) { volatile uint8_t __qfi = p->pdi.qfi; (void)__qfi; }
+        if (p->pdi.flags.networkInstance && p->pdi.networkInstance) {
+            volatile size_t __nlen = strnlen(p->pdi.networkInstance, 64); (void)__nlen;
+        }
+        if (p->pdi.flags.sdfFilter) {
+            if (p->pdi.sdfFilter.flags.fl) {
+                volatile uint32_t __fl = ((uint32_t)p->pdi.sdfFilter.flowLabel[0] << 16) |
+                                         ((uint32_t)p->pdi.sdfFilter.flowLabel[1] << 8)  |
+                                         ((uint32_t)p->pdi.sdfFilter.flowLabel[2]);
+                (void)__fl;
+            }
+            if (p->pdi.sdfFilter.flags.spi) {
+                volatile uint32_t __spi = p->pdi.sdfFilter.securityParameterIndex; (void)__spi;
             }
         }
 
-        /* ---- ToS / Traffic Class ---- */
-        if (full && p->pdi.flags.sdfFilter && p->pdi.sdfFilter.flags.ttc && iph) {
-            uint16_t ttc = p->pdi.sdfFilter.tosTrafficClass;
-            if ((uint8_t)ttc != ip_tos) full = false;
-        }
-
-        if (full) {
-            if (!best || p->precedence > best_prec) {
-                best = p; best_prec = p->precedence;
-                best_fd_target = cur_fd_target;
-            }
+        if (full && (!best || p->precedence < best_prec)) {
+            best = p;
+            best_prec = p->precedence;
+            best_fd_target = cur_fd_target;  // if you track it
         }
     }
 
@@ -812,7 +860,22 @@ GetPdrByTeid(struct rte_mbuf *pkt, uint32_t teid) { /* UL */
                 qer = (UpfQER *)qnode->val; qnode = qnode->next;
                 if (qer->qerId != qerId_) continue;
 
-                key = pdr->pdi.flags.sdfFilter ? (pkt->port + best_fd_target) : pkt->port;
+                int fd_target = 0;
+                if (pdr->pdi.flags.sdfFilter && pdr->pdi.sdfFilter.flowDescription[0]) {
+                    const char *ip_str = strstr(pdr->pdi.sdfFilter.flowDescription, "from");
+                    if (ip_str) {
+                        ip_str += 5;
+                        char buf[64] = {0};
+                        size_t n = 0;
+                        while (ip_str[n] && ip_str[n] != ' ') n++;
+                        n = n < sizeof(buf)-1 ? n : sizeof(buf)-1;
+                        memcpy(buf, ip_str, n); buf[n] = 0;
+                        uint32_t prefix_len = 0;
+                        fd_target = charStr2MaskedIP(buf, &prefix_len);
+                    }
+                }
+                key = pdr->pdi.flags.sdfFilter ? (pkt->port + fd_target) : pkt->port;
+
                 if (ftSearch(key) < 0 && qer->flags.maximumBitrate) {
                     UTLT_Info("QER ID: %d key: %d", qerId_, key);
                     struct rte_meter_trtcm_params trtcm_params = app_trtcm_params;
