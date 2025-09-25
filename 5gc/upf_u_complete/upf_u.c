@@ -75,8 +75,8 @@ int SELF_IP;
 /* --- Runtime port map (deploy-time configurable) --- */
 enum { IF_UNKNOWN = -1 };
 
-static int16_t g_access_port = 0;  
-static int16_t g_core_port   = 1; 
+static int16_t g_access_port = 0;
+static int16_t g_core_port   = 1;
 static int16_t g_sgi_port    = 1;
 
 
@@ -820,7 +820,7 @@ AttachL2Header(struct rte_mbuf *pkt, bool is_dl) {
         eth_hdr->dst_addr.addr_bytes[4] = AnMac[4];
         eth_hdr->dst_addr.addr_bytes[5] = AnMac[5];
 
-    } else { 
+    } else {
         rte_ether_addr_copy(&cn_dn_eth, &eth_hdr->src_addr);
         rte_ether_addr_copy(&dn_eth, &eth_hdr->dst_addr);
     }
