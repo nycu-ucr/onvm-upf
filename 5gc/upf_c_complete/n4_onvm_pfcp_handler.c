@@ -56,7 +56,7 @@
 
 
 #define UPF_SYNTH_ENABLE     1          /* 0=off, 1=on (one-time per publish) */
-#define UPF_SYNTH_RULES      20000      /* extra rules to inject                 */
+#define UPF_SYNTH_RULES      100      /* extra rules to inject                 */
 #define UPF_SYNTH_DIR_HINT   2
 #define UPF_SYNTH_INSERT_FIRST 1
 
@@ -474,7 +474,7 @@ static uint32_t g_cls_retired_version = 0;
 
 
 bool UpfClsRebuildAndPublish(uint32_t *out_version) {
-    cls_handle_t *snap = cls_create(CLS_SELECTED_BACKEND);
+    cls_handle_t *snap = cls_create(CLS_SELECTED_BACKEND_ID);
     if (!snap) {
         UTLT_Error("Classifier snapshot create failed");
         return false;

@@ -11,11 +11,11 @@
 #include "TupleSpaceSearch/TupleSpaceSearch.h"
 
 
-#if CLS_SELECTED_BACKEND == CLS_BACKEND_PS
+#if CLS_SELECTED_BACKEND_ID == CLS_BACKEND_ID_PS
 struct cls_handle_t { PartitionSort *ps; };
-#elif CLS_SELECTED_BACKEND == CLS_BACKEND_TSS
+#elif CLS_SELECTED_BACKEND_ID == CLS_BACKEND_ID_TSS
 struct cls_handle_t { TupleSpaceSearch *tss; };
-#else /* CLS_BACKEND_PTSS */
+#else /* CLS_BACKEND_ID_TSS */
 struct cls_handle_t { PriorityTupleSpaceSearch *ptss; };
 #endif
 
@@ -120,9 +120,9 @@ extern "C" {
 cls_handle_t *cls_create(cls_backend_t /*backend_ignored_if_compiletime_selected*/) {
     try {
         auto *h = new cls_handle_t{};
-    #if CLS_SELECTED_BACKEND == CLS_BACKEND_PS
+    #if CLS_SELECTED_BACKEND_ID == CLS_BACKEND_ID_PS
         h->ps  = new PartitionSort();
-    #elif CLS_SELECTED_BACKEND == CLS_BACKEND_TSS
+    #elif CLS_SELECTED_BACKEND_ID == CLS_BACKEND_ID_TSS
         h->tss = new TupleSpaceSearch();
     #else
         h->ptss = new PriorityTupleSpaceSearch();
@@ -136,9 +136,9 @@ cls_handle_t *cls_create(cls_backend_t /*backend_ignored_if_compiletime_selected
 /* Destroy a snapshot handle (called in UPF-C after GC_ACK). */
 /* void cls_destroy(cls_handle_t *h) {
     if (!h) return;
-#if CLS_SELECTED_BACKEND == CLS_BACKEND_PS
+#if CLS_SELECTED_BACKEND == CLS_BACKEND_ID_PS
     delete h->ps;   h->ps = nullptr;
-#elif CLS_SELECTED_BACKEND == CLS_BACKEND_TSS
+#elif CLS_SELECTED_BACKEND == CLS_BACKEND_ID_TSS
     delete h->tss;  h->tss = nullptr;
 #else
     delete h->ptss; h->ptss = nullptr;
@@ -148,9 +148,9 @@ cls_handle_t *cls_create(cls_backend_t /*backend_ignored_if_compiletime_selected
 
 void cls_destroy(cls_handle_t *h) {
     if (!h) return;
-#if CLS_SELECTED_BACKEND == CLS_BACKEND_PS
+#if CLS_SELECTED_BACKEND_ID == CLS_BACKEND_ID_PS
     delete h->ps;
-#elif CLS_SELECTED_BACKEND == CLS_BACKEND_TSS
+#elif CLS_SELECTED_BACKEND_ID == CLS_BACKEND_ID_TSS
     delete h->tss;
 #else
     delete h->ptss;
@@ -165,30 +165,58 @@ uintptr_t cls_insert_rule(cls_handle_t *h, const pdr_t *r) {
     Rule R = to_cpp_rule(r);
     static uint64_t sum_cycles = 0;
     static uint32_t count      = 0;
-#if CLS_SELECTED_BACKEND == CLS_BACKEND_PS
+#if CLS_SELECTED_BACKEND_ID == CLS_BACKEND_ID_PS
+printf("----------------CLS_BACKEND_ID_PS-----------------");
     // PartitionSort returns its descriptor
     uint64_t t0 = rte_rdtsc_precise();
     uintptr_t desc = h->ps->InsertRuleReturnDescriptor(R);
     uint64_t dt = rte_rdtsc_precise() - t0;
     sum_cycles += dt;
-    if (++count == 100) {
+    if (++count >= 500) {
         const uint64_t hz = rte_get_tsc_hz();
         // avg_ns = (sum_cycles / 100) * 1e9 / hz
-        const double avg_ns = (double)sum_cycles * 1e9 / (double)(hz * 100ull);
+        const double avg_ns = (double)sum_cycles * 1e9 / (double)(hz * 500ull);
         // Use printf here since this is a C++ TU without UTLT headers.
-        printf("[PS] insert avg: %.1f ns over 100\n", avg_ns);
+        printf("[PS] insert avg: %.1f ns over 500\n", avg_ns);
         sum_cycles = 0;
         count      = 0;
     }
     return desc;
-#elif CLS_SELECTED_BACKEND == CLS_BACKEND_TSS
+#elif CLS_SELECTED_BACKEND_ID == CLS_BACKEND_ID_TSS
     try {
+        printf("----------------CLS_BACKEND_ID_TSS----------------- \n");
+        printf("Count %d \n", count);
+        uint64_t t0 = rte_rdtsc_precise();
         h->tss->InsertRule(R);
+        uint64_t dt = rte_rdtsc_precise() - t0;
+        sum_cycles += dt;
+        if (++count >= 500) {
+            printf("Dhukche \n");
+            const uint64_t hz = rte_get_tsc_hz();
+            // avg_ns = (sum_cycles / 100) * 1e9 / hz
+            const double avg_ns = (double)sum_cycles * 1e9 / (double)(hz * 500ull);
+            // Use printf here since this is a C++ TU without UTLT headers.
+            printf("[TSS] insert avg: %.1f ns over 500\n", avg_ns);
+            sum_cycles = 0;
+            count      = 0;
+        }
         return R.descriptor;
     } catch (const std::bad_alloc&) { return 0; }
 #else
     try {
+        uint64_t t0 = rte_rdtsc_precise();
         h->ptss->InsertRule(R);
+        uint64_t dt = rte_rdtsc_precise() - t0;
+        sum_cycles += dt;
+        if (++count >= 500) {
+            const uint64_t hz = rte_get_tsc_hz();
+            // avg_ns = (sum_cycles / 100) * 1e9 / hz
+            const double avg_ns = (double)sum_cycles * 1e9 / (double)(hz * 500ull);
+            // Use printf here since this is a C++ TU without UTLT headers.
+            printf("[PTSS] insert avg: %.1f ns over 500\n", avg_ns);
+            sum_cycles = 0;
+            count      = 0;
+        }
         return R.descriptor;
     } catch (const std::bad_alloc&) { 
         return 0; 
@@ -199,9 +227,9 @@ uintptr_t cls_insert_rule(cls_handle_t *h, const pdr_t *r) {
 /* Optional: delete by descriptor while building (rarely used) */
 int cls_delete_rule_by_descriptor(cls_handle_t *h, uintptr_t d) {
     if (!h) return -1;
-#if CLS_SELECTED_BACKEND == CLS_BACKEND_PS
+#if CLS_SELECTED_BACKEND_ID == CLS_BACKEND_ID_PS
     return h->ps->DeleteRuleByDescriptor(d) ? 0 : -1;
-#elif CLS_SELECTED_BACKEND == CLS_BACKEND_TSS
+#elif CLS_SELECTED_BACKEND_ID == CLS_BACKEND_ID_TSS
     return h->tss->DeleteRuleByDescriptor(d) ? 0 : -1;
 #else
     return h->ptss->DeleteRuleByDescriptor(d) ? 0 : -1;
@@ -218,9 +246,9 @@ int cls_classify_packet(
 {
     if (!h || !p) return -1;
 
-#if CLS_SELECTED_BACKEND == CLS_BACKEND_PS
+#if CLS_SELECTED_BACKEND_ID == CLS_BACKEND_ID_PS
     MatchResult m = h->ps->ClassifyAPacketMod(to_cpp_pkt(p));
-#elif CLS_SELECTED_BACKEND == CLS_BACKEND_TSS
+#elif CLS_SELECTED_BACKEND_ID == CLS_BACKEND_ID_TSS
     MatchResult m = h->tss->ClassifyAPacketMod(to_cpp_pkt(p));
 #else
     MatchResult m = h->ptss->ClassifyAPacketMod(to_cpp_pkt(p));
@@ -244,9 +272,9 @@ static void print_cidr(uint32_t host_ip, unsigned prefix) {
 }
 
 void cls_print_all_rules(cls_handle_t *h) {
-#if CLS_SELECTED_BACKEND == CLS_BACKEND_PS
+#if CLS_SELECTED_BACKEND_ID == CLS_BACKEND_ID_PS
     if (h && h->ps) h->ps->PrintAllRules();
-#elif CLS_SELECTED_BACKEND == CLS_BACKEND_TSS
+#elif CLS_SELECTED_BACKEND_ID == CLS_BACKEND_ID_TSS
     if (h && h->tss) {
         auto rules = h->tss->SerializeIntoRules();
         printf("=== TupleSpaceSearch: %zu rules ===\n", rules.size());

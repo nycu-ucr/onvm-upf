@@ -6,16 +6,20 @@
 
 #include "../../onvm/updk/updk/rule_pdr.h"
 
-/*────────────────── Backend selection ───────────────────────────────────*/
-typedef enum {
-    CLS_BACKEND_PS,      /* PartitionSort        */
-    CLS_BACKEND_TSS,     /* Tuple-Space-Search   */
-    CLS_BACKEND_PTSS     /* Priority/Parallel TSS */
-} cls_backend_t;
+#define CLS_BACKEND_ID_PS   0
+#define CLS_BACKEND_ID_TSS  1
+#define CLS_BACKEND_ID_PTSS 2
 
-#ifndef CLS_SELECTED_BACKEND
-#define CLS_SELECTED_BACKEND CLS_BACKEND_PS
+#ifndef CLS_SELECTED_BACKEND_ID
+#define CLS_SELECTED_BACKEND_ID CLS_BACKEND_ID_TSS
 #endif
+
+/* (Keep your enum if you also want a typed arg somewhere) */
+typedef enum {
+    CLS_BACKEND_PS      = CLS_BACKEND_ID_PS,
+    CLS_BACKEND_TSS     = CLS_BACKEND_ID_TSS,
+    CLS_BACKEND_PTSS    = CLS_BACKEND_ID_PTSS
+} cls_backend_t;
 
 /* Max number of PDI dimensions we feed into engines */
 #define PDI_MAX_FLD 14
