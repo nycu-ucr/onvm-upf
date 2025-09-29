@@ -10,11 +10,11 @@
 #include "TupleSpaceSearch/TupleSpaceSearch.h"
 
 
-#if CLS_SELECTED_BACKEND == CLS_BACKEND_PS
+#if CLS_SELECTED_BACKEND_ID == CLS_BACKEND_ID_PS
 struct cls_handle_t { PartitionSort *ps; };
-#elif CLS_SELECTED_BACKEND == CLS_BACKEND_TSS
+#elif CLS_SELECTED_BACKEND_ID == CLS_BACKEND_ID_TSS
 struct cls_handle_t { TupleSpaceSearch *tss; };
-#else /* CLS_BACKEND_PTSS */
+#else /* CLS_BACKEND_ID_TSS */
 struct cls_handle_t { PriorityTupleSpaceSearch *ptss; };
 #endif
 
@@ -119,9 +119,9 @@ extern "C" {
 cls_handle_t *cls_create(cls_backend_t /*backend_ignored_if_compiletime_selected*/) {
     try {
         auto *h = new cls_handle_t{};
-    #if CLS_SELECTED_BACKEND == CLS_BACKEND_PS
+    #if CLS_SELECTED_BACKEND_ID == CLS_BACKEND_ID_PS
         h->ps  = new PartitionSort();
-    #elif CLS_SELECTED_BACKEND == CLS_BACKEND_TSS
+    #elif CLS_SELECTED_BACKEND_ID == CLS_BACKEND_ID_TSS
         h->tss = new TupleSpaceSearch();
     #else
         h->ptss = new PriorityTupleSpaceSearch();
@@ -135,9 +135,9 @@ cls_handle_t *cls_create(cls_backend_t /*backend_ignored_if_compiletime_selected
 /* Destroy a snapshot handle (called in UPF-C after GC_ACK). */
 /* void cls_destroy(cls_handle_t *h) {
     if (!h) return;
-#if CLS_SELECTED_BACKEND == CLS_BACKEND_PS
+#if CLS_SELECTED_BACKEND == CLS_BACKEND_ID_PS
     delete h->ps;   h->ps = nullptr;
-#elif CLS_SELECTED_BACKEND == CLS_BACKEND_TSS
+#elif CLS_SELECTED_BACKEND == CLS_BACKEND_ID_TSS
     delete h->tss;  h->tss = nullptr;
 #else
     delete h->ptss; h->ptss = nullptr;
@@ -147,9 +147,9 @@ cls_handle_t *cls_create(cls_backend_t /*backend_ignored_if_compiletime_selected
 
 void cls_destroy(cls_handle_t *h) {
     if (!h) return;
-#if CLS_SELECTED_BACKEND == CLS_BACKEND_PS
+#if CLS_SELECTED_BACKEND_ID == CLS_BACKEND_ID_PS
     delete h->ps;
-#elif CLS_SELECTED_BACKEND == CLS_BACKEND_TSS
+#elif CLS_SELECTED_BACKEND_ID == CLS_BACKEND_ID_TSS
     delete h->tss;
 #else
     delete h->ptss;
@@ -162,10 +162,10 @@ void cls_destroy(cls_handle_t *h) {
 uintptr_t cls_insert_rule(cls_handle_t *h, const pdr_t *r) {
     if (!h || !r) return 0;
     Rule R = to_cpp_rule(r);
-#if CLS_SELECTED_BACKEND == CLS_BACKEND_PS
+#if CLS_SELECTED_BACKEND_ID == CLS_BACKEND_ID_PS
     // PartitionSort returns its descriptor
     return h->ps->InsertRuleReturnDescriptor(R);
-#elif CLS_SELECTED_BACKEND == CLS_BACKEND_TSS
+#elif CLS_SELECTED_BACKEND_ID == CLS_BACKEND_ID_TSS
     try {
         h->tss->InsertRule(R);
         return R.descriptor;
@@ -183,9 +183,9 @@ uintptr_t cls_insert_rule(cls_handle_t *h, const pdr_t *r) {
 /* Optional: delete by descriptor while building (rarely used) */
 int cls_delete_rule_by_descriptor(cls_handle_t *h, uintptr_t d) {
     if (!h) return -1;
-#if CLS_SELECTED_BACKEND == CLS_BACKEND_PS
+#if CLS_SELECTED_BACKEND_ID == CLS_BACKEND_ID_PS
     return h->ps->DeleteRuleByDescriptor(d) ? 0 : -1;
-#elif CLS_SELECTED_BACKEND == CLS_BACKEND_TSS
+#elif CLS_SELECTED_BACKEND_ID == CLS_BACKEND_ID_TSS
     return h->tss->DeleteRuleByDescriptor(d) ? 0 : -1;
 #else
     return h->ptss->DeleteRuleByDescriptor(d) ? 0 : -1;
@@ -202,9 +202,9 @@ int cls_classify_packet(
 {
     if (!h || !p) return -1;
 
-#if CLS_SELECTED_BACKEND == CLS_BACKEND_PS
+#if CLS_SELECTED_BACKEND_ID == CLS_BACKEND_ID_PS
     MatchResult m = h->ps->ClassifyAPacketMod(to_cpp_pkt(p));
-#elif CLS_SELECTED_BACKEND == CLS_BACKEND_TSS
+#elif CLS_SELECTED_BACKEND_ID == CLS_BACKEND_ID_TSS
     MatchResult m = h->tss->ClassifyAPacketMod(to_cpp_pkt(p));
 #else
     MatchResult m = h->ptss->ClassifyAPacketMod(to_cpp_pkt(p));
@@ -228,9 +228,9 @@ static void print_cidr(uint32_t host_ip, unsigned prefix) {
 }
 
 void cls_print_all_rules(cls_handle_t *h) {
-#if CLS_SELECTED_BACKEND == CLS_BACKEND_PS
+#if CLS_SELECTED_BACKEND_ID == CLS_BACKEND_ID_PS
     if (h && h->ps) h->ps->PrintAllRules();
-#elif CLS_SELECTED_BACKEND == CLS_BACKEND_TSS
+#elif CLS_SELECTED_BACKEND_ID == CLS_BACKEND_ID_TSS
     if (h && h->tss) {
         auto rules = h->tss->SerializeIntoRules();
         printf("=== TupleSpaceSearch: %zu rules ===\n", rules.size());
