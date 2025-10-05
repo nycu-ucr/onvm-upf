@@ -28,6 +28,8 @@
 #include <rte_malloc.h>      // rte_zmalloc, rte_free
 #include <rte_ip.h>          // RTE_IPV4()
 
+#include <rte_random.h>
+
 #include "onvm_nflib.h"
 
 #include "utlt_list.h"
@@ -56,7 +58,7 @@
 
 
 #define UPF_SYNTH_ENABLE     1          /* 0=off, 1=on (one-time per publish) */
-#define UPF_SYNTH_RULES      100      /* extra rules to inject                 */
+#define UPF_SYNTH_RULES      10000      /* extra rules to inject                 */
 #define UPF_SYNTH_DIR_HINT   2
 #define UPF_SYNTH_INSERT_FIRST 1
 
@@ -506,6 +508,9 @@ bool UpfClsRebuildAndPublish(uint32_t *out_version) {
             for (uint32_t i = 0; i < (uint32_t)UPF_SYNTH_RULES; ++i) {
                 UpfPDR tmp = *tmpl;  /* stack copy */
 
+                tmp.flags.precedence = 1;
+                tmp.precedence = (uint32_t)(400u + rte_rand_max(201));
+
                 /* Direction hint */
                 if (tmp.flags.pdi && tmp.pdi.flags.sourceInterface) {
                     if (UPF_SYNTH_DIR_HINT == 0)       tmp.pdi.sourceInterface = 1;      /* CORE/DL */
@@ -593,6 +598,9 @@ if (UPF_SYNTH_ENABLE && (UPF_SYNTH_INSERT_FIRST == 0) && (real_rules_num > 3)) {
         } else {
             for (uint32_t i = 0; i < (uint32_t)UPF_SYNTH_RULES; ++i) {
                 UpfPDR tmp = *tmpl;
+
+                tmp.flags.precedence = 1;
+                tmp.precedence = (uint32_t)(400u + rte_rand_max(201));
 
                 if (tmp.flags.pdi && tmp.pdi.flags.sourceInterface) {
                     if (UPF_SYNTH_DIR_HINT == 0)       tmp.pdi.sourceInterface = 1;

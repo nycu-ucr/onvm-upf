@@ -166,7 +166,6 @@ uintptr_t cls_insert_rule(cls_handle_t *h, const pdr_t *r) {
     static uint64_t sum_cycles = 0;
     static uint32_t count      = 0;
 #if CLS_SELECTED_BACKEND_ID == CLS_BACKEND_ID_PS
-printf("----------------CLS_BACKEND_ID_PS-----------------");
     // PartitionSort returns its descriptor
     uint64_t t0 = rte_rdtsc_precise();
     uintptr_t desc = h->ps->InsertRuleReturnDescriptor(R);
@@ -184,8 +183,6 @@ printf("----------------CLS_BACKEND_ID_PS-----------------");
     return desc;
 #elif CLS_SELECTED_BACKEND_ID == CLS_BACKEND_ID_TSS
     try {
-        printf("----------------CLS_BACKEND_ID_TSS----------------- \n");
-        printf("Count %d \n", count);
         uint64_t t0 = rte_rdtsc_precise();
         h->tss->InsertRule(R);
         uint64_t dt = rte_rdtsc_precise() - t0;
@@ -204,6 +201,7 @@ printf("----------------CLS_BACKEND_ID_PS-----------------");
     } catch (const std::bad_alloc&) { return 0; }
 #else
     try {
+        printf("----------------CLS_BACKEND_ID_PTSS-----------------");
         uint64_t t0 = rte_rdtsc_precise();
         h->ptss->InsertRule(R);
         uint64_t dt = rte_rdtsc_precise() - t0;

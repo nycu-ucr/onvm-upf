@@ -11,7 +11,7 @@
 #define CLS_BACKEND_ID_PTSS 2
 
 #ifndef CLS_SELECTED_BACKEND_ID
-#define CLS_SELECTED_BACKEND_ID CLS_BACKEND_ID_TSS
+#define CLS_SELECTED_BACKEND_ID CLS_BACKEND_ID_PTSS
 #endif
 
 /* (Keep your enum if you also want a typed arg somewhere) */
