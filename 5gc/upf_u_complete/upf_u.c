@@ -1536,7 +1536,7 @@ main(int argc, char *argv[]) {
     struct onvm_nf_local_ctx *nf_local_ctx;
     struct onvm_nf_function_table *nf_function_table;
     // UTLT_SetLogLevel("Panic"); // to eliminate log print influenced jitter
-    UTLT_SetLogLevel("debug"); // to eliminate log print influenced jitter
+    UTLT_SetLogLevel("warning"); // to eliminate log print influenced jitter
 
     nf_local_ctx = onvm_nflib_init_nf_local_ctx();
     onvm_nflib_start_signal_handler(nf_local_ctx, NULL);
