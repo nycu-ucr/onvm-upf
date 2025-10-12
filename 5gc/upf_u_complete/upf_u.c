@@ -40,6 +40,8 @@
 #include "onvm_pkt_helper.h"
 #include "rte_meter.h"
 
+#include "upf_u_config.h"
+
 #define NF_TAG "upf_u"
 
 // #if 0
@@ -75,9 +77,9 @@ int SELF_IP;
 /* --- Runtime port map (deploy-time configurable) --- */
 enum { IF_UNKNOWN = -1 };
 
-static int16_t g_access_port = 0;
-static int16_t g_core_port   = 1;
-static int16_t g_sgi_port    = 1;
+int16_t g_access_port = 0;
+int16_t g_core_port   = 0;
+int16_t g_sgi_port    = 0;
 
 
 
@@ -1096,12 +1098,19 @@ main(int argc, char *argv[]) {
         rte_exit(EXIT_FAILURE, "Cannot get MAC address: err=%d, port=%u\n", ret, 1);
 
     // Parse DN & AN MAC address from upf_u.txt
-    const char *config_path = "upf_u.txt";  // default
+    //const char *config_path = "upf_u.txt";  // default
+
+    const char *config_path = "config/upf_u.yaml";
+
     if (argc > arg_offset + 1) {
         config_path = argv[arg_offset + 1];
     }
-    printf("Using config path: %s\n", config_path);  // print the path
-    parseMAC(config_path);
+    printf("[UPF-U] Using config: %s\n", config_path);
+    //parseMAC(config_path);
+    UpfU_LoadAndParseConfig(config_path);
+
+    /* UTLT_Info("[UPF-U][CONFIG] Port map: ACCESS=%d CORE=%d SGI=%d",
+          g_access_port, g_core_port, g_sgi_port); */
 
     // 8c:dc:d4:ac:6c:7d
     dn_eth.addr_bytes[0] = DnMac[0];

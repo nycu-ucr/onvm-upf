@@ -12,11 +12,18 @@ foreach nf : l25gc_nfs
 
     subdir(nf)
 
+    # base deps for every NF
+    deps = [ onvm_dpdk_dep, onvm_nflib_dep, onvm_l25gc_dep, rt_dep ]
+
+    if nf == 'upf_u_complete'
+        deps += upf_u_link_deps
+    endif
+
     executable(
         name,
         sources,
         include_directories: includes,
-        dependencies: [onvm_dpdk_dep, onvm_nflib_dep, onvm_l25gc_dep, rt_dep],
+        dependencies: deps,
         install: true,
         install_tag: 'onvm',
         install_dir: onvm_output_dir + '/nf/' + nf

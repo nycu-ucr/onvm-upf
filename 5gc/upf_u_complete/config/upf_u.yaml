@@ -1,0 +1,13 @@
+info:
+  version: 1.0.0
+  description: L25GC-plus UPF-U dataplane configuration
+
+configuration:
+  dataplane:
+    dn_mac: "3c:fd:fe:b4:fe:21"
+    an_mac: "3c:fd:fe:b5:00:14"
+    upf_ip: "192.168.1.2"
+
+    ports:
+      access: 0                     # ACCESS_PORT
+      core: 1                       # CORE_PORT (SGi follows CORE)

@@ -1,3 +1,8 @@
 sources = files(
-    'upf_u.c'
+    'upf_u.c',
+    'upf_u_config.c'
 )
+
+upf_u_link_deps = [
+  dependency('yaml-0.1', version: '>=0.2.2', required: true),
+]
