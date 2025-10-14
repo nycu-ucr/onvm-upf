@@ -132,19 +132,6 @@ cls_handle_t *cls_create(cls_backend_t /*backend_ignored_if_compiletime_selected
     }
 }
 
-/* Destroy a snapshot handle (called in UPF-C after GC_ACK). */
-/* void cls_destroy(cls_handle_t *h) {
-    if (!h) return;
-#if CLS_SELECTED_BACKEND == CLS_BACKEND_ID_PS
-    delete h->ps;   h->ps = nullptr;
-#elif CLS_SELECTED_BACKEND == CLS_BACKEND_ID_TSS
-    delete h->tss;  h->tss = nullptr;
-#else
-    delete h->ptss; h->ptss = nullptr;
-#endif
-    delete h;
-} */
-
 void cls_destroy(cls_handle_t *h) {
     if (!h) return;
 #if CLS_SELECTED_BACKEND_ID == CLS_BACKEND_ID_PS
@@ -154,7 +141,6 @@ void cls_destroy(cls_handle_t *h) {
 #else
     delete h->ptss;
 #endif
-    // explicitly free the handle storage as raw memory
     rte_free(h);
 }
 
@@ -180,7 +166,7 @@ uintptr_t cls_insert_rule(cls_handle_t *h, const pdr_t *r) {
 #endif
 }
 
-/* Optional: delete by descriptor while building (rarely used) */
+/* Optional: delete by descriptor while building (if needed later) */
 int cls_delete_rule_by_descriptor(cls_handle_t *h, uintptr_t d) {
     if (!h) return -1;
 #if CLS_SELECTED_BACKEND_ID == CLS_BACKEND_ID_PS

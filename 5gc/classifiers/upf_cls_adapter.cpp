@@ -13,7 +13,7 @@
 #include "upf_cls_adapter.h"
 #include "classifier_wrapper.h"
 
-#define CLS_ADAPTER_DEBUG 1
+#define CLS_ADAPTER_DEBUG 0
 
 /*──────────────────── local helpers ────────────────────*/
 

@@ -14,7 +14,7 @@
 #define CLS_SELECTED_BACKEND_ID CLS_BACKEND_ID_PS
 #endif
 
-/* (Keep your enum if you also want a typed arg somewhere) */
+
 typedef enum {
     CLS_BACKEND_PS      = CLS_BACKEND_ID_PS,
     CLS_BACKEND_TSS     = CLS_BACKEND_ID_TSS,
@@ -56,8 +56,8 @@ typedef struct {
     uint16_t  pdr_id;
     uint32_t  precedence;
     pdi_t     pdi;
-    uintptr_t descriptor;       /* back-pointer/cookie to DP view (hugepage) */
-    bool      is_uplink;        /* traffic direction flag */
+    uintptr_t descriptor;
+    bool      is_uplink;
 } pdr_t;
 
 /* Flat packet view for classification */
@@ -70,14 +70,6 @@ typedef struct {
     uint8_t  qfi;
     uint8_t  is_uplink;
 } ps_packet_t;
-
-/* Optional: consolidated match result (convenience) */
-typedef struct {
-    int       matched;      /* 0/1 */
-    uint32_t  pdr_id;
-    uint32_t  precedence;
-    uintptr_t descriptor;   /* engine’s descriptor cookie */
-} cls_match_t;
 
 /* Opaque classifier handle (one per immutable snapshot) */
 typedef struct cls_handle_t cls_handle_t;

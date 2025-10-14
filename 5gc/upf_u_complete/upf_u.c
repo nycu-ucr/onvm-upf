@@ -147,58 +147,6 @@ typedef struct {
 
 static upf_cls_local_t g_cls_local = {0};
 
-/* Flip to the latest published snapshot (called at burst boundary) */
-/* static inline void UpfClsMaybeFlipAndAck(void) {
-    if (likely(!g_cls_local.flip_pending)) {
-        return;
-    }
-    // Pair with UPF-C's rte_wmb before publishing; read pointer then version
-    rte_rmb();
-    void    *new_ptr = g_upf_cls_ctrl ? g_upf_cls_ctrl->active  : NULL;
-    uint32_t new_ver = g_upf_cls_ctrl ? g_upf_cls_ctrl->version : 0;
-
-    g_cls_local.ptr = new_ptr;
-    g_cls_local.ver = new_ver;
-    g_cls_local.flip_pending = 0;
-
-    // ACK back to UPF-C with the new version we observed
-    (void)UpfSendEvt1(UPF_C_SERVICE_ID, EVT_CLS_GC_ACK, (uintptr_t)new_ver);
-} */
-
-
-/* static inline void UpfClsMaybeFlipAndAck(void) {
-    if (likely(!g_cls_local.flip_pending)) return;
-
-    rte_rmb();
-    void    *new_ptr = g_upf_cls_ctrl ? g_upf_cls_ctrl->active  : NULL;
-    uint32_t new_ver = g_upf_cls_ctrl ? g_upf_cls_ctrl->version : 0;
-    if (unlikely(!new_ptr)) {
-        UTLT_Warning("CLS flip requested but ctrl.active==NULL (ctrl.ver=%u)", new_ver);
-        return;
-    }
-
-    // // NEW: deep flip diagnostics BEFORE we start using it
-    // void *handle = new_ptr;
-    // void *engine = *(void**)handle;              // first word in handle
-    // void *vptr   = engine ? *(void**)engine : NULL;  // first word in engine = vtable ptr
-
-    // UTLT_Info("CLS flip:  handle=%p iova=%"PRIu64"  engine=%p iova=%"PRIu64"  vptr=%p iova=%"PRIu64" ver=%u",
-    //           handle, (uint64_t)rte_mem_virt2iova(handle),
-    //           engine, (uint64_t)rte_mem_virt2iova(engine),
-    //           vptr,   (uint64_t)rte_mem_virt2iova(vptr),
-    //           new_ver);
-
-    //if (handle) rte_hexdump(stdout, "DP cls_handle head", handle, 32);
-    // if (engine) rte_hexdump(stdout, "DP engine head",     engine, 32);
-
-    g_cls_local.ptr = new_ptr;
-    g_cls_local.ver = new_ver;
-    g_cls_local.flip_pending = 0;
-
-    (void)UpfSendEvt1(UPF_C_SERVICE_ID, EVT_CLS_GC_ACK, (uintptr_t)new_ver);
-} */
-
-
 // Flip to the latest published snapshot (called at burst boundary)
 static inline void UpfClsMaybeFlipAndAck(void) {
     if (likely(!g_cls_local.flip_pending))
@@ -239,8 +187,6 @@ static inline void UpfClsMaybeFlipAndAck(void) {
 
     (void)UpfSendEvt1(UPF_C_SERVICE_ID, EVT_CLS_GC_ACK, (uintptr_t)v2);
 }
-
-
 
 
 /* static inline const UPDK_PDR *UpfLookupPdr(const ps_packet_t *key) {
@@ -346,67 +292,6 @@ static inline int SourceInterfaceToPort(source_interface_t srcIf) {
     }
 }
 
-/* static inline void
-ConfigureQerFlows(UpfSession *session,
-                 const UPDK_PDR *pdr,
-                 uint8_t port,
-                 uint32_t id24,
-                 bool is_uplink)
-{
-    if (!session || !pdr) return;
-    if (!session->qer_list) return;
-
-    for (int i = 0; i < 2; i++) {
-        uint32_t qerId = pdr->qerId[i];
-        if (!qerId) continue;
-
-        list_node_t *node = session->qer_list->head;
-        while (node) {
-            UpfQER *qer = (UpfQER *)node->val;
-            node = node->next;
-            if (qer->qerId != qerId) continue;
-
-            // pack port (high 8 bits) + low-24 of id24 (TEID or UE-IP)
-            uint32_t ft_key = ((uint32_t)port << 24) ^ (id24 & 0x00FFFFFFU);
-
-            if (ftSearch(ft_key) < 0 && qer->flags.maximumBitrate) {
-                UTLT_Info("QER ID: %u ft_key: %u", qerId, ft_key);
-                struct rte_meter_trtcm_params trtcm_params = app_trtcm_params;
-
-                // choose UL vs DL MBR
-                uint32_t mbr = is_uplink
-                             ? qer->maximumBitrate.ul
-                             : qer->maximumBitrate.dl;
-                trtcm_params.pir = mbr * 1000 / 8;
-
-                // choose UL vs DL GBR (or default)
-                if (qer->flags.guaranteedBitrate) {
-                    uint32_t gbr = is_uplink
-                                 ? qer->guaranteedBitrate.ul
-                                 : qer->guaranteedBitrate.dl;
-                    trtcm_params.cir = gbr * 1000 / 8;
-                } else {
-                    trtcm_params.cir = is_uplink ? 0 : 1;
-                }
-
-                if (!ftAddEntry(ft_key, trTCMidx)) {
-                    UTLT_Warning("FT add failed");
-                }
-                rte_meter_trtcm_profile_config(&app_trtcm_profile, &trtcm_params);
-                rte_meter_trtcm_config(&app_flows[trTCMidx], &app_trtcm_profile);
-
-                UTLT_Info("TRTCM params: cir=%u pir=%u cbs=%u pbs=%u",
-                          trtcm_params.cir, trtcm_params.pir,
-                          trtcm_params.cbs, trtcm_params.pbs);
-                trTCMidx++;
-            }
-        }
-    }
-} */
-
-
-
-
 static inline void
 ConfigureQerFlows(UpfSession *session,
                   const UPDK_PDR *pdr,
@@ -509,7 +394,6 @@ ConfigureQerFlows(UpfSession *session,
         }
     }
 }
-
 
 
 char *
@@ -617,7 +501,6 @@ parseMAC(const char *config_path) {
 }
 
 
-
 static inline source_interface_t PortToSourceInterface(uint8_t port) {
     if ((int)port == g_access_port)  return SRC_IF_ACCESS;
     if ((int)port == g_core_port)    return SRC_IF_CORE;
@@ -626,8 +509,6 @@ static inline source_interface_t PortToSourceInterface(uint8_t port) {
                  port, g_access_port, g_core_port, g_sgi_port);
     return SRC_IF_ACCESS;
 }
-
-
 
 
 static int
@@ -879,7 +760,7 @@ GetPdrByUeIpAddress(struct rte_mbuf *pkt, uint32_t ue_ip)
 
     if (key.proto == IPPROTO_UDP) {
         const struct rte_udp_hdr *uh = onvm_pkt_udp_hdr(pkt);
-        if (uh) {                      // <-- do NOT return on NULL
+        if (uh) {
             sp = rte_be_to_cpu_16(uh->src_port);
             dp = rte_be_to_cpu_16(uh->dst_port);
         }
@@ -937,7 +818,6 @@ GetPdrByUeIpAddress(struct rte_mbuf *pkt, uint32_t ue_ip)
     return pdr;
 }
 
-
 static inline const char *
 ip4_to_buf(uint32_t be_addr, char buf[16]) {
   inet_ntop(AF_INET, &be_addr, buf, 16);
@@ -993,14 +873,14 @@ UPDK_PDR *GetPdrByTeid(struct rte_mbuf *pkt, uint32_t td) {
     uint8_t *inner_ptr = base + payload_offset;
 
     if ((inner_ptr[0] >> 4) != 4 || (inner_ptr[0] & 0x0F) < 5) {
-        UTLT_Warning("Non-IPv4 start at offset %u (0x%02x), scanning for IPv4...",
+        UTLT_Info("Non-IPv4 start at offset %u (0x%02x), scanning for IPv4...",
                      payload_offset, inner_ptr[0]);
         int found = 0;
         for (int delta = -4; delta <= 4; delta++) {
             if ((int)payload_offset + delta < 0) continue;
             uint8_t *cand = base + payload_offset + delta;
             if ((cand[0] >> 4) == 4 && (cand[0] & 0x0F) >= 5) {
-                UTLT_Warning("Adjusted payload_offset from %u to %u",
+                UTLT_Info("Adjusted payload_offset from %u to %u",
                              payload_offset, payload_offset + delta);
                 payload_offset += delta;
                 inner_ptr = cand;
