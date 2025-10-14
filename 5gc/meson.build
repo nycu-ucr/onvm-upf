@@ -16,7 +16,7 @@ foreach nf : l25gc_nfs
     subdir(nf)
 
     # base deps for every NF
-    deps = [ onvm_dpdk_dep, onvm_nflib_dep, onvm_l25gc_dep, rt_dep ]
+    deps = [ onvm_dpdk_dep, onvm_nflib_dep, onvm_l25gc_dep, rt_dep, classifier_dep ]
 
     if nf == 'upf_u_complete'
         deps += upf_u_link_deps
