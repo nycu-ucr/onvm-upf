@@ -314,9 +314,9 @@ bool UpfClsRebuildAndPublish(uint32_t *out_version) {
     if (retired) {
         __atomic_store_n(&g_cls_retired_snapshot, retired, __ATOMIC_RELEASE);
         __atomic_store_n(&g_cls_retired_version,  ver,     __ATOMIC_RELEASE);
-        UTLT_Info("CLS publish: new=%p retired=%p ver=%u", snap, retired, ver);
+        UTLT_Debug("CLS publish: new=%p retired=%p ver=%u", snap, retired, ver);
     } else {
-        UTLT_Info("CLS publish: new=%p retired=<none> ver=%u", snap, ver);
+        UTLT_Debug("CLS publish: new=%p retired=<none> ver=%u", snap, ver);
     }
 
     /* Notify DP exactly once to flip to this version */
@@ -348,7 +348,7 @@ void UpfClsOnAckFree(uint32_t ver) {
     void *to_free = __atomic_exchange_n(&g_cls_retired_snapshot, NULL, __ATOMIC_ACQ_REL);
     if (!to_free) return;  // already freed
 
-    UTLT_Info("CLS GC: ACK ver=%u, freeing retired snapshot %p", ver, to_free);
+    UTLT_Debug("CLS GC: ACK ver=%u, freeing retired snapshot %p", ver, to_free);
     cls_destroy((cls_handle_t*)to_free);
 
     // Optional: clear version (release) so duplicate ACKs are cheap no-ops
