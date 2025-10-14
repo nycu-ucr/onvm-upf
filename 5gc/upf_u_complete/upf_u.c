@@ -755,7 +755,7 @@ GetPdrByUeIpAddress(struct rte_mbuf *pkt, uint32_t ue_ip)
     key.ue_ip   = ue_ip;
 
     uint16_t sp = 0, dp = 0;
-    
+
     key.proto = outer4->next_proto_id;
 
     if (key.proto == IPPROTO_UDP) {
@@ -785,11 +785,11 @@ GetPdrByUeIpAddress(struct rte_mbuf *pkt, uint32_t ue_ip)
     key.is_uplink = false;
 
     // printf("DBG2: srcIf=%u (port=%u)\n", key.source_if, pkt->port);
-    
+
     /* UTLT_Debug("DL key → teid=%u UE_IP=%s/%u sport=%u dport=%u proto=%u "
                "spi=%u flow_label=%u ni=0x%08x qfi=%u srcIf=%u",
         key.teid,
-        ip4(key.ue_ip), 
+        ip4(key.ue_ip),
         key.src_port, key.dst_port,
         key.proto,
         key.spi,
@@ -969,14 +969,14 @@ UPDK_PDR *GetPdrByTeid(struct rte_mbuf *pkt, uint32_t td) {
         UTLT_Error("Couldn't classify the packet to a PDR");
         return NULL;
     }
-    
+
     UpfSession *session = UpfSessionFindByTeid(td);
     if (session) {
         ConfigureQerFlows(session, pdr, pkt->port, true);
     }
-    
+
     return pdr;
-} 
+}
 
 void *
 GetQerByUEIpAddress(uint32_t ue_ip, char *IP) {
@@ -1148,7 +1148,7 @@ AttachL2Header(struct rte_mbuf *pkt, bool is_dl) {
         eth_hdr->dst_addr.addr_bytes[4] = AnMac[4];
         eth_hdr->dst_addr.addr_bytes[5] = AnMac[5];
 
-    } else { 
+    } else {
         rte_ether_addr_copy(&cn_dn_eth, &eth_hdr->src_addr);
         rte_ether_addr_copy(&dn_eth, &eth_hdr->dst_addr);
     }
@@ -1184,7 +1184,6 @@ packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm_nf_
     UTLT_Info("Src IP is %s\n", src_address);
     char *dst_address = convertToIpAddress(iph->dst_addr);
     UTLT_Info("Dst IP is %s\n", dst_address);
-
 
     if (iph->dst_addr == SELF_IP) {  //
         UTLT_Info("It is uplink\n");
