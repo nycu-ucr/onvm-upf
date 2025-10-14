@@ -66,3 +66,9 @@ env
 
 # Output directories
 /bin
+
+.idea/
+
+**/.DS_Store
+
+.vscode/

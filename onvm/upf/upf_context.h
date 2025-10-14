@@ -6,6 +6,8 @@
 #include <net/if.h>
 #include <pthread.h>
 
+#include <rte_ring.h>
+
 #include "utlt_list.h"
 #include "utlt_buff.h"
 #include "utlt_event.h"
@@ -138,6 +140,10 @@ typedef struct _UpfSession {
     list_t          *pdr_list;
     list_t          *far_list;
     list_t          *qer_list;
+
+    /* === Per-session DL buffering (for egress NF) === */
+    struct rte_ring *dl_ring;  /* dl_ring_<SEID>, lazily published by Ingress */
+    uint16_t         buffering;/* 0=live (CLEAR), 1=paused (SET_BUF) */
 
     bool srr_flag;
 } UpfSession;
