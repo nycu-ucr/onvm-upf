@@ -52,9 +52,7 @@
 
 // for logging
 
-/* #include <rte_hexdump.h>
-#include <rte_memory.h> */
-
+#include "upf_u_config.h"
 
 #define NF_TAG "upf_u"
 
@@ -107,9 +105,9 @@ int SELF_IP;
 
 enum { IF_UNKNOWN = -1 };
 
-static int16_t g_access_port = 0;
-static int16_t g_core_port   = 1;
-static int16_t g_sgi_port    = 1;
+int16_t g_access_port = 0;
+int16_t g_core_port   = 0;
+int16_t g_sgi_port    = 0;
 
 
 
@@ -137,7 +135,7 @@ struct flow_entry {
 }typedef flow_entry_t;
 flow_entry_t iPFlows[APP_FLOWS_MAX];
 uint32_t iPFlowsLen = 0;
-uint32_t trTCMidx = 0; 
+uint32_t trTCMidx = 0;
 
 
 typedef struct {
@@ -263,7 +261,7 @@ static inline uint16_t UpfClassifyGetPdrId(const ps_packet_t *key) {
         UTLT_Warning("CLS classify: no snapshot yet (ver=%u) — dropping", g_cls_local.ver);
         return 0;
     }
-    
+
     // logging block
     void *engine = *(void**)snap;
     UTLT_Debug("CLS classify: snap=%p engine=%p ver=%u", (void*)snap, engine, g_cls_local.ver);
@@ -314,7 +312,7 @@ bool ftAddEntry(uint32_t subnet, int flow_idx) {
     iPFlows[index].flow_idx = flow_idx;
     iPFlows[index].in_use = true;
     iPFlowsLen++;
-    
+
     return true;
 }
 
@@ -331,7 +329,7 @@ uint32_t charStr2MaskedIP(char *str, uint32_t *prefix_val){
     sscanf(str, "%[^/]/%d", ip_str, &prefix_len);
     struct in_addr ip_addr;
     inet_pton(AF_INET, ip_str, &ip_addr);
-    
+
     if (prefix_val) *prefix_val = prefix_len;
     return IP_MASKED(ip_addr.s_addr, prefix_len);
 }
@@ -357,7 +355,7 @@ ConfigureQerFlows(UpfSession *session,
 {
     if (!session || !pdr) return;
     if (!session->qer_list) return;
-    
+
     for (int i = 0; i < 2; i++) {
         uint32_t qerId = pdr->qerId[i];
         if (!qerId) continue;
@@ -392,7 +390,7 @@ ConfigureQerFlows(UpfSession *session,
                 }
 
                 if (!ftAddEntry(ft_key, trTCMidx)) {
-                    UTLT_Warning("FT add failed"); 
+                    UTLT_Warning("FT add failed");
                 }
                 rte_meter_trtcm_profile_config(&app_trtcm_profile, &trtcm_params);
                 rte_meter_trtcm_config(&app_flows[trTCMidx], &app_trtcm_profile);
@@ -450,7 +448,7 @@ ConfigureQerFlows(UpfSession *session,
         for (list_node_t *node = session->qer_list->head; node; node = node->next) {
             UpfQER *qer = (UpfQER *)node->val;
             if (!qer || qer->qerId != qerId) continue;
-            
+
             /* int idx = ftSearch(key);
             if (idx >= 0) {
                 UTLT_Info("QER flow already exists: key=%u idx=%d (is_uplink=%d)", key, idx, (int)is_uplink);
@@ -1568,12 +1566,19 @@ main(int argc, char *argv[]) {
         rte_exit(EXIT_FAILURE, "Cannot get MAC address: err=%d, port=%u\n", ret, 1);
 
     // Parse DN & AN MAC address from upf_u.txt
-    const char *config_path = "upf_u.txt";  // default
+    //const char *config_path = "upf_u.txt";  // default
+
+    const char *config_path = "config/upf_u.yaml";
+
     if (argc > arg_offset + 1) {
         config_path = argv[arg_offset + 1];
     }
-    printf("Using config path: %s\n", config_path);  // print the path
-    parseMAC(config_path);
+    printf("[UPF-U] Using config: %s\n", config_path);
+    //parseMAC(config_path);
+    UpfU_LoadAndParseConfig(config_path);
+
+    /* UTLT_Info("[UPF-U][CONFIG] Port map: ACCESS=%d CORE=%d SGI=%d",
+          g_access_port, g_core_port, g_sgi_port); */
 
     // 8c:dc:d4:ac:6c:7d
     dn_eth.addr_bytes[0] = DnMac[0];
