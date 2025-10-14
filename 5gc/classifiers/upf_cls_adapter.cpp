@@ -13,7 +13,9 @@
 #include "upf_cls_adapter.h"
 #include "classifier_wrapper.h"
 
+#ifndef CLS_ADAPTER_DEBUG
 #define CLS_ADAPTER_DEBUG 0
+#endif
 
 /*──────────────────── local helpers ────────────────────*/
 
@@ -94,7 +96,7 @@ static void log_rule(const pdr_t &r) {
 
 extern "C" pdr_t updk_pdr_to_cls_rule(const UPDK_PDR *in, bool is_uplink)
 {
-#ifdef CLS_ADAPTER_DEBUG
+#if CLS_ADAPTER_DEBUG
     std::printf("updk_pdr_to_cls_rule: is_uplink = %s\n", is_uplink ? "true" : "false");
 #endif
 
@@ -145,7 +147,7 @@ extern "C" pdr_t updk_pdr_to_cls_rule(const UPDK_PDR *in, bool is_uplink)
                     out.pdi.src_ip.s_addr = 0;                    out.pdi.src_pref = 0;
                     out.pdi.dst_ip.s_addr = out.pdi.ue_ip.s_addr; out.pdi.dst_pref = out.pdi.ue_pref;
                 }
-#ifdef CLS_ADAPTER_DEBUG
+#if CLS_ADAPTER_DEBUG
                 std::printf("[CLS] FlowDescription hack: %s — src=%u dst=%u\n",
                             is_uplink ? "UL" : "DL",
                             out.pdi.src_ip.s_addr, out.pdi.dst_ip.s_addr);
@@ -163,7 +165,7 @@ extern "C" pdr_t updk_pdr_to_cls_rule(const UPDK_PDR *in, bool is_uplink)
                     if      (std::strcmp(token, "any") == 0)      { out.pdi.src_ip.s_addr = 0; out.pdi.src_pref = 0; }
                     else if (std::strcmp(token, "assigned") == 0) {
                         if (out.pdi.ue_pref == 0 && out.pdi.ue_ip.s_addr == 0) {
-#ifdef CLS_ADAPTER_DEBUG
+#if CLS_ADAPTER_DEBUG
                             std::cerr << "[upf_cls_adapter] ‘assigned’ used but UE IP missing – wildcard\n";
 #endif
                             out.pdi.src_ip.s_addr = 0; out.pdi.src_pref = 0;
@@ -190,7 +192,7 @@ extern "C" pdr_t updk_pdr_to_cls_rule(const UPDK_PDR *in, bool is_uplink)
                     if      (std::strcmp(token, "any") == 0)      { out.pdi.dst_ip.s_addr = 0; out.pdi.dst_pref = 0; }
                     else if (std::strcmp(token, "assigned") == 0) {
                         if (out.pdi.ue_pref == 0 && out.pdi.ue_ip.s_addr == 0) {
-#ifdef CLS_ADAPTER_DEBUG
+#if CLS_ADAPTER_DEBUG
                             std::cerr << "[upf_cls_adapter] ‘assigned’ used but UE IP missing – wildcard\n";
 #endif
                             out.pdi.dst_ip.s_addr = 0; out.pdi.dst_pref = 0;
@@ -207,7 +209,7 @@ extern "C" pdr_t updk_pdr_to_cls_rule(const UPDK_PDR *in, bool is_uplink)
         }
     }
 
-#ifdef CLS_ADAPTER_DEBUG
+#if CLS_ADAPTER_DEBUG
     log_rule(out);
 #endif
 
