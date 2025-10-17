@@ -32,6 +32,9 @@
 #include <time.h>
 #include <unistd.h>
 
+#include <rte_ethdev.h>
+#include <stdatomic.h>
+
 #include "gtp.h"
 #include "upf_context.h"
 
@@ -39,6 +42,8 @@
 #include "onvm_nflib.h"
 #include "onvm_pkt_helper.h"
 #include "rte_meter.h"
+
+
 
 #include "upf_u_config.h"
 
@@ -70,6 +75,8 @@ static struct rte_ether_addr dn_eth;
 static struct rte_ether_addr cn_dn_eth;
 static struct rte_ether_addr cn_ue_eth;
 
+static atomic_uint_fast64_t last_stats_tsc = 0;
+
 uint8_t DnMac[RTE_ETHER_ADDR_LEN];
 uint8_t AnMac[RTE_ETHER_ADDR_LEN];
 int SELF_IP;
@@ -82,6 +89,22 @@ int16_t g_core_port   = 0;
 int16_t g_sgi_port    = 0;
 
 
+static inline void upf_print_port_stats_periodic(void) {
+    const uint64_t now = rte_rdtsc();
+    uint64_t last = atomic_load_explicit(&last_stats_tsc, memory_order_relaxed);
+    if (now - last < rte_get_tsc_hz()) return; // ~1s
+    if (!atomic_compare_exchange_strong(&last_stats_tsc, &last, now)) return;
+
+    struct rte_eth_stats s0 = {0}, s1 = {0};
+    rte_eth_stats_get(g_access_port, &s0);
+    rte_eth_stats_get(g_core_port,   &s1);
+    UTLT_Warning(
+        "STATS acc{rx=%"PRIu64" tx=%"PRIu64" rx_nombuf=%"PRIu64" oerrors=%"PRIu64"} "
+        "core{rx=%"PRIu64" tx=%"PRIu64" rx_nombuf=%"PRIu64" oerrors=%"PRIu64"}",
+        s0.ipackets, s0.opackets, s0.rx_nombuf, s0.oerrors,
+        s1.ipackets, s1.opackets, s1.rx_nombuf, s1.oerrors
+    );
+}
 
 char *
 convertToIpAddress(uint32_t big_endian_value) {
@@ -540,7 +563,7 @@ GetPdrByUeIpAddress(struct rte_mbuf *pkt, uint32_t ue_ip) { // dl
                 // new ft entry
                 key = pdr->pdi.flags.sdfFilter ? pkt->port + fd_target : pkt->port;
                 if (ftSearch(key) < 0 && qer->flags.maximumBitrate) {
-                    UTLT_Info("QER ID: %d key: %d", qerId, key);
+                    /* UTLT_Info("QER ID: %d key: %d", qerId, key);
                     struct rte_meter_trtcm_params trtcm_params = app_trtcm_params;
                     if (!ftAddEntry(key, trTCMidx)) {
                         UTLT_Warning("FT add failed");
@@ -561,7 +584,7 @@ GetPdrByUeIpAddress(struct rte_mbuf *pkt, uint32_t ue_ip) { // dl
                     }
                     // config trtcm table 
                     UTLT_Info("TRTCM params: %d %d %d %d\n", trtcm_params.cir, trtcm_params.pir, trtcm_params.cbs, trtcm_params.pbs);
-                    trTCMidx ++;
+                    trTCMidx ++; */
                 }
             }
         }
@@ -656,7 +679,7 @@ GetPdrByTeid(struct rte_mbuf *pkt, uint32_t td) {
     if (pdr) {
         seid = session->smfSeid;
         pdrId = pdr->pdrId;
-        for (int i=0; i<2; i++){
+        /* for (int i=0; i<2; i++){
             if (!pdr->qerId[i]) continue;
             UpfQER *qer = NULL;
             uint32_t key = 0, qerId = pdr->qerId[i];
@@ -690,7 +713,7 @@ GetPdrByTeid(struct rte_mbuf *pkt, uint32_t td) {
                     trTCMidx ++;
                 }
             }
-        }
+        } */
     }
     return pdr;
 }
@@ -773,32 +796,29 @@ HandlePacketWithFar(struct rte_mbuf *pkt, UPDK_FAR *far, UPDK_QER *qer, struct o
                 meta->action = ONVM_NF_ACTION_OUT;
                 break;
             case UPDK_FAR_APPLY_ACTION_BUFF:
-                meta->destination = pkt->port ^ 1;
-                meta->action = ONVM_NF_ACTION_DROP;
-                if (buffer_length < MAX_OF_BUFFER_PACKET_SIZE) {
+                if (far->flags.forwardingParameters &&
+                    far->forwardingParameters.flags.outerHeaderCreation &&
+                    far->forwardingParameters.outerHeaderCreation.description ==
+                        UPDK_OUTER_HEADER_CREATION_DESCRIPTION_GTPU_UDP_IPV4) {
                     Encap(pkt, far, qer);
-                    buffer[buffer_length++] = pkt;
-                    buff = 1;
                 }
+                meta->action = ONVM_NF_ACTION_OUT;
+                // do NOT touch buffer[], do NOT DROP here
                 break;
             default:
                 UTLT_Error("Unspec apply action[%u] in FAR[%u]", far->applyAction, far->farId);
         }
         // TODO(vivek): Complete these actions:
-        if (far->applyAction & UPDK_FAR_APPLY_ACTION_NOCP) {
+        /* if (far->applyAction & UPDK_FAR_APPLY_ACTION_NOCP) {
             // Send message to UPF-C
             Event *msg = (Event *)rte_calloc(NULL, 1, sizeof(Event), 0);
             msg->type = UPF_EVENT_SESSION_REPORT;
             msg->arg0 = seid;
             msg->arg1 = pdrId;
-            /*
-            struct ReportMsg *msg= (struct ReportMsg *) rte_calloc(NULL, 1, sizeof(struct ReportMsg), 0);
-            msg->seid = seid;
-            msg->pdrId = pdrId;
-            */
+            
             UTLT_Debug("Send to upf-c, namely service id is 2\n");
             onvm_nflib_send_msg_to_nf(2, msg);
-        }
+        } */
         if (far->applyAction & UPDK_FAR_APPLY_ACTION_DUPL) {
             UTLT_Error("Duplicate Apply action: %u not supported, dropping the packet", far->applyAction);
         }
@@ -878,7 +898,7 @@ packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm_nf_
         UTLT_Info("(%s) Time: %ld.%09ld\n", convertToIpAddress(iph->dst_addr), ts.tv_sec, ts.tv_nsec);
         //  Step 2: Get PDR rule
         pdr = GetPdrByUeIpAddress(pkt, rte_cpu_to_be_32(iph->dst_addr));
-        GetQerByUEIpAddress(rte_cpu_to_be_32(iph->dst_addr), convertToIpAddress(iph->dst_addr));
+        // GetQerByUEIpAddress(rte_cpu_to_be_32(iph->dst_addr), convertToIpAddress(iph->dst_addr));
         is_dl = true;
     }
 
@@ -925,7 +945,7 @@ packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm_nf_
     }
 
     int status = 0, color_result = 0;
-    status = HandlePacketWithFar(pkt, far, pdr->qer, meta);
+    status = HandlePacketWithFar(pkt, far, NULL, meta);
     if (meta->action == ONVM_NF_ACTION_DROP) {
         UTLT_Info("Action is drop\n");
     } else if (meta->action == ONVM_NF_ACTION_OUT) {
@@ -934,6 +954,8 @@ packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm_nf_
         UTLT_Trace("Action is unknown\n");
     }
     AttachL2Header(pkt, is_dl);
+    upf_print_port_stats_periodic();
+    return 0;
     if (meta->action == ONVM_NF_ACTION_OUT && is_dl) {
         // check if the UE IP exists in the table and update the token
         int index = findIndexByUeIpAddress(rte_cpu_to_be_32(iph->dst_addr));
@@ -1090,10 +1112,10 @@ main(int argc, char *argv[]) {
     }
 
     int ret;
-    ret = rte_eth_macaddr_get(0, &cn_ue_eth);
+    ret = rte_eth_macaddr_get(g_access_port, &cn_ue_eth);
     if (ret < 0)
         rte_exit(EXIT_FAILURE, "Cannot get MAC address: err=%d, port=%u\n", ret, 0);
-    ret = rte_eth_macaddr_get(1, &cn_dn_eth);
+    ret = rte_eth_macaddr_get(g_core_port, &cn_dn_eth);
     if (ret < 0)
         rte_exit(EXIT_FAILURE, "Cannot get MAC address: err=%d, port=%u\n", ret, 1);
 
@@ -1121,8 +1143,8 @@ main(int argc, char *argv[]) {
     dn_eth.addr_bytes[5] = DnMac[5];
 
     // trTCM
-    trtcmConfigFlowTables();
-    initUeTable();
+    //trtcmConfigFlowTables();
+    // initUeTable();
 
     UpfSessionPoolInit();
     UeIpToUpfSessionMapInit();
