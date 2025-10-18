@@ -747,8 +747,18 @@ addEntrybyUeIp(uint32_t ue_ip, uint32_t ue_ambr, uint32_t ue_gbr,uint32_t ue_mbr
             ue_table[i].ue_nqos_tb_params.tb_tokens = nqos_rate;
             ue_table[i].ue_nqos_tb_params.last_cycle = rte_get_tsc_cycles();
             ue_table[i].ue_nqos_tb_params.cur_cycles = rte_get_tsc_cycles();
-            UTLT_Info("non QoS Rate: %d", nqos_rate); 
+            UTLT_Info("non QoS Rate: %d", nqos_rate);
 
+            UTLT_Warning("TB init UE=%s "
+            "QOS{rate(Mbps)=%" PRIu64 " depth(bytes)=%" PRIu64 " tokens(bytes)=%" PRIu64 "} "
+            "NQOS{rate(Mbps)=%" PRIu64 " depth(bytes)=%" PRIu64 " tokens(bytes)=%" PRIu64 "}",
+            convertToIpAddress(ue_table[i].ue_ip),
+            ue_table[i].ue_qos_tb_params.tb_rate,
+            ue_table[i].ue_qos_tb_params.tb_depth,
+            ue_table[i].ue_qos_tb_params.tb_tokens,
+            ue_table[i].ue_nqos_tb_params.tb_rate,
+            ue_table[i].ue_nqos_tb_params.tb_depth,
+            ue_table[i].ue_nqos_tb_params.tb_tokens);
 
             break;
         }
@@ -1497,8 +1507,16 @@ packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm_nf_
             }
             if (meta->flags == RTE_COLOR_YELLOW) {
                 while (ue_table[index].ue_qos_tb_params.tb_tokens < cal_pktlen) {
-                    updateTokenbyIndex(index);
-                    usleep(1);
+                    /* updateTokenbyIndex(index);
+                    usleep(1); */
+                    UTLT_Error("TB DROP(QOS) UE=%s pkt=%uB "
+                    "tokens=%" PRIu64 " depth=%" PRIu64 " rateBps=%" PRIu64,
+                    convertToIpAddress(ue_table[index].ue_ip),
+                    (unsigned)cal_pktlen,
+                    ue_table[index].ue_qos_tb_params.tb_tokens,
+                    ue_table[index].ue_qos_tb_params.tb_depth,
+                    ue_table[index].ue_qos_tb_params.tb_rate * 125000ULL);
+                    meta->action = ONVM_NF_ACTION_DROP;
                 }
                 ue_table[index].ue_qos_tb_params.tb_tokens -= cal_pktlen;
                 meta->action = ONVM_NF_ACTION_OUT;      
@@ -1507,8 +1525,16 @@ packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm_nf_
         // Step 2. bucket (non QoS flow)
         else {
             while (ue_table[index].ue_nqos_tb_params.tb_tokens < cal_pktlen) {
-                updateTokenbyIndex(index);
-                usleep(1);
+                /* updateTokenbyIndex(index);
+                usleep(1); */
+                UTLT_Error("TB DROP(NQOS) UE=%s pkt=%uB "
+                "tokens=%" PRIu64 " depth=%" PRIu64 " rateBps=%" PRIu64,
+                convertToIpAddress(ue_table[index].ue_ip),
+                (unsigned)cal_pktlen,
+                ue_table[index].ue_nqos_tb_params.tb_tokens,
+                ue_table[index].ue_nqos_tb_params.tb_depth,
+                ue_table[index].ue_nqos_tb_params.tb_rate * 125000ULL);
+                meta->action = ONVM_NF_ACTION_DROP;
             }
             ue_table[index].ue_nqos_tb_params.tb_tokens -= cal_pktlen;
             meta->action = ONVM_NF_ACTION_OUT;
