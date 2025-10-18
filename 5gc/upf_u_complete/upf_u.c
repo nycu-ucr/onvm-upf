@@ -82,13 +82,61 @@
 #define MIN(x, y) (((x) < (y)) ? (x) : (y))
 #define MAX_OF_BUFFER_PACKET_SIZE 30000
 
+#define GTPU_PORT 2152
+
 /* mask for 20-bit IPv6 flow label */
 #ifndef IPV6_FLOWLABEL_MASK
 #define IPV6_FLOWLABEL_MASK 0x000FFFFFu
 #endif
 
 
-static atomic_uint_fast64_t last_stats_tsc = 0;
+#define MAX_POOLS 4
+static struct rte_mempool *g_pools[MAX_POOLS];
+static uint32_t g_pool_cnt;
+
+static inline void upf_track_pool(struct rte_mbuf *m) {
+    struct rte_mempool *mp = m ? m->pool : NULL;
+    if (!mp) return;
+    for (uint32_t i = 0; i < g_pool_cnt; ++i)
+        if (g_pools[i] == mp) return;
+    if (g_pool_cnt < MAX_POOLS) g_pools[g_pool_cnt++] = mp;
+}
+
+static _Atomic uint64_t last_stats_tsc;
+
+int16_t g_access_port = 0;
+int16_t g_core_port   = 0;
+int16_t g_sgi_port    = 0;
+
+static inline void upf_print_port_stats_periodic(void) {
+    const uint64_t now = rte_rdtsc();
+    uint64_t last = atomic_load_explicit(&last_stats_tsc, memory_order_relaxed);
+    if (now - last < rte_get_tsc_hz()) return;
+    if (!atomic_compare_exchange_strong(&last_stats_tsc, &last, now)) return;
+
+    struct rte_eth_stats acc = {0}, core = {0};
+    rte_eth_stats_get(g_access_port, &acc);
+    rte_eth_stats_get(g_core_port,   &core);
+
+    char pools_buf[256]; pools_buf[0] = '\0';
+    for (uint32_t i = 0; i < g_pool_cnt; ++i) {
+        if (!g_pools[i]) continue;
+        unsigned avail = rte_mempool_avail_count(g_pools[i]);
+        unsigned inuse = rte_mempool_in_use_count(g_pools[i]);
+        char tmp[64];
+        int n = snprintf(tmp, sizeof(tmp), "%s%u:{a=%u u=%u}", (i? " ":""), i, avail, inuse);
+        if (n > 0) strncat(pools_buf, tmp, sizeof(pools_buf) - strlen(pools_buf) - 1);
+    }
+
+    UTLT_Warning(
+        "STATS acc{rx=%"PRIu64" tx=%"PRIu64" rx_nombuf=%"PRIu64" oerrors=%"PRIu64"} "
+        "core{rx=%"PRIu64" tx=%"PRIu64" rx_nombuf=%"PRIu64" oerrors=%"PRIu64"} pools[%s]",
+        acc.ipackets, acc.opackets, acc.rx_nombuf, acc.oerrors,
+        core.ipackets, core.opackets, core.rx_nombuf, core.oerrors,
+        pools_buf
+    );
+}
+
 
 static inline int UpfSendEvt1(uint16_t dest_sid, uint32_t type, uintptr_t a0) {
     Event *e = (Event *)rte_calloc("upf_evt", 1, sizeof(*e), 0);
@@ -111,9 +159,7 @@ int SELF_IP;
 
 enum { IF_UNKNOWN = -1 };
 
-int16_t g_access_port = 0;
-int16_t g_core_port   = 0;
-int16_t g_sgi_port    = 0;
+
 
 
 
@@ -143,23 +189,6 @@ flow_entry_t iPFlows[APP_FLOWS_MAX];
 uint32_t iPFlowsLen = 0;
 uint32_t trTCMidx = 0;
 
-
-static inline void upf_print_port_stats_periodic(void) {
-    const uint64_t now = rte_rdtsc();
-    uint64_t last = atomic_load_explicit(&last_stats_tsc, memory_order_relaxed);
-    if (now - last < rte_get_tsc_hz()) return; // ~1s
-    if (!atomic_compare_exchange_strong(&last_stats_tsc, &last, now)) return;
-
-    struct rte_eth_stats s0 = {0}, s1 = {0};
-    rte_eth_stats_get(g_access_port, &s0);
-    rte_eth_stats_get(g_core_port,   &s1);
-    UTLT_Warning(
-        "STATS acc{rx=%"PRIu64" tx=%"PRIu64" rx_nombuf=%"PRIu64" oerrors=%"PRIu64"} "
-        "core{rx=%"PRIu64" tx=%"PRIu64" rx_nombuf=%"PRIu64" oerrors=%"PRIu64"}",
-        s0.ipackets, s0.opackets, s0.rx_nombuf, s0.oerrors,
-        s1.ipackets, s1.opackets, s1.rx_nombuf, s1.oerrors
-    );
-}
 
 
 typedef struct {
@@ -836,7 +865,7 @@ GetPdrByUeIpAddress(struct rte_mbuf *pkt, uint32_t ue_ip)
         return NULL;
     } */
 
-    char o_src[16], o_dst[16], o_ue[16];
+    /* char o_src[16], o_dst[16], o_ue[16];
         UTLT_Info("DL key → teid=%u UE_IP=%s SRC_IP=%s DST_IP=%s sport=%u dport=%u proto=%u "
                 "spi=%u flow_label=%u ni=0x%08x qfi=%u srcIf=%u is_uplink=%s",
             key.teid,
@@ -851,12 +880,12 @@ GetPdrByUeIpAddress(struct rte_mbuf *pkt, uint32_t ue_ip)
             key.qfi,
             (unsigned)key.source_if,
             key.is_uplink ? "true" : "false"
-        );
+        ); */
 
     const UPDK_PDR *pdr = UpfClassifyGetPdrPtr(&key);
     if (!pdr) {
 
-        //char o_src[16], o_dst[16], o_ue[16];
+        char o_src[16], o_dst[16], o_ue[16];
         UTLT_Error("DL key → teid=%u UE_IP=%s SRC_IP=%s DST_IP=%s sport=%u dport=%u proto=%u "
                 "spi=%u flow_label=%u ni=0x%08x qfi=%u srcIf=%u is_uplink=%s",
             key.teid,
@@ -1026,7 +1055,7 @@ UPDK_PDR *GetPdrByTeid(struct rte_mbuf *pkt, uint32_t td) {
 
     // printf("PDR ID from Classifier = %" PRIu16 "\n", pdr_id);
 
-    char o_ue[16];
+    /* char o_ue[16];
         UTLT_Error("UL key → teid=%u UE_IP=%s SRC_IP=%s DST_IP=%s sport=%u dport=%u proto=%u "
                 "spi=%u flow_label=%u ni=0x%08x qfi=%u srcIf=%u is_uplink=%s",
             key.teid,
@@ -1041,12 +1070,12 @@ UPDK_PDR *GetPdrByTeid(struct rte_mbuf *pkt, uint32_t td) {
             key.qfi,
             (unsigned)key.source_if,
             key.is_uplink ? "true" : "false"
-        );
+        ); */
 
     const UPDK_PDR *pdr = UpfClassifyGetPdrPtr(&key);
     if (!pdr) {
 
-        //char o_src[16], o_dst[16], o_ue[16];
+        char o_src[16], o_dst[16], o_ue[16];
         UTLT_Error("UL key → teid=%u UE_IP=%s SRC_IP=%s DST_IP=%s sport=%u dport=%u proto=%u "
                 "spi=%u flow_label=%u ni=0x%08x qfi=%u srcIf=%u is_uplink=%s",
             key.teid,
@@ -1257,6 +1286,7 @@ AttachL2Header(struct rte_mbuf *pkt, bool is_dl) {
 
 static int
 packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm_nf_local_ctx *nf_local_ctx) {
+    upf_track_pool(pkt);
     if (pkt == NULL || meta == NULL) {
         return 0;
     }
@@ -1265,14 +1295,58 @@ packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm_nf_
     // UTLT_Info("Handle PKT from port: %d [len: %d]", pkt->port, pkt->pkt_len);
     cal_pktlen = pkt->pkt_len - sizeof(struct rte_ether_hdr) - sizeof(struct rte_ipv4_hdr) - sizeof(struct rte_udp_hdr);
 
-    bool is_dl = false;
+    /* bool is_dl = false;
     meta->action = ONVM_NF_ACTION_DROP;
     struct rte_ipv4_hdr *iph = onvm_pkt_ipv4_hdr(pkt);
 
     if (iph == NULL) {
         UTLT_Info("Not IP packet, ignore it\n");
         return 0;
+    } */
+
+    struct rte_ether_hdr *eth = rte_pktmbuf_mtod(pkt, struct rte_ether_hdr *);
+    uint16_t ether_type = eth->ether_type;
+    uint16_t l3ofs = sizeof(*eth);
+
+    /* Handle a single VLAN tag (extend to a loop if you might see QinQ) */
+    if (unlikely(ether_type == rte_cpu_to_be_16(RTE_ETHER_TYPE_VLAN))) {
+        struct rte_vlan_hdr *vh = rte_pktmbuf_mtod_offset(pkt, struct rte_vlan_hdr *, l3ofs);
+        ether_type = vh->eth_proto;
+        l3ofs += sizeof(*vh);
     }
+
+    /* Bail if not IPv4 */
+    if (unlikely(ether_type != rte_cpu_to_be_16(RTE_ETHER_TYPE_IPV4))) {
+        meta->action = ONVM_NF_ACTION_DROP;   // or send to mgmtNF if you have one
+        return 0;
+    }
+
+    /* OUTER IPv4 & UDP (don’t mutate mbuf!) */
+    struct rte_ipv4_hdr *outer = rte_pktmbuf_mtod_offset(pkt, struct rte_ipv4_hdr *, l3ofs);
+    const uint8_t ihl = (outer->version_ihl & 0x0F) << 2;
+
+    struct rte_udp_hdr *udp = NULL;
+    if (likely(outer->next_proto_id == IPPROTO_UDP)) {
+        udp = rte_pktmbuf_mtod_offset(pkt, struct rte_udp_hdr *, l3ofs + ihl);
+    }
+
+    /* Direction: independent of data_off and inner headers */
+    const bool from_access = (pkt->port == g_access_port);
+    const bool from_core   = (pkt->port == g_core_port);
+
+    const bool is_ul = from_access &&
+                    likely(udp) &&
+                    likely(udp->dst_port == rte_cpu_to_be_16(GTPU_PORT));   // GTP-U to us
+
+    const bool is_dl = from_core &&
+                    (!udp || udp->dst_port != rte_cpu_to_be_16(GTPU_PORT)); // plain IP from DN
+
+    /* Optional: treat everything else as local/mgmt */
+    if (unlikely(!is_ul && !is_dl)) {
+        meta->action = ONVM_NF_ACTION_DROP;   // or route to control path
+        return 0;
+    }
+
 
     // Flip to a newly published snapshot if a REQ was received
     UpfClsMaybeFlipAndAck();
@@ -1293,43 +1367,42 @@ packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm_nf_
     UTLT_Info("Direction check: iph->dst_addr=0x%08" PRIx32 " (%s) SELF_IP host=0x%08" PRIx32 " net=0x%08" PRIx32 " (%s)",
               rte_be_to_cpu_32(iph->dst_addr), hdr_dst_buf,
               (uint32_t)SELF_IP, rte_cpu_to_be_32((uint32_t)SELF_IP), self_buf); */
-    
-    uint32_t a = iph->dst_addr; // raw value as compared (network order)
-    uint32_t b = SELF_IP;       // raw value as compared (whatever you stored)
 
-    //if (iph->dst_addr == SELF_IP) {  //
-    if (a == b) {
-        UTLT_Info("It is uplink\n");
-        UTLT_Info("iph->dst_addr=0x%08" PRIx32 " SELF_IP=0x%08" PRIx32, a, b);
 
-        struct rte_udp_hdr *udp_header = onvm_pkt_udp_hdr(pkt);
-        if (udp_header == NULL) {
+    if (is_ul) {
+        // Parse TEID from OUTER GTP-U (do NOT decap yet)
+        uint32_t teid = get_teid_gtp_packet(pkt, udp);   // host-order
+        pdr = GetPdrByTeid(pkt, teid);
+        if (!pdr) { 
+            UTLT_Error("UL: no PDR teid=0x%08x outer %s:%u -> %s:%u",
+               teid,
+               convertToIpAddress(outer->src_addr), rte_be_to_cpu_16(udp->src_port),
+               convertToIpAddress(outer->dst_addr), rte_be_to_cpu_16(udp->dst_port));
+            meta->action = ONVM_NF_ACTION_DROP;
             return 0;
         }
-        // invariant(dst_port == GTPV1_PORT);
-        // extract TEID from
-        // Step 2: Get PDR rule
-        uint32_t teid = get_teid_gtp_packet(pkt, udp_header);
-        pdr = GetPdrByTeid(pkt, teid);
+
+        // Only now mutate: remove outer headers, then recompute inner header
+        // ...
+    } else if (is_dl) {
+         struct rte_ipv4_hdr *iph = outer;  // avoid re-reading via data_off
+        uint32_t ue_ip_be = iph->dst_addr;
+        pdr = GetPdrByUeIpAddress(pkt, rte_cpu_to_be_32(ue_ip_be));
+        if (!pdr) { 
+            UTLT_Error("DL: no PDR UE=%s DN=%s",
+                   convertToIpAddress(ue_ip_be),
+                   convertToIpAddress(iph->src_addr));
+            meta->action = ONVM_NF_ACTION_DROP;
+            return 0;
+        }
+        GetQerByUEIpAddress(rte_cpu_to_be_32(ue_ip_be), convertToIpAddress(ue_ip_be));
 
     } else {
-        // UTLT_Info("It is downlink, dst is %s\n", convertToIpAddress(iph->dst_addr));
-        UTLT_Info("It is downlink\n");
-        UTLT_Info("iph->dst_addr=0x%08" PRIx32 " SELF_IP=0x%08" PRIx32, a, b);
-        pdr = GetPdrByUeIpAddress(pkt, rte_cpu_to_be_32(iph->dst_addr));
-        GetQerByUEIpAddress(rte_cpu_to_be_32(iph->dst_addr), convertToIpAddress(iph->dst_addr));
-        is_dl = true;
-    }
-
-    if (!pdr) {
-        if (a == b) {
-            UTLT_Error("It is uplink\n");
-        }
-        UTLT_Error("iph->dst_addr=0x%08" PRIx32 " SELF_IP=0x%08" PRIx32, a, b);
-        UTLT_Error("no PDR found for %s, skip\n", convertToIpAddress(iph->dst_addr));
-        // TODO(vivek): what to do?
+        // mgmt/local traffic (e.g., ping to UPF IP) — drop or send to control path
+        meta->action = ONVM_NF_ACTION_DROP;
         return 0;
     }
+
     //UTLT_Info("Got PDR ID is %u\n", pdr->pdrId);
     rte_pktmbuf_adj(pkt, sizeof(struct rte_ether_hdr));
 
@@ -1378,9 +1451,9 @@ packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm_nf_
     AttachL2Header(pkt, is_dl);
     if (meta->action == ONVM_NF_ACTION_OUT && is_dl) {
         // check if the UE IP exists in the table and update the token
-        int index = findIndexByUeIpAddress(rte_cpu_to_be_32(iph->dst_addr));
+        int index = findIndexByUeIpAddress(rte_cpu_to_be_32(outer->dst_addr));
         if (index != -1) {
-            UTLT_Trace("Update token for UE IP: %s", convertToIpAddress(iph->dst_addr));
+            UTLT_Trace("Update token for UE IP: %s", convertToIpAddress(outer->dst_addr));
             updateTokenbyIndex(index);
         }
         else {
