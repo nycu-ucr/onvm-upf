@@ -398,7 +398,7 @@ ConfigureQerFlows(UpfSession *session,
             } */
 
             // only add on miss, and only if MBR exists
-            if (ftSearch(key) < 0 && qer->flags.maximumBitrate) {
+            if (0 && ftSearch(key) < 0 && qer->flags.maximumBitrate) {
                 UTLT_Info("QER ID: %u key: %u", qerId, key);
 
                 struct rte_meter_trtcm_params trtcm_params = app_trtcm_params;
@@ -607,7 +607,7 @@ trtcmColorHandle(uint32_t pkt_len, uint64_t time, uint8_t qfi, struct rte_meter_
     return out_color;
 }
 
-static inline int
+/* static inline int
 trtcmPolicer(struct onvm_pkt_meta *meta, int color_result){
     if (meta->action == ONVM_NF_ACTION_DROP) {
         meta->flags = RTE_COLOR_RED;
@@ -623,7 +623,7 @@ trtcmPolicer(struct onvm_pkt_meta *meta, int color_result){
     case RTE_COLOR_YELLOW:
         UTLT_Info("\033[0;32mYELLOW(%d)\033[0m, best effort pkt fwd", RTE_COLOR_YELLOW);
         meta->flags = RTE_COLOR_YELLOW;
-        meta->action = ONVM_NF_ACTION_DROP;
+        meta->action = ONVM_NF_ACTION_OUT;   // was DROP
         break;
     case RTE_COLOR_GREEN:
         UTLT_Info("\033[0;33mGREEEN(%d)\033[0m, guaranted pkt fwd.", RTE_COLOR_GREEN);
@@ -635,6 +635,12 @@ trtcmPolicer(struct onvm_pkt_meta *meta, int color_result){
         return 1;
     }
     return 0;
+} */
+
+static inline void trtcmPolicer(struct onvm_pkt_meta *meta, int color_result) {
+    (void)color_result;
+    meta->flags  = RTE_COLOR_GREEN;
+    meta->action = ONVM_NF_ACTION_OUT;
 }
 
 
@@ -1405,7 +1411,7 @@ packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm_nf_
             meta->action = ONVM_NF_ACTION_DROP;
             return 0;
         }
-        GetQerByUEIpAddress(rte_cpu_to_be_32(ue_ip_be), convertToIpAddress(ue_ip_be));
+        // GetQerByUEIpAddress(rte_cpu_to_be_32(ue_ip_be), convertToIpAddress(ue_ip_be));
 
     } else {
         // mgmt/local traffic (e.g., ping to UPF IP) — drop or send to control path
@@ -1459,6 +1465,7 @@ packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm_nf_
         UTLT_Trace("Action is unknown\n");
     }
     AttachL2Header(pkt, is_dl);
+    #if 0
     if (meta->action == ONVM_NF_ACTION_OUT && is_dl) {
         // check if the UE IP exists in the table and update the token
         int index = findIndexByUeIpAddress(rte_cpu_to_be_32(outer->dst_addr));
@@ -1498,48 +1505,38 @@ packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm_nf_
         
         // Step 2. bucket (QoS flow)
         if (isQos) {
-            if (meta->flags == RTE_COLOR_RED) {
+            const uint32_t need = cal_pktlen;
+            struct tb_config *tb = &ue_table[index].ue_qos_tb_params;
+
+            if (tb->tb_tokens < need) {
+                UTLT_Error("TB DROP(QOS) UE=%s pkt=%uB tokens=%" PRIu64 " depth=%" PRIu64 " rateBps=%" PRIu64,
+                        convertToIpAddress(ue_table[index].ue_ip), (unsigned)need,
+                        tb->tb_tokens, tb->tb_depth, tb->tb_rate * 125000ULL);
                 meta->action = ONVM_NF_ACTION_DROP;
-            }
-            if (meta->flags == RTE_COLOR_GREEN) {
-                ue_table[index].ue_qos_tb_params.tb_tokens -= cal_pktlen;
+            } else {
+                tb->tb_tokens -= need;
                 meta->action = ONVM_NF_ACTION_OUT;
-            }
-            if (meta->flags == RTE_COLOR_YELLOW) {
-                while (ue_table[index].ue_qos_tb_params.tb_tokens < cal_pktlen) {
-                    /* updateTokenbyIndex(index);
-                    usleep(1); */
-                    UTLT_Error("TB DROP(QOS) UE=%s pkt=%uB "
-                    "tokens=%" PRIu64 " depth=%" PRIu64 " rateBps=%" PRIu64,
-                    convertToIpAddress(ue_table[index].ue_ip),
-                    (unsigned)cal_pktlen,
-                    ue_table[index].ue_qos_tb_params.tb_tokens,
-                    ue_table[index].ue_qos_tb_params.tb_depth,
-                    ue_table[index].ue_qos_tb_params.tb_rate * 125000ULL);
-                    meta->action = ONVM_NF_ACTION_DROP;
-                }
-                ue_table[index].ue_qos_tb_params.tb_tokens -= cal_pktlen;
-                meta->action = ONVM_NF_ACTION_OUT;      
             }
         }
         // Step 2. bucket (non QoS flow)
         else {
-            while (ue_table[index].ue_nqos_tb_params.tb_tokens < cal_pktlen) {
-                /* updateTokenbyIndex(index);
-                usleep(1); */
-                UTLT_Error("TB DROP(NQOS) UE=%s pkt=%uB "
-                "tokens=%" PRIu64 " depth=%" PRIu64 " rateBps=%" PRIu64,
-                convertToIpAddress(ue_table[index].ue_ip),
-                (unsigned)cal_pktlen,
-                ue_table[index].ue_nqos_tb_params.tb_tokens,
-                ue_table[index].ue_nqos_tb_params.tb_depth,
-                ue_table[index].ue_nqos_tb_params.tb_rate * 125000ULL);
+            const uint32_t need = cal_pktlen;
+            struct tb_config *tb = &ue_table[index].ue_nqos_tb_params;
+
+            if (tb->tb_tokens < need) {
+                UTLT_Error("TB DROP(NQOS) UE=%s pkt=%uB tokens=%" PRIu64 " depth=%" PRIu64 " rateBps=%" PRIu64,
+                        convertToIpAddress(ue_table[index].ue_ip), (unsigned)need,
+                        tb->tb_tokens, tb->tb_depth, tb->tb_rate * 125000ULL);
                 meta->action = ONVM_NF_ACTION_DROP;
+            } else {
+                tb->tb_tokens -= need;
+                meta->action = ONVM_NF_ACTION_OUT;
             }
-            ue_table[index].ue_nqos_tb_params.tb_tokens -= cal_pktlen;
-            meta->action = ONVM_NF_ACTION_OUT;
         }
     }
+    #else
+    meta->action = ONVM_NF_ACTION_OUT;
+    #endif
     upf_print_port_stats_periodic();
     return status;
 }
@@ -1688,7 +1685,7 @@ main(int argc, char *argv[]) {
     dn_eth.addr_bytes[5] = DnMac[5];
 
     // trTCM
-    trtcmConfigFlowTables();
+    // trtcmConfigFlowTables();
     initUeTable();
 
     UpfSessionPoolInit();
