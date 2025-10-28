@@ -88,8 +88,8 @@
 #define NF_MSG_SIZE sizeof(struct onvm_nf_msg)
 #define NF_MSG_CACHE_SIZE 8
 
-#define RTE_MP_RX_DESC_DEFAULT 1024
-#define RTE_MP_TX_DESC_DEFAULT 1024
+#define RTE_MP_RX_DESC_DEFAULT 512
+#define RTE_MP_TX_DESC_DEFAULT 512
 #define NF_MSG_QUEUE_SIZE 128
 
 #define NO_FLAGS 0
