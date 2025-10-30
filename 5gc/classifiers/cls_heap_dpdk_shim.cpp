@@ -4,6 +4,17 @@
 #include <rte_malloc.h>
 #include <rte_memory.h>
 
+#ifndef CLS_SHIM_HAS_ALIGNED_NEW
+  #define CLS_SHIM_HAS_ALIGNED_NEW 0
+  // Prefer library feature-test macros over compiler ones
+  #if (defined(__cpp_lib_aligned_new) && (__cpp_lib_aligned_new >= 201606)) \
+      || defined(_GLIBCXX_HAVE_ALIGNED_NEW) \
+      || defined(_LIBCPP_HAS_ALIGNED_ALLOCATION)
+    #undef CLS_SHIM_HAS_ALIGNED_NEW
+    #define CLS_SHIM_HAS_ALIGNED_NEW 1
+  #endif
+#endif
+
 static inline std::size_t round_up_align(std::size_t a) {
     // DPDK expects power-of-two, >= cacheline
     if (a < RTE_CACHE_LINE_SIZE) a = RTE_CACHE_LINE_SIZE;
@@ -55,6 +66,8 @@ void  operator delete[](void* p, const std::nothrow_t&) noexcept {
      if (p) rte_free(p);
 }
 
+#if CLS_SHIM_HAS_ALIGNED_NEW
+
 /* ---------- Aligned new/delete (C++17) ---------- */
 void* operator new (std::size_t n, std::align_val_t al) {
     std::size_t a = round_up_align(static_cast<std::size_t>(al));
@@ -96,3 +109,6 @@ void  operator delete (void* p, std::align_val_t, const std::nothrow_t&) noexcep
 void  operator delete[](void* p, std::align_val_t, const std::nothrow_t&) noexcept {
      if (p) rte_free(p);
 }
+
+
+#endif // CLS_SHIM_HAS_ALIGNED_NEW

@@ -80,7 +80,7 @@
 #define IP_MASKED(BIGENDIINT, LEN) (BIGENDIINT & (0xFFFFFFFF << (32-LEN)))
 #define MAX_UE 256 // Max number of UEs
 #define MIN(x, y) (((x) < (y)) ? (x) : (y))
-#define MAX_OF_BUFFER_PACKET_SIZE 30000
+#define MAX_OF_BUFFER_PACKET_SIZE 300000
 
 #define GTPU_PORT 2152
 
@@ -947,10 +947,10 @@ UPDK_PDR *GetPdrByTeid(struct rte_mbuf *pkt, uint32_t td) {
     // Outer IPv4
     struct rte_ipv4_hdr *outer4 = onvm_pkt_ipv4_hdr(pkt);
     if (!outer4) return NULL;
-    UTLT_Debug("Outer IPv4 src=%s dst=%s totlen=%u",
+    /* UTLT_Debug("Outer IPv4 src=%s dst=%s totlen=%u",
                ip4_to_buf(outer4->src_addr, o_src),
                ip4_to_buf(outer4->dst_addr, o_dst),
-               data_len);
+               data_len); */
 
     // Outer UDP
     struct rte_udp_hdr *outerU = onvm_pkt_udp_hdr(pkt);
@@ -959,12 +959,12 @@ UPDK_PDR *GetPdrByTeid(struct rte_mbuf *pkt, uint32_t td) {
 
     // TEID extraction
     uint32_t teid = get_teid_gtp_packet(pkt, outerU);
-    UTLT_Debug("Extracted TEID (host order): %u", teid);
+    //UTLT_Debug("Extracted TEID (host order): %u", teid);
 
     // GTP-U header length + QFI
     uint8_t qfi = 0;
     uint16_t payload_offset = get_gtpu_header_len_with_qfi(pkt, &qfi);
-    UTLT_Debug("Computed GTP-U payload_offset=%u QFI=%u", payload_offset, qfi);
+    //UTLT_Debug("Computed GTP-U payload_offset=%u QFI=%u", payload_offset, qfi);
 
     // Base pointer to GTP header
     uint8_t *base = rte_pktmbuf_mtod(pkt, uint8_t *) +
@@ -980,15 +980,15 @@ UPDK_PDR *GetPdrByTeid(struct rte_mbuf *pkt, uint32_t td) {
     uint8_t *inner_ptr = base + payload_offset;
 
     if ((inner_ptr[0] >> 4) != 4 || (inner_ptr[0] & 0x0F) < 5) {
-        UTLT_Debug("Non-IPv4 start at offset %u (0x%02x), scanning for IPv4...",
-                     payload_offset, inner_ptr[0]);
+        /* UTLT_Debug("Non-IPv4 start at offset %u (0x%02x), scanning for IPv4...",
+                     payload_offset, inner_ptr[0]); */
         int found = 0;
         for (int delta = -4; delta <= 4; delta++) {
             if ((int)payload_offset + delta < 0) continue;
             uint8_t *cand = base + payload_offset + delta;
             if ((cand[0] >> 4) == 4 && (cand[0] & 0x0F) >= 5) {
-                UTLT_Debug("Adjusted payload_offset from %u to %u",
-                             payload_offset, payload_offset + delta);
+                /* UTLT_Debug("Adjusted payload_offset from %u to %u",
+                             payload_offset, payload_offset + delta); */
                 payload_offset += delta;
                 inner_ptr = cand;
                 found = 1;
@@ -1012,10 +1012,10 @@ UPDK_PDR *GetPdrByTeid(struct rte_mbuf *pkt, uint32_t td) {
         return NULL;
     struct rte_udp_hdr *innerU = (struct rte_udp_hdr *)(inner_ptr + inner_ihl);
 
-    UTLT_Debug("Inner IPv4 src=%s dst=%s proto=%u QFI=%u",
+    /* UTLT_Debug("Inner IPv4 src=%s dst=%s proto=%u QFI=%u",
                ip4_to_buf(inner4->src_addr, i_src),
                ip4_to_buf(inner4->dst_addr, i_dst),
-               inner4->next_proto_id, qfi);
+               inner4->next_proto_id, qfi); */
 
     // Build classifier key
     ps_packet_t key = {0};
