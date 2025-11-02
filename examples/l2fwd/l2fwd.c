@@ -205,13 +205,16 @@ l2fwd_initialize_ports(struct state_info *stats) {
 static void
 l2fwd_mac_updating(struct rte_mbuf *pkt, unsigned dest_portid, struct state_info *stats) {
         struct rte_ether_hdr *eth;
-        void *tmp;
+        void *tmp, *tmp2;
         eth = rte_pktmbuf_mtod(pkt, struct rte_ether_hdr *);
 
         /* 02:00:00:00:00:xx */
         tmp = &eth->dst_addr.addr_bytes[0];
-        *((uint64_t *)tmp) = 0x000000000002 + ((uint64_t)dest_portid << 40);
-        rte_ether_addr_copy(tmp, &eth->src_addr);
+        *((uint64_t *)tmp) = 0x1522b3bae290;
+        //rte_ether_addr_copy(tmp, &eth->src_addr);
+
+        tmp2 = &eth->src_addr.addr_bytes[0];
+        *((uint64_t *)tmp2) = 0x39b9b3bae290; // 90:e2:ba:b3:b9:39 
 
         if (stats->print_mac) {
                 printf("Packet updated MAC address: %02X:%02X:%02X:%02X:%02X:%02X\n\n",
@@ -277,6 +280,7 @@ packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta,
         /* Update stats packet sent from source port. */
         stats->port_statistics[dst_port].tx += 1;
         meta->action = ONVM_NF_ACTION_OUT;
+        onvm_pkt_print_ether(onvm_pkt_ether_hdr(pkt));
         return 0;
 }
 
