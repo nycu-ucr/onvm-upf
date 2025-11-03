@@ -54,6 +54,8 @@
 
 #include "upf_u_config.h"
 
+#include "upf_u_config.h"
+
 #define NF_TAG "upf_u"
 
 // #if 0
