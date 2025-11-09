@@ -347,6 +347,7 @@ static inline uint16_t get_gtpu_header_len(struct rte_mbuf *pkt){
             }
         }
     }
+
     return gtp_len;
 }
 

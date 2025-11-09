@@ -579,6 +579,7 @@ onvm_nflib_thread_main_loop(void *arg) {
 
         nf_local_ctx = (struct onvm_nf_local_ctx *)arg;
         nf = nf_local_ctx->nf;
+        // uint16_t nf_srvc_id = nf->service_id;
         onvm_threading_core_affinitize(nf->thread_info.core);
 
         printf("Sending NF_READY message to manager...\n");
@@ -610,7 +611,7 @@ onvm_nflib_thread_main_loop(void *arg) {
                         onvm_pkt_process_tx_batch(nf->nf_tx_mgr, pkts, onvm_config->dynfield_offset, nb_pkts_added, nf);
                         init_timeout = 1;
                         last_time_get_pkt = rte_get_tsc_cycles();
-                } else if(nb_pkts_added == 0) {
+                } else if(nb_pkts_added == 0 && nf->service_id != 1) {
                         if (init_timeout && unlikely((rte_get_tsc_cycles() - last_time_get_pkt) * TIME_TTL_MULTIPLIER * 1000000000 / rte_get_timer_hz() >= 20000)) {
                                 // printf("Force to trigger timeout\n");
                                 (*nf->function_table->pkt_handler)(NULL, NULL, nf_local_ctx);
@@ -1004,9 +1005,13 @@ onvm_nflib_dequeue_packets(void **pkts, struct onvm_nf_local_ctx *nf_local_ctx, 
                         nf->stats.tx_buffer++;
                 }
         }
+
+        
+
         if (ONVM_NF_HANDLE_TX) {
                 return nb_pkts;
         }
+
 
         onvm_pkt_enqueue_tx_thread(&tx_buf, nf);
         return 0;

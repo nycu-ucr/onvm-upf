@@ -29,6 +29,8 @@
 #include <unistd.h>
 #include <stdbool.h>
 
+// #include <arpa/inet.h>
+
 #include <rte_common.h>
 #include <rte_gtp.h>
 #include <rte_ip.h>
@@ -76,6 +78,9 @@
 #define DEFAULT_TB_TOKENS 10000
 #define APP_FLOWS_MAX 256
 #define IP_MASKED(BIGENDIINT, LEN) (BIGENDIINT & (0xFFFFFFFF << (32-LEN)))
+
+/* Temporary helper IP for the RAN side when faking GTP encapsulation */
+#define DEFAULT_ACCESS_NODE_IP RTE_IPV4(192, 168, 1, 1)
 #define MAX_UE 256 // Max number of UEs
 #define MIN(x, y) (((x) < (y)) ? (x) : (y))
 #define MAX_OF_BUFFER_PACKET_SIZE 30000
@@ -760,13 +765,25 @@ GetPdrByUeIpAddress(struct rte_mbuf *pkt, uint32_t ue_ip)
 
     key.proto = outer4->next_proto_id;
 
-    if (key.proto == IPPROTO_UDP) {
+    /* if (key.proto == IPPROTO_UDP) {
         const struct rte_udp_hdr *uh = onvm_pkt_udp_hdr(pkt);
         if (uh) {
             sp = rte_be_to_cpu_16(uh->src_port);
             dp = rte_be_to_cpu_16(uh->dst_port);
         }
+    } */
+
+    if (key.proto == IPPROTO_TCP || key.proto == IPPROTO_UDP) {
+        const struct rte_tcp_hdr *th = (const struct rte_tcp_hdr *)
+                rte_pktmbuf_mtod_offset(pkt, const char *,
+                    sizeof(struct rte_ether_hdr) + ((outer4->version_ihl & 0x0F) * 4));
+        if (th) {
+            sp = rte_be_to_cpu_16(th->src_port);
+            dp = rte_be_to_cpu_16(th->dst_port);
+        }
     }
+
+
 
     key.src_port= sp;
     key.dst_port= dp;
@@ -984,6 +1001,10 @@ void *
 GetQerByUEIpAddress(uint32_t ue_ip, char *IP) {
     if (findIndexByUeIpAddress(ue_ip) == -1) {        
         UpfSession *session = UpfSessionFindByUeIP(ue_ip);
+
+        printf("UE IP: %u\n", ue_ip);
+        printf("Session: %p\n", (void *)session);
+
         UTLT_Assert(session, return NULL, "session not found error");
         UTLT_Assert(session->pdr_list, return NULL, "PDR list not initialized");
         UTLT_Assert(session->pdr_list->len, return NULL, "PDR list contains 0 rules");
@@ -1137,8 +1158,13 @@ HandlePacketWithFar(struct rte_mbuf *pkt, UPDK_FAR *far, UPDK_QER *qer, struct o
 static inline void
 AttachL2Header(struct rte_mbuf *pkt, bool is_dl) {
     // Prepend ethernet header
+    // struct rte_ether_hdr *eth_hdr = rte_pktmbuf_mtod(pkt, struct rte_ether_hdr*);
     struct rte_ether_hdr *eth_hdr =
         (struct rte_ether_hdr *)rte_pktmbuf_prepend(pkt, (uint16_t)sizeof(struct rte_ether_hdr));
+    if (unlikely(eth_hdr == NULL)) {
+        UTLT_Error("AttachL2Header: no headroom (pkt_len=%u data_off=%u)", pkt->pkt_len, pkt->data_off);
+        return;
+    }
 
     // next hop's mac address
     if (is_dl == true) {
@@ -1158,173 +1184,588 @@ AttachL2Header(struct rte_mbuf *pkt, bool is_dl) {
     eth_hdr->ether_type = rte_cpu_to_be_16(RTE_ETHER_TYPE_IPV4);
 }
 
+
+static uint32_t print_delay = 1000000;
+
+
+static void
+do_stats_display(struct rte_mbuf *pkt) {
+        const char clr[] = {27, '[', '2', 'J', '\0'};
+        const char topLeft[] = {27, '[', '1', ';', '1', 'H', '\0'};
+        static uint64_t pkt_process = 0;
+
+        struct rte_ipv4_hdr *ip;
+
+        pkt_process += print_delay;
+
+        /* Clear screen and move to top left */
+        printf("%s%s", clr, topLeft);
+
+        printf("PACKETS\n");
+        printf("-----\n");
+        printf("Port : %d\n", pkt->port);
+        printf("Size : %d\n", pkt->pkt_len);
+        printf("Type : %d\n", pkt->packet_type);
+        printf("Number of packet processed : %" PRIu64 "\n", pkt_process);
+
+        ip = onvm_pkt_ipv4_hdr(pkt);
+        if (ip != NULL) {
+                onvm_pkt_print(pkt);
+        } else {
+                printf("Not IP4\n");
+        }
+
+        printf("\n\n");
+}
+
+// static inline int
+// strip_uplink_gtp(struct rte_mbuf *pkt) {
+//     struct rte_ipv4_hdr *outer4 = rte_pktmbuf_mtod(pkt, struct rte_ipv4_hdr *);
+//     if (!outer4)
+//         return -1;
+
+//     uint16_t ip_hlen = (outer4->version_ihl & 0x0F) * 4;
+//     struct rte_udp_hdr *udp_hdr = rte_pktmbuf_mtod_offset(pkt, struct rte_udp_hdr *, ip_hlen);
+//     if (!udp_hdr || udp_hdr->dst_port != rte_cpu_to_be_16(UDP_PORT_FOR_GTP))
+//         return -1;
+
+//     uint16_t gtp_len = get_gtpu_header_len(pkt);
+//     uint16_t remove_len = ip_hlen + sizeof(struct rte_udp_hdr) + gtp_len;
+
+//     if (rte_pktmbuf_adj(pkt, remove_len) == NULL)
+//         return -1;
+//     return 0;
+// }
+
+// static inline int
+// encap_downlink_gtp(struct rte_mbuf *pkt, uint32_t ran_ip, uint32_t teid) {
+//     const uint16_t outer_len = sizeof(struct rte_ipv4_hdr) + sizeof(struct rte_udp_hdr) + sizeof(gtpv1_t);
+//     const uint16_t inner_len = rte_pktmbuf_pkt_len(pkt);
+
+//     struct rte_ipv4_hdr *outer4 = (struct rte_ipv4_hdr *)rte_pktmbuf_prepend(pkt, outer_len);
+//     if (!outer4)
+//         return -1;
+
+//     struct rte_udp_hdr *udp_hdr = (struct rte_udp_hdr *)((uint8_t *)outer4 + sizeof(struct rte_ipv4_hdr));
+//     gtpv1_t *gtp_hdr = (gtpv1_t *)((uint8_t *)udp_hdr + sizeof(struct rte_udp_hdr));
+//     memset(outer4, 0, outer_len);
+
+//     gtpv1_set_header(gtp_hdr, inner_len, teid);
+//     onvm_pkt_fill_udp(udp_hdr, UDP_PORT_FOR_GTP, UDP_PORT_FOR_GTP, inner_len + sizeof(gtpv1_t));
+
+//     onvm_pkt_fill_ipv4(outer4, SELF_IP, ran_ip, IPPROTO_UDP);
+//     outer4->total_length = rte_cpu_to_be_16(inner_len + outer_len);
+//     outer4->hdr_checksum = rte_ipv4_cksum(outer4);
+
+//     return 0;
+// }
+
+// static int
+// packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm_nf_local_ctx *nf_local_ctx) {
+
+//     struct rte_ether_hdr *eh = rte_pktmbuf_mtod(pkt, struct rte_ether_hdr*);
+//     // onvm_pkt_print_ether(eh);
+
+//     if (pkt == NULL || meta == NULL) {
+//             return 0;
+//     }
+
+//     bool is_dl = false;
+//     // uint32_t cal_pktlen = 0;
+//     //printf("Get packet\n");
+//     // printf("Handle PKT from port: %d\n", pkt->port);
+//     // cal_pktlen = pkt->pkt_len - sizeof(struct rte_ether_hdr) - sizeof(struct rte_ipv4_hdr) - sizeof(struct rte_udp_hdr);
+
+//     meta->action = ONVM_NF_ACTION_DROP;
+//     struct rte_ipv4_hdr *iph = onvm_pkt_ipv4_hdr(pkt);
+
+
+//     if (iph == NULL) {
+//         printf("Not IP packet, ignore it\n");
+//         return 0;
+//     }
+
+//     bool is_uplink = (iph->dst_addr == SELF_IP);
+
+//     // printf("Self IP is: %u\n", SELF_IP);
+
+//     if (rte_pktmbuf_adj(pkt, sizeof(struct rte_ether_hdr)) == NULL) {
+//         UTLT_Error("Failed to remove L2 header");
+//         return 0;
+//     }
+
+//     {
+//         char src_s[16], dst_s[16], line[128];
+//         int n = 0;
+
+//         snprintf(src_s, sizeof(src_s), "%s", convertToIpAddress(iph->src_addr));
+//         snprintf(dst_s, sizeof(dst_s), "%s", convertToIpAddress(iph->dst_addr));
+
+//         n = snprintf(line, sizeof(line), "Src IP is %s | Dst IP is %s\n", src_s, dst_s);
+//         if (n > 0 && n < (int)sizeof(line)) {
+//             (void)write(STDOUT_FILENO, line, (size_t)n);
+//         }
+//     }
+
+//     if (is_uplink) {
+//         if (strip_uplink_gtp(pkt) < 0)
+//             return 0;
+
+//         struct rte_ipv4_hdr *inner4 = rte_pktmbuf_mtod(pkt, struct rte_ipv4_hdr *);
+//         if (!inner4) return 0;
+
+//         meta->destination = g_core_port;
+//         AttachL2Header(pkt, false);   // false → use cn_dn_eth/dn_eth
+//         meta->action = ONVM_NF_ACTION_OUT;
+//         return 0;
+//     } else {
+//         if (encap_downlink_gtp(pkt, DEFAULT_ACCESS_NODE_IP, 0) < 0)
+//             return 0;
+
+//         meta->destination = g_access_port;
+//         AttachL2Header(pkt, true); 
+//         meta->action = ONVM_NF_ACTION_OUT;
+//         return 0;
+//     }
+
+
+//     return 0;
+
+// }
+
+
+
+/* Prepend IPv4/UDP/GTP-U headers around the current payload.
+ * ran_ip = outer destination (RAN/gNB IP), teid = TEID to advertise.
+ */
+static inline int
+encap_downlink_gtp(struct rte_mbuf *pkt, uint32_t ran_ip, uint32_t teid) {
+    const uint16_t inner_len = rte_pktmbuf_pkt_len(pkt);
+    const uint16_t outer_len =
+        sizeof(struct rte_ipv4_hdr) + sizeof(struct rte_udp_hdr) + sizeof(gtpv1_t);
+
+    struct rte_ipv4_hdr *outer4 =
+        rte_pktmbuf_mtod_offset(pkt, struct rte_ipv4_hdr *,
+                                -(int)outer_len); /* ensure prepend space */
+    outer4 = (struct rte_ipv4_hdr *)rte_pktmbuf_prepend(pkt, outer_len);
+    if (!outer4)
+        return -1;
+
+    struct rte_udp_hdr *udp_hdr =
+        (struct rte_udp_hdr *)((uint8_t *)outer4 + sizeof(struct rte_ipv4_hdr));
+    gtpv1_t *gtp_hdr =
+        (gtpv1_t *)((uint8_t *)udp_hdr + sizeof(struct rte_udp_hdr));
+    memset(outer4, 0, outer_len);
+
+    gtpv1_set_header(gtp_hdr, inner_len, teid);
+    onvm_pkt_fill_udp(udp_hdr, UDP_PORT_FOR_GTP, UDP_PORT_FOR_GTP,
+                      inner_len + sizeof(gtpv1_t));
+
+    onvm_pkt_fill_ipv4(outer4, rte_cpu_to_be_32(SELF_IP), ran_ip, IPPROTO_UDP);
+    outer4->total_length = rte_cpu_to_be_16(inner_len + outer_len);
+    outer4->hdr_checksum = rte_ipv4_cksum(outer4);
+
+    return 0;
+}
+
+
+
+
+
+
 static int
 packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm_nf_local_ctx *nf_local_ctx) {
+
+    struct rte_ether_hdr *eh = rte_pktmbuf_mtod(pkt, struct rte_ether_hdr*);
+    // onvm_pkt_print_ether(eh);
+
     if (pkt == NULL || meta == NULL) {
-        return 0;
+            return 0;
     }
-    uint32_t cal_pktlen = 0;
-    UTLT_Trace("Get packet\n");
-    UTLT_Info("Handle PKT from port: %d [len: %d]", pkt->port, pkt->pkt_len);
-    cal_pktlen = pkt->pkt_len - sizeof(struct rte_ether_hdr) - sizeof(struct rte_ipv4_hdr) - sizeof(struct rte_udp_hdr);
+
+    // uint32_t cal_pktlen = 0;
+    //printf("Get packet\n");
+    // printf("Handle PKT from port: %d\n", pkt->port);
+    // cal_pktlen = pkt->pkt_len - sizeof(struct rte_ether_hdr) - sizeof(struct rte_ipv4_hdr) - sizeof(struct rte_udp_hdr);
 
     bool is_dl = false;
     meta->action = ONVM_NF_ACTION_DROP;
     struct rte_ipv4_hdr *iph = onvm_pkt_ipv4_hdr(pkt);
+
 
     if (iph == NULL) {
         UTLT_Info("Not IP packet, ignore it\n");
         return 0;
     }
 
-    // Flip to a newly published snapshot if a REQ was received
-    UpfClsMaybeFlipAndAck();
+    {
+        char src_s[16], dst_s[16], line[128];
+        int n = 0;
 
-    UPDK_PDR *pdr = NULL;
+        snprintf(src_s, sizeof(src_s), "%s", convertToIpAddress(iph->src_addr));
+        snprintf(dst_s, sizeof(dst_s), "%s", convertToIpAddress(iph->dst_addr));
 
-    char *src_address = convertToIpAddress(iph->src_addr);
-    UTLT_Info("Src IP is %s\n", src_address);
-    char *dst_address = convertToIpAddress(iph->dst_addr);
-    UTLT_Info("Dst IP is %s\n", dst_address);
+        n = snprintf(line, sizeof(line), "Src IP is %s | Dst IP is %s\n", src_s, dst_s);
+        if (n > 0 && n < (int)sizeof(line)) {
+            (void)write(STDOUT_FILENO, line, (size_t)n);
+        }
+    }
 
-    if (iph->dst_addr == SELF_IP) {  //
-        UTLT_Info("It is uplink\n");
+    //printf(onvm_pkt_is_ipv4(pkt) ? "It's IPv4\n" : "Not IPv4\n");
+    
 
-        struct rte_udp_hdr *udp_header = onvm_pkt_udp_hdr(pkt);
-        if (udp_header == NULL) {
+    // printf("Self IP is: %u\n", SELF_IP);
+
+ /*    printf("SELF_IP: %u\n", SELF_IP);
+    printf("dst_addr: %u\n", iph->dst_addr); */
+
+    if (iph->dst_addr == SELF_IP) {
+
+        //printf("inside uplink");
+
+        rte_pktmbuf_adj(pkt, sizeof(struct rte_ether_hdr));
+
+        uint16_t outerHeaderLen = 0;
+        //printf("GTP-U Header Length: %u\n", get_gtpu_header_len(pkt));
+
+        outerHeaderLen = sizeof(struct rte_ipv4_hdr) + sizeof(struct rte_udp_hdr) + get_gtpu_header_len(pkt);
+
+        // onvm_pkt_print_ether(pkt);
+
+        // printf("Outer Header Length: %u\n", outerHeaderLen);
+        // shift to the start of the inner header
+        rte_pktmbuf_adj(pkt, outerHeaderLen);
+
+        // rte_pktmbuf_prepend(pkt, (uint16_t)sizeof(struct rte_ether_hdr));
+
+        //printf(onvm_pkt_is_ipv4(pkt) ? "It's IPv4\n" : "Not IPv4\n");
+
+        // onvm_pkt_print(pkt);
+
+        // rte_pktmbuf_adj(pkt, (uint16_t)sizeof(struct rte_ether_hdr));
+
+        meta->destination = 1;
+    } else {
+        is_dl = true;
+        rte_pktmbuf_adj(pkt, (uint16_t)sizeof(struct rte_ether_hdr));
+        if (encap_downlink_gtp(pkt, DEFAULT_ACCESS_NODE_IP, 2) < 0) {
+            UTLT_Error("Failed to encapsulate GTP-U header");
             return 0;
         }
-        // invariant(dst_port == GTPV1_PORT);
-        // extract TEID from
-        // Step 2: Get PDR rule
-        uint32_t teid = get_teid_gtp_packet(pkt, udp_header);
-        pdr = GetPdrByTeid(pkt, teid);
 
-    } else {
-        UTLT_Info("It is downlink, dst is %s\n", convertToIpAddress(iph->dst_addr));
-        pdr = GetPdrByUeIpAddress(pkt, rte_cpu_to_be_32(iph->dst_addr));
-        GetQerByUEIpAddress(rte_cpu_to_be_32(iph->dst_addr), convertToIpAddress(iph->dst_addr));
-        is_dl = true;
+        meta->destination = 0;
     }
 
-    if (!pdr) {
-        UTLT_Error("no PDR found for %s, skip\n", convertToIpAddress(iph->dst_addr));
-        // TODO(vivek): what to do?
-        return 0;
-    }
-    UTLT_Info("Got PDR ID is %u\n", pdr->pdrId);
-    rte_pktmbuf_adj(pkt, sizeof(struct rte_ether_hdr));
+    // rte_pktmbuf_adj(pkt, sizeof(struct rte_ether_hdr));
 
-    UPDK_FAR *far;
-    far = pdr->far;
-    if (!far) {
-        UTLT_Error("There is no FAR related to PDR[%u]\n", pdr->pdrId);
-        meta->action = ONVM_NF_ACTION_DROP;
-        return 0;
-    }
-
-    if (pdr->flags.outerHeaderRemoval) {
-        uint16_t outerHeaderLen = 0;
-        switch (pdr->outerHeaderRemoval) {
-            case OUTER_HEADER_REMOVAL_GTP_IP4: {
-                outerHeaderLen = sizeof(struct rte_ipv4_hdr) + sizeof(struct rte_udp_hdr);
-
-                // get gtp_header length
-                uint16_t gtp_length = get_gtpu_header_len(pkt);
-                outerHeaderLen += gtp_length;
-
-                rte_pktmbuf_adj(pkt, outerHeaderLen);
-            } break;
-            case OUTER_HEADER_REMOVAL_GTP_IP6:
-            case OUTER_HEADER_REMOVAL_UDP_IP4:
-            case OUTER_HEADER_REMOVAL_UDP_IP6:
-            case OUTER_HEADER_REMOVAL_IP4:
-            case OUTER_HEADER_REMOVAL_IP6:
-            case OUTER_HEADER_REMOVAL_GTP:
-            case OUTER_HEADER_REMOVAL_S_TAG:
-            case OUTER_HEADER_REMOVAL_S_C_TAG:
-            default:
-                printf("unknown or not implement\n");
-        }
-    }
-
-    int status = 0, color_result = 0;
-    status = HandlePacketWithFar(pkt, far, pdr->qer, meta);
-    if (meta->action == ONVM_NF_ACTION_DROP) {
-        UTLT_Info("Action is drop\n");
-    } else if (meta->action == ONVM_NF_ACTION_OUT) {
-        UTLT_Info("Action is out\n");
-    } else {
-        UTLT_Trace("Action is unknown\n");
-    }
     AttachL2Header(pkt, is_dl);
-    if (meta->action == ONVM_NF_ACTION_OUT && is_dl) {
-        // check if the UE IP exists in the table and update the token
-        int index = findIndexByUeIpAddress(rte_cpu_to_be_32(iph->dst_addr));
-        if (index != -1) {
-            UTLT_Trace("Update token for UE IP: %s", convertToIpAddress(iph->dst_addr));
-            updateTokenbyIndex(index);
-        }
-        else {
-            UTLT_Error("No UE IP found in the table");
-            return status;
-        }
 
-        // Step 1. trTCM (QoS flow)
-        int key, fd_target, prefix_len;
-        bool isQos = false;
-        uint64_t curr_time = rte_get_tsc_cycles();
-        struct rte_meter_trtcm_profile *trtcm_profile = NULL;
+    // meta->destination = pkt->port ^ 1;
+    meta->action = ONVM_NF_ACTION_OUT;
 
-        char *ip_str = strstr(pdr->pdi.sdfFilter.flowDescription, "from");
-        if (ip_str != NULL) {
-            ip_str += 5; // Skip "from "
-            char *end_ptr = strchr(ip_str, ' ');
-            if (end_ptr != NULL) {
-                *end_ptr = '\0'; // Null-terminate the extracted IP
-            }
-        }
+    return 0;
 
-        if (ip_str != NULL && strcmp(ip_str, "any") != 0) {
-            isQos = true;
-            fd_target = charStr2MaskedIP(ip_str, &prefix_len);
-            trtcm_profile = &app_flow_trtcm_profile;
-            key = (pdr->pdi.flags.sdfFilter) ? SourceInterfaceToPort(pdr->pdi.sourceInterface) + fd_target : SourceInterfaceToPort(pdr->pdi.sourceInterface);
-            color_result = trtcmColorHandle(cal_pktlen, curr_time, ftSearch(key), trtcm_profile);
-            if (trtcmPolicer(meta, color_result) > 0)
-                UTLT_Error("trTCM Policer error");
-        }
-        
-        // Step 2. bucket (QoS flow)
-        if (isQos) {
-            if (meta->flags == RTE_COLOR_RED) {
-                meta->action = ONVM_NF_ACTION_DROP;
-            }
-            if (meta->flags == RTE_COLOR_GREEN) {
-                ue_table[index].ue_qos_tb_params.tb_tokens -= cal_pktlen;
-                meta->action = ONVM_NF_ACTION_OUT;
-            }
-            if (meta->flags == RTE_COLOR_YELLOW) {
-                while (ue_table[index].ue_qos_tb_params.tb_tokens < cal_pktlen) {
-                    updateTokenbyIndex(index);
-                    usleep(1);
-                }
-                ue_table[index].ue_qos_tb_params.tb_tokens -= cal_pktlen;
-                meta->action = ONVM_NF_ACTION_OUT;      
-            }
-        }
-        // Step 2. bucket (non QoS flow)
-        else {
-            while (ue_table[index].ue_nqos_tb_params.tb_tokens < cal_pktlen) {
-                updateTokenbyIndex(index);
-                usleep(1);
-            }
-            ue_table[index].ue_nqos_tb_params.tb_tokens -= cal_pktlen;
-            meta->action = ONVM_NF_ACTION_OUT;
-        }
-    }
-    return status;
 }
+
+
+
+
+
+
+
+
+
+
+
+// static inline int gtpu_inner_offset(const uint8_t *g, uint32_t avail) {
+//     if (avail < 8) return -1;
+//     uint8_t flags = g[0], type = g[1];
+//     if ((flags >> 5) != 1 || type != 0xff) return -1;   // v1 T-PDU only
+//     uint32_t off = 8;
+//     if (flags & 0x07) {                                  // any of E/S/PN
+//         if (avail < 12) return -1;
+//         uint8_t next = g[11];                            // next ext type
+//         off = 12;
+//         if (flags & 0x04) {                              // E bit → walk exts
+//             uint32_t pos = off;
+//             while (next != 0x00) {
+//                 if (avail < pos + 2) return -1;
+//                 uint8_t len4 = g[pos + 1];               // in 4-byte units
+//                 uint32_t ext = 2u + 4u * len4;
+//                 if (avail < pos + ext) return -1;
+//                 next = g[pos + ext - 1];
+//                 pos += ext;
+//             }
+//             off = pos;
+//         }
+//     }
+//     return (off <= avail) ? (int)off : -1;
+// }
+
+// static int
+// packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm_nf_local_ctx *nf_local_ctx) {
+//     if (!pkt || !meta) return 0;
+
+//     meta->action = ONVM_NF_ACTION_DROP;
+//     bool is_dl = false;
+
+//     struct rte_ether_hdr *eth = rte_pktmbuf_mtod(pkt, struct rte_ether_hdr*);
+//     if (eth->ether_type != rte_cpu_to_be_16(RTE_ETHER_TYPE_IPV4)) {
+//         // lots of ARP on this link; ignore quietly
+//         return 0;
+//     }
+
+//     const uint16_t off_l2 = sizeof(struct rte_ether_hdr);
+//     struct rte_ipv4_hdr *o4 = rte_pktmbuf_mtod_offset(pkt, struct rte_ipv4_hdr*, off_l2);
+//     const uint16_t ihl = (o4->version_ihl & 0x0F) * 4;
+//     if (unlikely(rte_pktmbuf_pkt_len(pkt) < off_l2 + ihl + sizeof(struct rte_udp_hdr))) return 0;
+
+//     // Log OUTER once (handy for sanity)
+//     {
+//         char s[16], d[16], line[96];
+//         snprintf(s, sizeof s, "%s", convertToIpAddress(o4->src_addr));
+//         snprintf(d, sizeof d, "%s", convertToIpAddress(o4->dst_addr));
+//         int n = snprintf(line, sizeof line, "OUTER %s -> %s\n", s, d);
+//         if (n > 0 && n < (int)sizeof(line)) (void)write(STDOUT_FILENO, line, (size_t)n);
+//     }
+
+//     if (o4->next_proto_id != IPPROTO_UDP) {
+//         // not GTP-U; with this test rig we only care about GTP uplink
+//         return 0;
+//     }
+
+//     struct rte_udp_hdr *u = rte_pktmbuf_mtod_offset(pkt, struct rte_udp_hdr*, off_l2 + ihl);
+//     const uint16_t p2152 = rte_cpu_to_be_16(2152);
+//     if (u->dst_port != p2152 && u->src_port != p2152) {
+//         return 0; // UDP but not GTP-U
+//     }
+
+//     // Calculate inner offset
+//     const uint16_t off_gtp = off_l2 + ihl + sizeof(*u);
+//     const uint32_t avail   = rte_pktmbuf_pkt_len(pkt) - off_gtp;
+//     const uint8_t *g       = rte_pktmbuf_mtod_offset(pkt, const uint8_t*, off_gtp);
+//     int inner_off = gtpu_inner_offset(g, avail);
+//     if (inner_off < 0) return 0;
+
+//     // ---- Direction & action ----
+//     // UPLINK iff outer dst == our N3 IP (SELF_IP). Then decapsulate and send to DN.
+//     if (o4->dst_addr == rte_cpu_to_be_32(SELF_IP)) {
+//         const uint32_t remove_len = off_l2 + ihl + sizeof(*u) + (uint32_t)inner_off;
+//         if (unlikely(rte_pktmbuf_pkt_len(pkt) < remove_len)) return 0;
+
+//         // Drop outer L2 + IPv4 + UDP + GTP headers, reveal INNER IPv4 at head
+//         if (unlikely(rte_pktmbuf_adj(pkt, (uint16_t)remove_len) == NULL)) return 0;
+
+//         // Now data pointer is at inner IPv4; rewrite L2 for DN and emit to DN port
+//         is_dl = false;
+//         meta->destination = 1;               // your DN port
+//         AttachL2Header(pkt, is_dl);
+//         meta->action = ONVM_NF_ACTION_OUT;
+//         return 0;
+//     }
+
+//     // Not uplink (i.e., downlink GTP arriving from N3). For this minimal test, we don’t re-encap.
+//     // You can add the DN->UL re-encap later; for now, just drop after logging.
+//     return 0;
+// }
+
+
+
+
+// static int
+// packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm_nf_local_ctx *nf_local_ctx) {
+//     if (pkt == NULL || meta == NULL) {
+//         return 0;
+//     }
+//     uint32_t cal_pktlen = 0;
+//     UTLT_Trace("Get packet\n");
+//     UTLT_Info("Handle PKT from port: %d [len: %d]", pkt->port, pkt->pkt_len);
+//     cal_pktlen = pkt->pkt_len - sizeof(struct rte_ether_hdr) - sizeof(struct rte_ipv4_hdr) - sizeof(struct rte_udp_hdr);
+
+//     bool is_dl = false;
+//     meta->action = ONVM_NF_ACTION_DROP;
+//     struct rte_ipv4_hdr *iph = onvm_pkt_ipv4_hdr(pkt);
+
+//     if (iph == NULL) {
+//         UTLT_Info("Not IP packet, ignore it\n");
+//         return 0;
+//     }
+
+//     // Flip to a newly published snapshot if a REQ was received
+//     UpfClsMaybeFlipAndAck();
+
+//     UPDK_PDR *pdr = NULL;
+
+//     /* char *src_address = convertToIpAddress(iph->src_addr);
+//     UTLT_Info("Src IP is %s\n", src_address);
+//     char *dst_address = convertToIpAddress(iph->dst_addr);
+//     UTLT_Info("Dst IP is %s\n", dst_address); */
+
+
+//     {
+//         char src_s[16], dst_s[16], line[128];
+//         int n = 0;
+
+//         snprintf(src_s, sizeof(src_s), "%s", convertToIpAddress(iph->src_addr));
+//         snprintf(dst_s, sizeof(dst_s), "%s", convertToIpAddress(iph->dst_addr));
+
+//         n = snprintf(line, sizeof(line), "Src IP is %s | Dst IP is %s\n", src_s, dst_s);
+//         if (n > 0 && n < (int)sizeof(line)) {
+//             (void)write(STDOUT_FILENO, line, (size_t)n);  // one syscall, no extra buffering
+//         }
+//     }
+
+//     /* char hdr_dst_buf[INET_ADDRSTRLEN] = {0};
+//     char self_buf[INET_ADDRSTRLEN] = {0};
+//     struct in_addr hdr_dst_addr = { .s_addr = iph->dst_addr };
+//     struct in_addr self_addr = { .s_addr = rte_cpu_to_be_32((uint32_t)SELF_IP) };
+//     inet_ntop(AF_INET, &hdr_dst_addr, hdr_dst_buf, sizeof(hdr_dst_buf));
+//     inet_ntop(AF_INET, &self_addr, self_buf, sizeof(self_buf));
+//     printf("Direction check: iph->dst_addr=0x%08" PRIx32 " (%s) SELF_IP host=0x%08" PRIx32 " net=0x%08" PRIx32 " (%s)",
+//               rte_be_to_cpu_32(iph->dst_addr), hdr_dst_buf,
+//               (uint32_t)SELF_IP, rte_cpu_to_be_32((uint32_t)SELF_IP), self_buf); */
+
+
+//     if (iph->dst_addr == SELF_IP) {  //
+//         UTLT_Info("It is uplink\n");
+
+//         struct rte_udp_hdr *udp_header = onvm_pkt_udp_hdr(pkt);
+//         if (udp_header == NULL) {
+//             return 0;
+//         }
+//         // invariant(dst_port == GTPV1_PORT);
+//         // extract TEID from
+//         // Step 2: Get PDR rule
+//         uint32_t teid = get_teid_gtp_packet(pkt, udp_header);
+//         pdr = GetPdrByTeid(pkt, teid);
+
+//     } else {
+//         UTLT_Info("It is downlink, dst is %s\n", convertToIpAddress(iph->dst_addr));
+//         pdr = GetPdrByUeIpAddress(pkt, rte_cpu_to_be_32(iph->dst_addr));
+//         GetQerByUEIpAddress(rte_cpu_to_be_32(iph->dst_addr), convertToIpAddress(iph->dst_addr));
+//         is_dl = true;
+//     }
+
+//     if (!pdr) {
+//         UTLT_Error("no PDR found for %s, skip\n", convertToIpAddress(iph->dst_addr));
+//         // TODO(vivek): what to do?
+//         return 0;
+//     }
+//     UTLT_Info("Got PDR ID is %u\n", pdr->pdrId);
+//     rte_pktmbuf_adj(pkt, sizeof(struct rte_ether_hdr));
+
+//     UPDK_FAR *far;
+//     far = pdr->far;
+//     if (!far) {
+//         UTLT_Error("There is no FAR related to PDR[%u]\n", pdr->pdrId);
+//         meta->action = ONVM_NF_ACTION_DROP;
+//         return 0;
+//     }
+
+//     if (pdr->flags.outerHeaderRemoval) {
+//         uint16_t outerHeaderLen = 0;
+//         switch (pdr->outerHeaderRemoval) {
+//             case OUTER_HEADER_REMOVAL_GTP_IP4: {
+//                 outerHeaderLen = sizeof(struct rte_ipv4_hdr) + sizeof(struct rte_udp_hdr);
+
+//                 // get gtp_header length
+//                 uint16_t gtp_length = get_gtpu_header_len(pkt);
+//                 outerHeaderLen += gtp_length;
+
+//                 rte_pktmbuf_adj(pkt, outerHeaderLen);
+//             } break;
+//             case OUTER_HEADER_REMOVAL_GTP_IP6:
+//             case OUTER_HEADER_REMOVAL_UDP_IP4:
+//             case OUTER_HEADER_REMOVAL_UDP_IP6:
+//             case OUTER_HEADER_REMOVAL_IP4:
+//             case OUTER_HEADER_REMOVAL_IP6:
+//             case OUTER_HEADER_REMOVAL_GTP:
+//             case OUTER_HEADER_REMOVAL_S_TAG:
+//             case OUTER_HEADER_REMOVAL_S_C_TAG:
+//             default:
+//                 printf("unknown or not implement\n");
+//         }
+//     }
+
+//     int status = 0, color_result = 0;
+//     status = HandlePacketWithFar(pkt, far, pdr->qer, meta);
+//     if (meta->action == ONVM_NF_ACTION_DROP) {
+//         UTLT_Info("Action is drop\n");
+//     } else if (meta->action == ONVM_NF_ACTION_OUT) {
+//         UTLT_Info("Action is out\n");
+//     } else {
+//         UTLT_Trace("Action is unknown\n");
+//     }
+//     AttachL2Header(pkt, is_dl);
+//     if (meta->action == ONVM_NF_ACTION_OUT && is_dl) {
+//         // check if the UE IP exists in the table and update the token
+//         int index = findIndexByUeIpAddress(rte_cpu_to_be_32(iph->dst_addr));
+//         if (index != -1) {
+//             UTLT_Trace("Update token for UE IP: %s", convertToIpAddress(iph->dst_addr));
+//             updateTokenbyIndex(index);
+//         }
+//         else {
+//             UTLT_Error("No UE IP found in the table");
+//             return status;
+//         }
+
+//         // Step 1. trTCM (QoS flow)
+//         int key, fd_target, prefix_len;
+//         bool isQos = false;
+//         uint64_t curr_time = rte_get_tsc_cycles();
+//         struct rte_meter_trtcm_profile *trtcm_profile = NULL;
+
+//         char *ip_str = strstr(pdr->pdi.sdfFilter.flowDescription, "from");
+//         if (ip_str != NULL) {
+//             ip_str += 5; // Skip "from "
+//             char *end_ptr = strchr(ip_str, ' ');
+//             if (end_ptr != NULL) {
+//                 *end_ptr = '\0'; // Null-terminate the extracted IP
+//             }
+//         }
+
+//         if (ip_str != NULL && strcmp(ip_str, "any") != 0) {
+//             isQos = true;
+//             fd_target = charStr2MaskedIP(ip_str, &prefix_len);
+//             trtcm_profile = &app_flow_trtcm_profile;
+//             key = (pdr->pdi.flags.sdfFilter) ? SourceInterfaceToPort(pdr->pdi.sourceInterface) + fd_target : SourceInterfaceToPort(pdr->pdi.sourceInterface);
+//             color_result = trtcmColorHandle(cal_pktlen, curr_time, ftSearch(key), trtcm_profile);
+//             if (trtcmPolicer(meta, color_result) > 0)
+//                 UTLT_Error("trTCM Policer error");
+//         }
+        
+//         // Step 2. bucket (QoS flow)
+//         if (isQos) {
+//             if (meta->flags == RTE_COLOR_RED) {
+//                 meta->action = ONVM_NF_ACTION_DROP;
+//             }
+//             if (meta->flags == RTE_COLOR_GREEN) {
+//                 ue_table[index].ue_qos_tb_params.tb_tokens -= cal_pktlen;
+//                 meta->action = ONVM_NF_ACTION_OUT;
+//             }
+//             if (meta->flags == RTE_COLOR_YELLOW) {
+//                 while (ue_table[index].ue_qos_tb_params.tb_tokens < cal_pktlen) {
+//                     updateTokenbyIndex(index);
+//                     usleep(1);
+//                 }
+//                 ue_table[index].ue_qos_tb_params.tb_tokens -= cal_pktlen;
+//                 meta->action = ONVM_NF_ACTION_OUT;      
+//             }
+//         }
+//         // Step 2. bucket (non QoS flow)
+//         else {
+//             while (ue_table[index].ue_nqos_tb_params.tb_tokens < cal_pktlen) {
+//                 updateTokenbyIndex(index);
+//                 usleep(1);
+//             }
+//             ue_table[index].ue_nqos_tb_params.tb_tokens -= cal_pktlen;
+//             meta->action = ONVM_NF_ACTION_OUT;
+//         }
+//     }
+//     return status;
+// }
+
+
 
 void
 msg_handler(void *msg_data, struct onvm_nf_local_ctx *nf_local_ctx) {
@@ -1439,10 +1880,10 @@ main(int argc, char *argv[]) {
     }
 
     int ret;
-    ret = rte_eth_macaddr_get(0, &cn_ue_eth);
+    ret = rte_eth_macaddr_get(g_access_port, &cn_ue_eth);
     if (ret < 0)
         rte_exit(EXIT_FAILURE, "Cannot get MAC address: err=%d, port=%u\n", ret, 0);
-    ret = rte_eth_macaddr_get(1, &cn_dn_eth);
+    ret = rte_eth_macaddr_get(g_core_port, &cn_dn_eth);
     if (ret < 0)
         rte_exit(EXIT_FAILURE, "Cannot get MAC address: err=%d, port=%u\n", ret, 1);
 
@@ -1458,8 +1899,8 @@ main(int argc, char *argv[]) {
     //parseMAC(config_path);
     UpfU_LoadAndParseConfig(config_path);
 
-    /* UTLT_Info("[UPF-U][CONFIG] Port map: ACCESS=%d CORE=%d SGI=%d",
-          g_access_port, g_core_port, g_sgi_port); */
+    printf("[UPF-U][CONFIG] Port map: ACCESS=%d CORE=%d SGI=%d\n",
+          g_access_port, g_core_port, g_sgi_port);
 
     // 8c:dc:d4:ac:6c:7d
     dn_eth.addr_bytes[0] = DnMac[0];
@@ -1469,8 +1910,22 @@ main(int argc, char *argv[]) {
     dn_eth.addr_bytes[4] = DnMac[4];
     dn_eth.addr_bytes[5] = DnMac[5];
 
+
+    printf("dn_eth: %02X:%02X:%02X:%02X:%02X:%02X\n",
+           dn_eth.addr_bytes[0],
+           dn_eth.addr_bytes[1],
+           dn_eth.addr_bytes[2],
+           dn_eth.addr_bytes[3],
+           dn_eth.addr_bytes[4],
+           dn_eth.addr_bytes[5]);
+
+    printf("AN MAC: %02x:%02x:%02x:%02x:%02x:%02x\n",
+           AnMac[0], AnMac[1], AnMac[2],
+           AnMac[3], AnMac[4], AnMac[5]);
+
     // trTCM
-    trtcmConfigFlowTables();
+    //trtcmConfigFlowTables();
+    
     initUeTable();
 
     UpfSessionPoolInit();
@@ -1483,3 +1938,42 @@ main(int argc, char *argv[]) {
     printf("If we reach here, program is ending\n");
     return 0;
 }
+
+
+// int
+// main(int argc, char *argv[]) {
+//         int arg_offset;
+//         struct onvm_nf_local_ctx *nf_local_ctx;
+//         struct onvm_nf_function_table *nf_function_table;
+//         const char *progname = argv[0];
+
+//         nf_local_ctx = onvm_nflib_init_nf_local_ctx();
+//         onvm_nflib_start_signal_handler(nf_local_ctx, NULL);
+
+//         nf_function_table = onvm_nflib_init_nf_function_table();
+//         nf_function_table->pkt_handler = &packet_handler;
+
+//         if ((arg_offset = onvm_nflib_init(argc, argv, NF_TAG, nf_local_ctx, nf_function_table)) < 0) {
+//                 onvm_nflib_stop(nf_local_ctx);
+//                 if (arg_offset == ONVM_SIGNAL_TERMINATION) {
+//                         printf("Exiting due to user termination\n");
+//                         return 0;
+//                 } else {
+//                         rte_exit(EXIT_FAILURE, "Failed ONVM init\n");
+//                 }
+//         }
+
+//         argc -= arg_offset;
+//         argv += arg_offset;
+
+//         /* if (parse_app_args(argc, argv, progname) < 0) {
+//                 onvm_nflib_stop(nf_local_ctx);
+//                 rte_exit(EXIT_FAILURE, "Invalid command-line arguments\n");
+//         } */
+
+//         onvm_nflib_run(nf_local_ctx);
+
+//         onvm_nflib_stop(nf_local_ctx);
+//         printf("If we reach here, program is ending\n");
+//         return 0;
+// }

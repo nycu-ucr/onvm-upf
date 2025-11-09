@@ -80,7 +80,7 @@ onvm_pkt_process_rx_batch(struct queue_mgr *rx_mgr, struct rte_mbuf *pkts[], uin
                         meta->destination = onvm_sc_next_destination(sc, pkts[i], onvm_config->dynfield_offset);
                 } else {
 #endif
-                        eth_hdr = rte_pktmbuf_mtod(pkts[i], struct rte_ether_hdr *);
+                        /* eth_hdr = rte_pktmbuf_mtod(pkts[i], struct rte_ether_hdr *);
                         ether_type = eth_hdr->ether_type;
 
                         if (ether_type == rte_cpu_to_be_16(RTE_ETHER_TYPE_ARP)) {
@@ -89,7 +89,12 @@ onvm_pkt_process_rx_batch(struct queue_mgr *rx_mgr, struct rte_mbuf *pkts[], uin
                         } else {
                                 meta->action = onvm_sc_next_action(default_chain, pkts[i], onvm_config->dynfield_offset);
                                 meta->destination = onvm_sc_next_destination(default_chain, pkts[i], onvm_config->dynfield_offset);
-                        }
+                        } */
+
+                        meta->action = onvm_sc_next_action(default_chain, pkts[i], onvm_config->dynfield_offset);
+                        meta->destination = onvm_sc_next_destination(default_chain, pkts[i], onvm_config->dynfield_offset);
+
+
 #ifdef FLOW_LOOKUP
                 }
 #endif
@@ -100,6 +105,17 @@ onvm_pkt_process_rx_batch(struct queue_mgr *rx_mgr, struct rte_mbuf *pkts[], uin
                  */
 
                 (meta->chain_index)++;
+
+                /* struct rte_ether_hdr *eh = rte_pktmbuf_mtod(pkts[i], struct rte_ether_hdr*);
+                if ((i & 0x3fff) == 0) {
+                printf("[mgr→NF] in_port=%u dst=%02X:%02X:%02X:%02X:%02X:%02X action=%u dest=%u\n",
+                        pkts[i]->port,
+                        eh->dst_addr.addr_bytes[0], eh->dst_addr.addr_bytes[1], eh->dst_addr.addr_bytes[2],
+                        eh->dst_addr.addr_bytes[3], eh->dst_addr.addr_bytes[4], eh->dst_addr.addr_bytes[5],
+                        meta->action, meta->destination);
+                }
+                onvm_pkt_print_ether(eh); */
+
                 onvm_pkt_enqueue_nf(rx_mgr, meta->destination, pkts[i], NULL);
         }
 
