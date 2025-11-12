@@ -80,16 +80,8 @@ onvm_pkt_process_rx_batch(struct queue_mgr *rx_mgr, struct rte_mbuf *pkts[], uin
                         meta->destination = onvm_sc_next_destination(sc, pkts[i], onvm_config->dynfield_offset);
                 } else {
 #endif
-                        eth_hdr = rte_pktmbuf_mtod(pkts[i], struct rte_ether_hdr *);
-                        ether_type = eth_hdr->ether_type;
-
-                        if (ether_type == rte_cpu_to_be_16(RTE_ETHER_TYPE_ARP)) {
-                                meta->action = ONVM_NF_ACTION_TONF;
-                                meta->destination = ARP_NF_ID;
-                        } else {
-                                meta->action = onvm_sc_next_action(default_chain, pkts[i], onvm_config->dynfield_offset);
-                                meta->destination = onvm_sc_next_destination(default_chain, pkts[i], onvm_config->dynfield_offset);
-                        }
+                        meta->action = onvm_sc_next_action(default_chain, pkts[i], onvm_config->dynfield_offset);
+                        meta->destination = onvm_sc_next_destination(default_chain, pkts[i], onvm_config->dynfield_offset);
 #ifdef FLOW_LOOKUP
                 }
 #endif
