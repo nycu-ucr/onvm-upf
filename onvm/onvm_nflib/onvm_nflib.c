@@ -110,6 +110,21 @@ struct onvm_configuration *onvm_config;
 /* Flag to check if shared core mutex sleep/wakeup is enabled */
 uint8_t ONVM_NF_SHARE_CORES;
 
+static const char *const g_nf_flag_targets[] = {
+        "upf_c",
+        "smf",
+        "nssf",
+        "pcf",
+        "nrf",
+        "udr",
+        "udm",
+        "amf",
+        "ausf",
+        "chf"
+};
+static const size_t g_nf_flag_target_count =
+        sizeof(g_nf_flag_targets) / sizeof(g_nf_flag_targets[0]);
+
 /***********************Internal Functions Prototypes*************************/
 
 /*
@@ -579,12 +594,24 @@ onvm_nflib_thread_main_loop(void *arg) {
 
         nf_local_ctx = (struct onvm_nf_local_ctx *)arg;
         nf = nf_local_ctx->nf;
+        nf->flag = false;
+        
         onvm_threading_core_affinitize(nf->thread_info.core);
 
         printf("Sending NF_READY message to manager...\n");
         ret = onvm_nflib_nf_ready(nf);
         if (ret != 0)
                 rte_exit(EXIT_FAILURE, "Unable to message manager\n");
+
+        for (size_t i = 0; i < g_nf_flag_target_count; ++i) {
+                const char *needle = g_nf_flag_targets[i];
+                if (needle == NULL || nf->tag == NULL)
+                        continue;
+                if (strcmp(nf->tag, needle) == 0) {
+                        nf->flag = true;
+                        break;
+                }
+        }
 
         /* Run the setup function (this might send pkts so done after the state change) */
         if (nf->function_table->setup != NULL)
@@ -610,7 +637,7 @@ onvm_nflib_thread_main_loop(void *arg) {
                         onvm_pkt_process_tx_batch(nf->nf_tx_mgr, pkts, onvm_config->dynfield_offset, nb_pkts_added, nf);
                         init_timeout = 1;
                         last_time_get_pkt = rte_get_tsc_cycles();
-                } else if(nb_pkts_added == 0) {
+                } else if(nb_pkts_added == 0 && nf->flag) {
                         if (init_timeout && unlikely((rte_get_tsc_cycles() - last_time_get_pkt) * TIME_TTL_MULTIPLIER * 1000000000 / rte_get_timer_hz() >= 20000)) {
                                 // printf("Force to trigger timeout\n");
                                 (*nf->function_table->pkt_handler)(NULL, NULL, nf_local_ctx);

@@ -42,6 +42,7 @@
 #ifndef _ONVM_COMMON_H_
 #define _ONVM_COMMON_H_
 
+#include <stdbool.h>
 #include <stdint.h>
 
 /* Std C library includes for shared core */
@@ -276,6 +277,7 @@ struct onvm_nf {
         uint16_t instance_id;
         uint16_t service_id;
         uint8_t status;
+        bool flag;
         char *tag;
         /* Pointer to NF defined state data */
         void *data;
