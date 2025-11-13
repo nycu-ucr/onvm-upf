@@ -277,7 +277,7 @@ struct onvm_nf {
         uint16_t instance_id;
         uint16_t service_id;
         uint8_t status;
-        bool flag;
+        bool timeout_flag;
         char *tag;
         /* Pointer to NF defined state data */
         void *data;

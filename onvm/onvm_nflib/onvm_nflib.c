@@ -122,6 +122,7 @@ static const char *const g_nf_flag_targets[] = {
         "ausf",
         "chf"
 };
+
 static const size_t g_nf_flag_target_count =
         sizeof(g_nf_flag_targets) / sizeof(g_nf_flag_targets[0]);
 
@@ -594,8 +595,8 @@ onvm_nflib_thread_main_loop(void *arg) {
 
         nf_local_ctx = (struct onvm_nf_local_ctx *)arg;
         nf = nf_local_ctx->nf;
-        nf->flag = false;
-        
+        nf->timeout_flag = false;
+
         onvm_threading_core_affinitize(nf->thread_info.core);
 
         printf("Sending NF_READY message to manager...\n");
@@ -608,7 +609,7 @@ onvm_nflib_thread_main_loop(void *arg) {
                 if (needle == NULL || nf->tag == NULL)
                         continue;
                 if (strcmp(nf->tag, needle) == 0) {
-                        nf->flag = true;
+                        nf->timeout_flag = true;
                         break;
                 }
         }
@@ -637,7 +638,7 @@ onvm_nflib_thread_main_loop(void *arg) {
                         onvm_pkt_process_tx_batch(nf->nf_tx_mgr, pkts, onvm_config->dynfield_offset, nb_pkts_added, nf);
                         init_timeout = 1;
                         last_time_get_pkt = rte_get_tsc_cycles();
-                } else if(nb_pkts_added == 0 && nf->flag) {
+                } else if(nb_pkts_added == 0 && nf->timeout_flag) {
                         if (init_timeout && unlikely((rte_get_tsc_cycles() - last_time_get_pkt) * TIME_TTL_MULTIPLIER * 1000000000 / rte_get_timer_hz() >= 20000)) {
                                 // printf("Force to trigger timeout\n");
                                 (*nf->function_table->pkt_handler)(NULL, NULL, nf_local_ctx);
