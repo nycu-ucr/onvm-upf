@@ -48,6 +48,8 @@
 
 #include "onvm_pkt_common.h"
 
+#define UPFU_TAG_BIT (1u << 7)
+
 /**********************Internal Functions Prototypes**************************/
 
 /*
@@ -82,6 +84,80 @@ onvm_pkt_process_next_action(struct queue_mgr *tx_mgr, struct rte_mbuf *pkt, int
  */
 static int
 onvm_pkt_drop(struct rte_mbuf *pkt);
+
+
+static uint64_t g_tx_shortfall = 0, g_tx_shortfall_firstlen_lt60 = 0;
+static uint64_t g_tx_shortfall_firstlen_gt1518 = 0, g_tx_shortfall_multiseg = 0;
+
+static inline void dbg_dump_refused(const char* tag, uint16_t port, uint16_t qid,
+                                    struct rte_mbuf *m,
+                                    uint16_t sent, uint16_t count) {
+    uint16_t len   = rte_pktmbuf_pkt_len(m);
+    uint8_t *base  = rte_pktmbuf_mtod(m, uint8_t*);
+    uint16_t eth_t = (len >= 14) ? rte_be_to_cpu_16(*(uint16_t*)(base + 12)) : 0xffff;
+
+    printf("[%s] TX shortfall p%u q%u: sent %u/%u len=%u nb_segs=%u first=%02x %02x ethertype=0x%04x data_off=%u buf_len=%u tailroom=%u\n",
+           tag, port, qid, sent, count, len, m->nb_segs,
+           base[0], (len>1?base[1]:0), eth_t,
+           m->data_off, m->buf_len, rte_pktmbuf_tailroom(m));
+
+    g_tx_shortfall++;
+    if (len < 60) g_tx_shortfall_firstlen_lt60++;
+    if (len > 1518) g_tx_shortfall_firstlen_gt1518++;
+    if (m->nb_segs > 1) g_tx_shortfall_multiseg++;
+}
+
+
+static struct rte_eth_stats g_prev_stats[RTE_MAX_ETHPORTS];
+static uint64_t g_shortfall_events[RTE_MAX_ETHPORTS];
+
+static inline void dump_tx_stats_delta(uint16_t port, uint16_t qid, const char* tag) {
+    struct rte_eth_stats now;
+    if (rte_eth_stats_get(port, &now) < 0) return;
+
+    const struct rte_eth_stats *prev = &g_prev_stats[port];
+
+    uint64_t d_op = now.opackets - prev->opackets;
+    uint64_t d_ob = now.obytes   - prev->obytes;
+    uint64_t d_oe = now.oerrors  - prev->oerrors;
+
+    // per-queue arrays only exist up to RTE_ETHDEV_QUEUE_STAT_CNTRS
+    uint64_t d_qop = 0, d_qob = 0;
+    if (qid < RTE_ETHDEV_QUEUE_STAT_CNTRS) {
+        d_qop = now.q_opackets[qid] - prev->q_opackets[qid];
+        d_qob = now.q_obytes[qid]   - prev->q_obytes[qid];
+    }
+
+    printf("[%s] p%u q%u Δ: opk=%" PRIu64 " obytes=%" PRIu64 " oerr=%" PRIu64
+           " | q_opk=%" PRIu64 " q_obytes=%" PRIu64 " (events=%" PRIu64 ")\n",
+           tag, port, qid, d_op, d_ob, d_oe, d_qop, d_qob, ++g_shortfall_events[port]);
+
+    g_prev_stats[port] = now; // update snapshot
+}
+
+
+static inline const char* dstat2s(int s){
+  return s==RTE_ETH_TX_DESC_FULL?"FULL":
+         s==RTE_ETH_TX_DESC_DONE?"DONE":
+         s==RTE_ETH_TX_DESC_UNAVAIL?"UNAVAIL":"?";
+}
+
+static inline void dump_desc_sample(uint16_t port, uint16_t qid) {
+  const uint16_t idxs[] = {0, 32, 64, 128};
+  for (unsigned i=0; i<sizeof(idxs)/sizeof(idxs[0]); i++) {
+    int st = rte_eth_tx_descriptor_status(port, qid, idxs[i]);
+    if (st >= 0) printf("[desc] p%u q%u d%u=%s\n", port, qid, idxs[i], dstat2s(st));
+  }
+}
+
+static inline void dump_link(uint16_t port) {
+  struct rte_eth_link lk;
+  rte_eth_link_get_nowait(port, &lk);
+  printf("[link] p%u up=%d speed=%u duplex=%u\n",
+         port, lk.link_status, lk.link_speed, lk.link_duplex);
+}
+
+
 
 /**********************************Interfaces*********************************/
 
@@ -223,16 +299,123 @@ onvm_pkt_flush_port_queue(struct queue_mgr *tx_mgr, uint16_t port) {
                 return;
 
         tx_stats = &(ports->tx_stats);
-        sent = rte_eth_tx_burst(port, tx_mgr->id, port_buf->buffer, port_buf->count);
-        if (unlikely(sent < port_buf->count)) {
-                for (i = sent; i < port_buf->count; i++) {
-                        onvm_pkt_drop(port_buf->buffer[i]);
-                }
-                tx_stats->tx_drop[port] += (port_buf->count - sent);
-        }
-        tx_stats->tx[port] += sent;
+        
+        int ok = rte_eth_tx_prepare(port, tx_mgr->id, port_buf->buffer, port_buf->count);
+        if (ok != (int)port_buf->count) {
+            printf("[prepare] p%u q%u ok=%d/%u rte_errno=%d\n",
+                port, (unsigned)tx_mgr->id, ok, port_buf->count, rte_errno);
 
+                        // >>> INSERT "find first bad mbuf" block HERE <<<
+            int bad = -1;
+            for (uint16_t i = 0; i < (int)port_buf->count; i++) {
+                struct rte_mbuf *m = port_buf->buffer[i];
+                int one = rte_eth_tx_prepare(port, (uint16_t)tx_mgr->id, &m, 1);
+                if (one == 0) {
+                    bad = (int)i;
+                    uint16_t len = rte_pktmbuf_pkt_len(m);
+                    uint8_t *base = rte_pktmbuf_mtod(m, uint8_t *);
+                    uint16_t et = (len >= 14) ? rte_be_to_cpu_16(*(uint16_t *)(base + 12)) : 0xffff;
+
+                    /* struct onvm_configuration *onvm_config = onvm_nflib_get_onvm_config();
+                    struct onvm_pkt_meta *bm = onvm_get_pkt_meta(m, onvm_config->dynfield_offset); */
+
+                    printf("[bad] p%u q%u idx=%d len=%u nb_segs=%u data_off=%u "
+                        "ol=0x%lx l2=%u l3=%u tso=%u et=0x%04x first=%02x %02x errno=%d\n",
+                        port, (unsigned)tx_mgr->id, bad, len, m->nb_segs, m->data_off,
+                        (unsigned long)m->ol_flags, m->l2_len, m->l3_len, m->tso_segsz,
+                        et, base[0], (len>1?base[1]:0), rte_errno);
+                    
+                    /* printf("[bad] idx=%d m=%p tag=%u len=%u nb_segs=%u data_off=%u "
+                        "ol=0x%lx l2=%u l3=%u tso=%u errno=%d\n",
+                        bad, (void*)m,
+                        (bm ? ((bm->flags & UPFU_TAG_BIT) != 0) : 0),
+                        len, m->nb_segs, m->data_off,
+                        (unsigned long)m->ol_flags, m->l2_len, m->l3_len, m->tso_segsz,
+                        rte_errno); */
+                    
+                    break;
+                }
+            }
+
+            if (ok <= 0) {
+                // Drop entire batch if none are valid
+                    for (uint16_t i = 0; i < port_buf->count; i++) onvm_pkt_drop(port_buf->buffer[i]);
+                    tx_stats->tx_drop[port] += port_buf->count;
+                    port_buf->count = 0;
+                    return;
+            }
+            // Drop only the invalid tail; transmit the first 'ok'
+            for (uint16_t i = ok; i < port_buf->count; i++) onvm_pkt_drop(port_buf->buffer[i]);
+            tx_stats->tx_drop[port] += (port_buf->count - ok);
+            port_buf->count = ok;   // shrink batch to what prepare approved
+        }
+        
+        uint16_t total = 0, tries = 0, n = port_buf->count;
+
+        while (total < n) {
+                uint16_t s = rte_eth_tx_burst(port, tx_mgr->id,
+                                                &port_buf->buffer[total], n - total);
+                total += s;
+                if (total == n) break;
+
+                if (s == 0) {
+                        // ring-full relief: reclaim completed, brief pause, retry
+                        rte_eth_tx_done_cleanup(port, tx_mgr->id, 0);
+                        rte_pause();
+                        if (++tries > 8) break;   // don’t livelock
+                }
+        }
+
+        // shortfall handling (same place you already print)
+        if (unlikely(total < n)) {
+            // 1) see if reclaim frees anything right now
+            int reclaimed = rte_eth_tx_done_cleanup(port, (uint16_t)tx_mgr->id, 0);
+            printf("[cleanup] p%u q%u reclaimed=%d\n", port, (unsigned)tx_mgr->id, reclaimed);
+            struct rte_mbuf *first_refused = port_buf->buffer[total];
+            /* struct onvm_configuration *onvm_config = onvm_nflib_get_onvm_config();
+            struct onvm_pkt_meta *mm = onvm_get_pkt_meta(first_refused, onvm_config->dynfield_offset); */
+
+            printf("[mbuf] m=%p ol=0x%lx l2=%u l3=%u tso=%u vlan=%u\n",
+            (void*)first_refused,
+            (unsigned long)first_refused->ol_flags,
+            first_refused->l2_len, first_refused->l3_len,
+            first_refused->tso_segsz, first_refused->vlan_tci);
+
+            // single-packet prepare check to see *why* it won’t go
+            int ok1 = rte_eth_tx_prepare(port, (uint16_t)tx_mgr->id, &first_refused, 1);
+            printf("[prepare-1] ok=%d rte_errno=%d\n", ok1, rte_errno);
+            
+            dbg_dump_refused("flush", port, tx_mgr->id, first_refused, total, n);
+            dump_tx_stats_delta(port, tx_mgr->id, "flush-shortfall");
+            // 2) head/mid/tail descriptor status (relative to actual ring depth)
+            struct rte_eth_txq_info qi;
+            if (rte_eth_tx_queue_info_get(port, (uint16_t)tx_mgr->id, &qi) == 0) {
+                uint16_t mid  = qi.nb_desc / 2;
+                uint16_t tail = qi.nb_desc ? (qi.nb_desc - 1) : 0;
+
+                int s0 = rte_eth_tx_descriptor_status(port, (uint16_t)tx_mgr->id, 0);
+                int sm = rte_eth_tx_descriptor_status(port, (uint16_t)tx_mgr->id, mid);
+                int st = rte_eth_tx_descriptor_status(port, (uint16_t)tx_mgr->id, tail);
+
+                printf("[desc] p%u q%u d0=%s d%u=%s d%u=%s\n",
+                    port, (unsigned)tx_mgr->id,
+                    s0==RTE_ETH_TX_DESC_FULL?"FULL":s0==RTE_ETH_TX_DESC_DONE?"DONE":"UNAVAIL",
+                    mid, sm==RTE_ETH_TX_DESC_FULL?"FULL":sm==RTE_ETH_TX_DESC_DONE?"DONE":"UNAVAIL",
+                    tail,st==RTE_ETH_TX_DESC_FULL?"FULL":st==RTE_ETH_TX_DESC_DONE?"DONE":"UNAVAIL");
+            }
+
+            dump_link(port);
+
+
+
+            for (i = total; i < n; i++) onvm_pkt_drop(port_buf->buffer[i]);
+            tx_stats->tx_drop[port] += (n - total);
+        }
+
+        tx_stats->tx[port] += total;
         port_buf->count = 0;
+
+
 }
 
 void
@@ -259,15 +442,16 @@ onvm_pkt_enqueue_tx_thread(struct packet_buf *pkt_buf, struct onvm_nf *nf) {
 inline static void
 onvm_pkt_enqueue_port(struct queue_mgr *tx_mgr, uint16_t port, struct rte_mbuf *buf) {
         struct packet_buf *port_buf;
-
-        if (tx_mgr == NULL || buf == NULL || !ports->init[port])
+        if (tx_mgr == NULL || buf == NULL || !ports->init[port]) {
                 return;
 
+        }     
         port_buf = &tx_mgr->tx_thread_info->port_tx_bufs[port];
         port_buf->buffer[port_buf->count++] = buf;
         if (port_buf->count == PACKET_READ_SIZE) {
                 onvm_pkt_flush_port_queue(tx_mgr, port);
         }
+
 }
 
 inline static void

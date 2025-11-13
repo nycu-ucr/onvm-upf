@@ -330,7 +330,8 @@ static inline uint16_t get_gtpu_header_len(struct rte_mbuf *pkt){
         gtpv1_opt = rte_pktmbuf_mtod_offset( pkt, gtpv1_hdr_opt_t *, sizeof(struct rte_ipv4_hdr) + sizeof(struct rte_udp_hdr) + sizeof(gtpv1_t));
         next_ehdr_type = gtpv1_opt->next_ehdr_type;
 
-        while(next_ehdr_type){
+
+        if(next_ehdr_type){
             switch (next_ehdr_type)
             {
             case GTPV1_NEXT_EXT_HDR_TYPE_85:{

@@ -5,4 +5,5 @@ sources = files(
 
 upf_u_link_deps = [
   dependency('yaml-0.1', version: '>=0.2.2', required: true),
+  dependency('pcap', version: '1.10.1', required: true),
 ]

@@ -90,6 +90,8 @@
 #define IPV6_FLOWLABEL_MASK 0x000FFFFFu
 #endif
 
+#define UPFU_TAG_BIT (1u << 7)
+
 
 static inline int UpfSendEvt1(uint16_t dest_sid, uint32_t type, uintptr_t a0) {
     Event *e = (Event *)rte_calloc("upf_evt", 1, sizeof(*e), 0);
@@ -1434,7 +1436,13 @@ packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm_nf_
 
         // printf("Outer Header Length: %u\n", outerHeaderLen);
         // shift to the start of the inner header
-        rte_pktmbuf_adj(pkt, outerHeaderLen);
+        void *nh = rte_pktmbuf_adj(pkt, outerHeaderLen);
+
+        if (unlikely(nh == NULL || rte_pktmbuf_pkt_len(pkt) == 0)) {
+            printf("[upf] decap DROP adj=%u after_len=%u\n", outerHeaderLen, rte_pktmbuf_pkt_len(pkt));
+            meta->action = ONVM_NF_ACTION_DROP;
+            return 0;
+        }
 
         // rte_pktmbuf_prepend(pkt, (uint16_t)sizeof(struct rte_ether_hdr));
 
@@ -1444,16 +1452,16 @@ packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm_nf_
 
         // rte_pktmbuf_adj(pkt, (uint16_t)sizeof(struct rte_ether_hdr));
 
-        meta->destination = 1;
+        meta->destination = pkt->port ^ 1;
     } else {
         is_dl = true;
         rte_pktmbuf_adj(pkt, (uint16_t)sizeof(struct rte_ether_hdr));
-        if (encap_downlink_gtp(pkt, DEFAULT_ACCESS_NODE_IP, 2) < 0) {
+        if (encap_downlink_gtp(pkt, DEFAULT_ACCESS_NODE_IP, 1) < 0) {
             UTLT_Error("Failed to encapsulate GTP-U header");
             return 0;
         }
 
-        meta->destination = 0;
+        meta->destination = pkt->port ^ 1;
     }
 
     // rte_pktmbuf_adj(pkt, sizeof(struct rte_ether_hdr));
@@ -1461,6 +1469,24 @@ packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm_nf_
     AttachL2Header(pkt, is_dl);
 
     // meta->destination = pkt->port ^ 1;
+
+    pkt->ol_flags = 0;
+    pkt->l2_len   = sizeof(struct rte_ether_hdr);
+    pkt->l3_len   = sizeof(struct rte_ipv4_hdr);   // in that IPv4 path
+    pkt->tso_segsz= 0;
+
+    uint16_t plen = rte_pktmbuf_pkt_len(pkt);
+    if (unlikely(plen == 0)) {
+        printf("[upf] drop zero-len before OUT (path=%s)\n", is_dl ? "DL" : "UL");
+        meta->action = ONVM_NF_ACTION_DROP;
+        return 0;
+    }
+
+    printf("[upf] %s len=%u l2=%u l3=%u data_off=%u\n",
+       is_dl ? "DL" : "UL", plen, pkt->l2_len, pkt->l3_len, pkt->data_off);
+    
+    meta->flags |= UPFU_TAG_BIT;
+    
     meta->action = ONVM_NF_ACTION_OUT;
 
     return 0;
