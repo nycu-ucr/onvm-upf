@@ -18,6 +18,7 @@ For further information regarding Pktgen configuration or set up, please refer t
   - [2.2 Build Pktgen Application](#22-build-pktgen-application)
   - [2.3 Configure Pktgen for openNetVM](#23-configure-pktgen-for-opennetvm)
   - [2.4 Run pktgen](#24-run-pktgen)
+  - [2.5 Enable and Replay PCAP Files in Pktgen](#25-enable-and-replay-pcap-files-in-pktgen)
 - [3 Editing GTP-U PCAP Files](#3-editing-gtp-u-pcap-files)
   - [3.1 Install Dependencies](#31-install-dependencies)
   - [3.2 Script Overview](#32-script-overview)
@@ -297,6 +298,60 @@ Src MAC Address :  90:e2:ba:5a:f7:90  90:e2:ba:5a:f7:91
 Run `start all` to start sending packets.  
 
 Please use `pktgen> exit` for existing. 
+
+
+2.5 Enable and Replay PCAP Files in Pktgen
+------------- 
+Pktgen supports replaying PCAP files on a specified port. After launching Pktgen using your configuration file, follow the steps below to enable PCAP mode and replay the file.
+
+These examples assume **port 0** is used for PCAP replay (as configured in the sample `cfg` file).
+
+### Step 1: Enable PCAP mode on port 0
+
+At the Pktgen command prompt:
+
+```
+pktgen> enable 0 pcap
+```
+
+This instructs Pktgen to use the PCAP file specified in your configuration for port 0.
+
+---
+
+### Step 2: Start the PCAP replay
+
+Start sending packets from the PCAP:
+
+```
+pktgen> start 0
+```
+
+Pktgen will begin replaying the packets in a continuous loop unless a transmit count limit is configured.
+
+---
+
+### Step 3: Adjust the packet transmission rate (optional)
+
+You may dynamically change the send rate using:
+
+```
+pktgen> set 0 rate 0.001
+```
+
+This sets the transmit rate for port 0 to **0.001%** of the link speed.
+You can adjust the value to increase or decrease the traffic load.
+
+---
+
+### Notes
+
+* If your PCAP file contains GTP-U traffic, you can use the `gtpu_editor.py` script in Section 3 to preprocess or rewrite the PCAP before replaying.
+* Rate control (`set <port> rate <value>`) can be applied at any time during replay.
+* You can stop replay using:
+
+  ```
+  pktgen> stop 0
+  ```
 
 ---
 
