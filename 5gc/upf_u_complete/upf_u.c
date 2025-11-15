@@ -92,6 +92,8 @@
 
 #define UPFU_TAG_BIT (1u << 7)
 
+#define UPFU_STAMP_MAGIC 0x55504655u  /* 'UPFU' */
+
 
 static inline int UpfSendEvt1(uint16_t dest_sid, uint32_t type, uintptr_t a0) {
     Event *e = (Event *)rte_calloc("upf_evt", 1, sizeof(*e), 0);
@@ -126,6 +128,7 @@ struct rte_meter_trtcm app_flows[APP_FLOWS_MAX];
 
 struct rte_mbuf *buffer[MAX_OF_BUFFER_PACKET_SIZE];
 uint32_t buffer_length = 0;
+static uint32_t g_upfu_pkt_id = 0;
 
 /* trTCM */
 struct rte_meter_trtcm_params app_trtcm_params = {
@@ -1400,7 +1403,7 @@ packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm_nf_
         return 0;
     }
 
-    {
+    /* {
         char src_s[16], dst_s[16], line[128];
         int n = 0;
 
@@ -1411,7 +1414,7 @@ packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm_nf_
         if (n > 0 && n < (int)sizeof(line)) {
             (void)write(STDOUT_FILENO, line, (size_t)n);
         }
-    }
+    } */
 
     //printf(onvm_pkt_is_ipv4(pkt) ? "It's IPv4\n" : "Not IPv4\n");
     
@@ -1482,12 +1485,17 @@ packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm_nf_
         return 0;
     }
 
-    printf("[upf] %s len=%u l2=%u l3=%u data_off=%u\n",
-       is_dl ? "DL" : "UL", plen, pkt->l2_len, pkt->l3_len, pkt->data_off);
-    
+
+    uint32_t pkt_id = ++g_upfu_pkt_id;
+    pkt->dynfield1[UPFU_STAMP_DYNIDX] = UPFU_STAMP_MAGIC;
+    pkt->dynfield1[UPFU_STAMP_LEN_IDX] = plen;
+    pkt->dynfield1[UPFU_STAMP_ID_IDX]  = pkt_id;
     meta->flags |= UPFU_TAG_BIT;
-    
+
     meta->action = ONVM_NF_ACTION_OUT;
+
+    printf("[upf] id=%u m=%p %s len=%u l2=%u l3=%u data_off=%u ref=%u\n",
+       pkt_id, (void *)pkt, is_dl ? "DL" : "UL", plen, pkt->l2_len, pkt->l3_len, pkt->data_off, rte_mbuf_refcnt_read(pkt));
 
     return 0;
 

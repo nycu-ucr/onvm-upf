@@ -4,10 +4,10 @@ info:
 
 configuration:
   dataplane:
-    dn_mac: "3c:fd:fe:b3:13:04"
-    an_mac: "3c:fd:fe:ac:fb:00"
+    dn_mac: "90:e2:ba:ac:14:90"
+    an_mac: "90:e2:ba:b2:94:69"
     upf_ip: "192.168.1.2"
 
     ports:
-      access: 0                     # ACCESS_PORT
-      core: 1                       # CORE_PORT (SGi follows CORE)
+      access: 1                     # ACCESS_PORT
+      core: 0                       # CORE_PORT (SGi follows CORE)

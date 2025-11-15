@@ -415,6 +415,7 @@ main(int argc, char *argv[]) {
                 }
                 tx_mgr[i]->mgr_type_t = MGR;
                 tx_mgr[i]->id = i;
+                tx_mgr[i]->pkt_meta_offset = onvm_config->dynfield_offset;
                 tx_mgr[i]->tx_thread_info = rte_calloc(NULL, 1, sizeof(struct tx_thread_info), RTE_CACHE_LINE_SIZE);
                 if (tx_mgr[i]->tx_thread_info == NULL) {
                         goto onvm_free;

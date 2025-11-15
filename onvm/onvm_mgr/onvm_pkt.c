@@ -106,6 +106,15 @@ onvm_pkt_process_rx_batch(struct queue_mgr *rx_mgr, struct rte_mbuf *pkts[], uin
 
                 (meta->chain_index)++;
 
+                if (meta->destination == 1) {
+                        static uint64_t ul_rx = 0;
+                        ul_rx++;
+                        if (ul_rx % 10000 == 0) {
+                                printf("[mgr-ingress] ul_rx=%" PRIu64 " last_len=%u\n",
+                                ul_rx, rte_pktmbuf_pkt_len(pkts[i]));
+                        }
+                }
+
                 /* struct rte_ether_hdr *eh = rte_pktmbuf_mtod(pkts[i], struct rte_ether_hdr*);
                 if ((i & 0x3fff) == 0) {
                 printf("[mgr→NF] in_port=%u dst=%02X:%02X:%02X:%02X:%02X:%02X action=%u dest=%u\n",
