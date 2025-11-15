@@ -1,8 +1,0 @@
-# DN MAC Address
-3c:fd:fe:b0:f1:f4
-# AN MAC Address
-3c:fd:fe:b0:f5:4d
-# UPF ID Address
-192.168.1.2
-ACCESS_PORT=1
-CORE_PORT=0
