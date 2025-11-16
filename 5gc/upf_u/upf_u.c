@@ -50,10 +50,6 @@
 #include "../classifiers/upf_cls_adapter.h"
 #include "../classifiers/classifier_wrapper.h"
 
-// for logging
-
-#include "upf_u_config.h"
-
 #include "upf_u_config.h"
 
 #define NF_TAG "upf_u"
@@ -112,7 +108,6 @@ int16_t g_core_port   = 0;
 int16_t g_sgi_port    = 0;
 
 
-
 struct rte_meter_trtcm_profile app_trtcm_profile;
 struct rte_meter_trtcm_profile app_flow_trtcm_profile;
 struct rte_meter_trtcm app_flows[APP_FLOWS_MAX];
@@ -135,6 +130,7 @@ struct flow_entry {
     int flow_idx;     // maps to trTCM flows table
     bool in_use;      // to track if the slot is occupied
 }typedef flow_entry_t;
+
 flow_entry_t iPFlows[APP_FLOWS_MAX];
 uint32_t iPFlowsLen = 0;
 uint32_t trTCMidx = 0;
@@ -397,7 +393,6 @@ ConfigureQerFlows(UpfSession *session,
     }
 }
 
-
 char *
 convertToIpAddress(uint32_t big_endian_value) {
     static char ip_string[16];
@@ -434,75 +429,6 @@ parseIpv4Address(const char *addrStr) {
     return 0;
 }
 
-void
-parseMAC(const char *config_path) {
-    FILE *file = fopen(config_path, "r");
-    if (file == NULL) {
-        fprintf(stderr, "Error: failed to open file %s\n", config_path);
-        exit(EXIT_FAILURE);
-    }
-
-    char line[256];
-    int linenum = 0;
-    int DNvalues[6];
-    int ANvalues[6];
-
-    while (fgets(line, sizeof(line), file) != NULL) {
-        linenum++;
-
-        char *p = line;
-        while (*p == ' ' || *p == '\t') p++;
-
-        if (strncmp(p, "ACCESS_PORT=", 12) == 0) {
-            int v = atoi(p + 12);
-            if (v >= 0 && v <= UINT8_MAX) g_access_port = (int16_t)v;
-            continue;
-        }
-        if (strncmp(p, "CORE_PORT=", 10) == 0) {
-            int v = atoi(p + 10);
-            if (v >= 0 && v <= UINT8_MAX) {
-                g_core_port = (int16_t)v;
-                g_sgi_port  = (int16_t)v;
-            }
-            continue;
-        }
-
-        if (linenum == 2) {
-            /* DN MAC Address */
-            if (sscanf(p, "%x:%x:%x:%x:%x:%x%*c",
-                       &DNvalues[0], &DNvalues[1], &DNvalues[2],
-                       &DNvalues[3], &DNvalues[4], &DNvalues[5]) == 6) {
-                for (int i = 0; i < 6; ++i) DnMac[i] = (uint8_t)DNvalues[i];
-            } else {
-                fprintf(stderr, "[Parse MAC] could not parse DN MAC from: %s", p);
-            }
-        }
-
-        if (linenum == 4) {
-            /* AN MAC Address */
-            if (sscanf(p, "%x:%x:%x:%x:%x:%x%*c",
-                       &ANvalues[0], &ANvalues[1], &ANvalues[2],
-                       &ANvalues[3], &ANvalues[4], &ANvalues[5]) == 6) {
-                for (int j = 0; j < 6; ++j) AnMac[j] = (uint8_t)ANvalues[j];
-            } else {
-                fprintf(stderr, "[Parse MAC] could not parse AN MAC from: %s", p);
-            }
-        }
-
-        if (linenum == 6) {
-            if (parseIpv4Address(p)) {
-                UTLT_Error("Parse IP address failed\n");
-            }
-        }
-    }
-
-    fclose(file);
-
-    UTLT_Debug("UPF port map (from upf_u.txt): ACCESS=%d CORE=%d SGI=%d",
-              g_access_port, g_core_port, g_sgi_port);
-}
-
-
 static inline source_interface_t PortToSourceInterface(uint8_t port) {
     if ((int)port == g_access_port)  return SRC_IF_ACCESS;
     if ((int)port == g_core_port)    return SRC_IF_CORE;
@@ -511,7 +437,6 @@ static inline source_interface_t PortToSourceInterface(uint8_t port) {
                  port, g_access_port, g_core_port, g_sgi_port);
     return SRC_IF_ACCESS;
 }
-
 
 static int
 trtcmConfigFlowTables(void){
@@ -663,8 +588,7 @@ initUeTable(){
 uint32_t 
 findIndexByUeIpAddress(uint32_t ue_ip) {
     int index = -1;
-    for (int i = 0; i < MAX_UE; i++)
-    {
+    for (int i = 0; i < MAX_UE; i++) {
         if (ue_table[i].ue_ip == ue_ip) {
             index = i;
         }
@@ -711,7 +635,7 @@ updateTokenbyIndex(int index) {
         uint64_t cur_cycles;
         uint64_t elapsed_cycles;
         uint64_t tokens_produced;
-        //
+
         cur_cycles = rte_get_tsc_cycles();
         elapsed_cycles = cur_cycles - ue_table[index].ue_nqos_tb_params.last_cycle;
 
@@ -1379,6 +1303,7 @@ msg_handler(void *msg_data, struct onvm_nf_local_ctx *nf_local_ctx) {
 }
 
 uint64_t last_p = NULL;
+
 static int 
 callback_handler(struct onvm_nf_local_ctx *nf_local_ctx) {
     if (unlikely(!last_p)) last_p = rte_get_tsc_cycles();
@@ -1446,16 +1371,13 @@ main(int argc, char *argv[]) {
     if (ret < 0)
         rte_exit(EXIT_FAILURE, "Cannot get MAC address: err=%d, port=%u\n", ret, 1);
 
-    // Parse DN & AN MAC address from upf_u.txt
-    //const char *config_path = "upf_u.txt";  // default
-
+    /* Parse DN & AN MAC address from config/upf_u.yaml */
     const char *config_path = "config/upf_u.yaml";
 
     if (argc > arg_offset + 1) {
         config_path = argv[arg_offset + 1];
     }
     printf("[UPF-U] Using config: %s\n", config_path);
-    //parseMAC(config_path);
     UpfU_LoadAndParseConfig(config_path);
 
     /* UTLT_Info("[UPF-U][CONFIG] Port map: ACCESS=%d CORE=%d SGI=%d",
