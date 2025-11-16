@@ -3,7 +3,8 @@ subdir('classifiers')
 
 l25gc_nfs = [
     'upf_u',
-    'upf_c'
+    'upf_c',
+    'dn_app'
 ]
 
 rt_dep = cc.find_library('rt', required: false)
