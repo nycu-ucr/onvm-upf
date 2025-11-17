@@ -53,6 +53,85 @@
 
 /**********************************Interfaces*********************************/
 
+// void
+// onvm_pkt_process_rx_batch(struct queue_mgr *rx_mgr, struct rte_mbuf *pkts[], uint16_t rx_count) {
+//         uint16_t i;
+//         struct onvm_pkt_meta *meta;
+// 	struct rte_ether_hdr *eth_hdr;
+// 	uint16_t ether_type;
+// #ifdef FLOW_LOOKUP
+//         struct onvm_flow_entry *flow_entry;
+//         struct onvm_service_chain *sc;
+//         int ret;
+// #endif
+
+//         if (rx_mgr == NULL || pkts == NULL)
+//                 return;
+
+//         for (i = 0; i < rx_count; i++) {
+//                 meta = onvm_get_pkt_meta(pkts[i], onvm_config->dynfield_offset);
+//                 meta->src = 0;
+//                 meta->chain_index = 0;
+// #ifdef FLOW_LOOKUP
+//                 ret = onvm_flow_dir_get_pkt(pkts[i], &flow_entry);
+//                 if (ret >= 0) {
+//                         sc = flow_entry->sc;
+//                         meta->action = onvm_sc_next_action(sc, pkts[i], onvm_config->dynfield_offset);
+//                         meta->destination = onvm_sc_next_destination(sc, pkts[i], onvm_config->dynfield_offset);
+//                 } else {
+// #endif
+//                         /* eth_hdr = rte_pktmbuf_mtod(pkts[i], struct rte_ether_hdr *);
+//                         ether_type = eth_hdr->ether_type;
+
+//                         if (ether_type == rte_cpu_to_be_16(RTE_ETHER_TYPE_ARP)) {
+//                                 meta->action = ONVM_NF_ACTION_TONF;
+//                                 meta->destination = ARP_NF_ID;
+//                         } else {
+//                                 meta->action = onvm_sc_next_action(default_chain, pkts[i], onvm_config->dynfield_offset);
+//                                 meta->destination = onvm_sc_next_destination(default_chain, pkts[i], onvm_config->dynfield_offset);
+//                         } */
+
+//                         meta->action = onvm_sc_next_action(default_chain, pkts[i], onvm_config->dynfield_offset);
+//                         meta->destination = onvm_sc_next_destination(default_chain, pkts[i], onvm_config->dynfield_offset);
+
+
+// #ifdef FLOW_LOOKUP
+//                 }
+// #endif
+//                 /* PERF: this might hurt performance since it will cause cache
+//                  * invalidations. Ideally the data modified by the NF manager
+//                  * would be a different line than that modified/read by NFs.
+//                  * That may not be possible.
+//                  */
+
+//                 (meta->chain_index)++;
+
+//                 if (meta->destination == 1) {
+//                         static uint64_t ul_rx = 0;
+//                         ul_rx++;
+//                         if (ul_rx % 10000 == 0) {
+//                                 printf("[mgr-ingress] ul_rx=%" PRIu64 " last_len=%u\n",
+//                                 ul_rx, rte_pktmbuf_pkt_len(pkts[i]));
+//                         }
+//                 }
+
+//                 /* struct rte_ether_hdr *eh = rte_pktmbuf_mtod(pkts[i], struct rte_ether_hdr*);
+//                 if ((i & 0x3fff) == 0) {
+//                 printf("[mgr→NF] in_port=%u dst=%02X:%02X:%02X:%02X:%02X:%02X action=%u dest=%u\n",
+//                         pkts[i]->port,
+//                         eh->dst_addr.addr_bytes[0], eh->dst_addr.addr_bytes[1], eh->dst_addr.addr_bytes[2],
+//                         eh->dst_addr.addr_bytes[3], eh->dst_addr.addr_bytes[4], eh->dst_addr.addr_bytes[5],
+//                         meta->action, meta->destination);
+//                 }
+//                 onvm_pkt_print_ether(eh); */
+
+//                 onvm_pkt_enqueue_nf(rx_mgr, meta->destination, pkts[i], NULL);
+//         }
+
+//         onvm_pkt_flush_all_nfs(rx_mgr, NULL);
+// }
+
+
 void
 onvm_pkt_process_rx_batch(struct queue_mgr *rx_mgr, struct rte_mbuf *pkts[], uint16_t rx_count) {
         uint16_t i;
@@ -80,21 +159,8 @@ onvm_pkt_process_rx_batch(struct queue_mgr *rx_mgr, struct rte_mbuf *pkts[], uin
                         meta->destination = onvm_sc_next_destination(sc, pkts[i], onvm_config->dynfield_offset);
                 } else {
 #endif
-                        /* eth_hdr = rte_pktmbuf_mtod(pkts[i], struct rte_ether_hdr *);
-                        ether_type = eth_hdr->ether_type;
-
-                        if (ether_type == rte_cpu_to_be_16(RTE_ETHER_TYPE_ARP)) {
-                                meta->action = ONVM_NF_ACTION_TONF;
-                                meta->destination = ARP_NF_ID;
-                        } else {
-                                meta->action = onvm_sc_next_action(default_chain, pkts[i], onvm_config->dynfield_offset);
-                                meta->destination = onvm_sc_next_destination(default_chain, pkts[i], onvm_config->dynfield_offset);
-                        } */
-
                         meta->action = onvm_sc_next_action(default_chain, pkts[i], onvm_config->dynfield_offset);
                         meta->destination = onvm_sc_next_destination(default_chain, pkts[i], onvm_config->dynfield_offset);
-
-
 #ifdef FLOW_LOOKUP
                 }
 #endif
@@ -105,31 +171,14 @@ onvm_pkt_process_rx_batch(struct queue_mgr *rx_mgr, struct rte_mbuf *pkts[], uin
                  */
 
                 (meta->chain_index)++;
-
-                if (meta->destination == 1) {
-                        static uint64_t ul_rx = 0;
-                        ul_rx++;
-                        if (ul_rx % 10000 == 0) {
-                                printf("[mgr-ingress] ul_rx=%" PRIu64 " last_len=%u\n",
-                                ul_rx, rte_pktmbuf_pkt_len(pkts[i]));
-                        }
-                }
-
-                /* struct rte_ether_hdr *eh = rte_pktmbuf_mtod(pkts[i], struct rte_ether_hdr*);
-                if ((i & 0x3fff) == 0) {
-                printf("[mgr→NF] in_port=%u dst=%02X:%02X:%02X:%02X:%02X:%02X action=%u dest=%u\n",
-                        pkts[i]->port,
-                        eh->dst_addr.addr_bytes[0], eh->dst_addr.addr_bytes[1], eh->dst_addr.addr_bytes[2],
-                        eh->dst_addr.addr_bytes[3], eh->dst_addr.addr_bytes[4], eh->dst_addr.addr_bytes[5],
-                        meta->action, meta->destination);
-                }
-                onvm_pkt_print_ether(eh); */
-
                 onvm_pkt_enqueue_nf(rx_mgr, meta->destination, pkts[i], NULL);
         }
 
         onvm_pkt_flush_all_nfs(rx_mgr, NULL);
 }
+
+
+
 
 void
 onvm_pkt_flush_all_ports(struct queue_mgr *tx_mgr) {

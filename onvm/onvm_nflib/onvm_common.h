@@ -43,6 +43,7 @@
 #define _ONVM_COMMON_H_
 
 #include <stdint.h>
+#include <stdbool.h>
 
 /* Std C library includes for shared core */
 #include <sys/shm.h>
@@ -283,6 +284,7 @@ struct onvm_nf {
         uint16_t instance_id;
         uint16_t service_id;
         uint8_t status;
+        bool timeout_flag;
         char *tag;
         /* Pointer to NF defined state data */
         void *data;
