@@ -610,7 +610,7 @@ onvm_nflib_thread_main_loop(void *arg) {
                         onvm_pkt_process_tx_batch(nf->nf_tx_mgr, pkts, onvm_config->dynfield_offset, nb_pkts_added, nf);
                         init_timeout = 1;
                         last_time_get_pkt = rte_get_tsc_cycles();
-                } else if(nb_pkts_added == 0) {
+                } else if(nb_pkts_added == 0 && nf->service_id != 1) {
                         if (init_timeout && unlikely((rte_get_tsc_cycles() - last_time_get_pkt) * TIME_TTL_MULTIPLIER * 1000000000 / rte_get_timer_hz() >= 20000)) {
                                 // printf("Force to trigger timeout\n");
                                 (*nf->function_table->pkt_handler)(NULL, NULL, nf_local_ctx);
