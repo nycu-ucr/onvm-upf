@@ -393,7 +393,7 @@ ConfigureQerFlows(UpfSession *session,
     }
 }
 
-char *
+/* char *
 convertToIpAddress(uint32_t big_endian_value) {
     static char ip_string[16];
 
@@ -406,7 +406,15 @@ convertToIpAddress(uint32_t big_endian_value) {
     sprintf(ip_string, "%d.%d.%d.%d", ip_address[3], ip_address[2], ip_address[1], ip_address[0]);
 
     return ip_string;
+} */
+
+static inline void convertToIpAddress(uint32_t be_addr, char *buf, size_t len) {
+    struct in_addr addr = { .s_addr = be_addr };
+    if (!inet_ntop(AF_INET, &addr, buf, len)) {
+        snprintf(buf, len, "<err>");
+    }
 }
+
 
 int
 parseIpv4Address(const char *addrStr) {
@@ -737,10 +745,10 @@ GetPdrByUeIpAddress(struct rte_mbuf *pkt, uint32_t ue_ip)
         return NULL;
     }
 
-    UpfSession *session = UpfSessionFindByUeIP(ue_ip);
+    /* UpfSession *session = UpfSessionFindByUeIP(ue_ip);
     if (session) {
         ConfigureQerFlows(session, pdr, pkt->port, false);
-    }
+    } */
     return pdr;
 }
 
@@ -896,10 +904,10 @@ UPDK_PDR *GetPdrByTeid(struct rte_mbuf *pkt, uint32_t td) {
         return NULL;
     }
 
-    UpfSession *session = UpfSessionFindByTeid(td);
+    /* UpfSession *session = UpfSessionFindByTeid(td);
     if (session) {
         ConfigureQerFlows(session, pdr, pkt->port, true);
-    }
+    } */
 
     return pdr;
 }
@@ -1106,10 +1114,12 @@ packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm_nf_
 
     UPDK_PDR *pdr = NULL;
 
-    char *src_address = convertToIpAddress(iph->src_addr);
-    UTLT_Info("Src IP is %s\n", src_address);
-    char *dst_address = convertToIpAddress(iph->dst_addr);
-    UTLT_Info("Dst IP is %s\n", dst_address);
+    char src_s[16], dst_s[16];
+
+    convertToIpAddress(iph->src_addr, src_s, sizeof(src_s));;
+    convertToIpAddress(iph->dst_addr, dst_s, sizeof(dst_s));
+
+    UTLT_Info("Src IP is %s | Dst IP is %s", src_s, dst_s);
 
     if (iph->dst_addr == SELF_IP) {  //
         UTLT_Info("It is uplink\n");
@@ -1125,14 +1135,14 @@ packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm_nf_
         pdr = GetPdrByTeid(pkt, teid);
 
     } else {
-        UTLT_Info("It is downlink, dst is %s\n", convertToIpAddress(iph->dst_addr));
+        UTLT_Info("It is downlink, dst is %s\n", dst_s);
         pdr = GetPdrByUeIpAddress(pkt, rte_cpu_to_be_32(iph->dst_addr));
-        GetQerByUEIpAddress(rte_cpu_to_be_32(iph->dst_addr), convertToIpAddress(iph->dst_addr));
+        // GetQerByUEIpAddress(rte_cpu_to_be_32(iph->dst_addr), convertToIpAddress(iph->dst_addr));
         is_dl = true;
     }
 
     if (!pdr) {
-        UTLT_Error("no PDR found for %s, skip\n", convertToIpAddress(iph->dst_addr));
+        UTLT_Error("no PDR found for %s, skip\n", dst_s);
         // TODO(vivek): what to do?
         return 0;
     }
@@ -1182,7 +1192,7 @@ packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm_nf_
         UTLT_Trace("Action is unknown\n");
     }
     AttachL2Header(pkt, is_dl);
-    if (meta->action == ONVM_NF_ACTION_OUT && is_dl) {
+    /* if (meta->action == ONVM_NF_ACTION_OUT && is_dl) {
         // check if the UE IP exists in the table and update the token
         int index = findIndexByUeIpAddress(rte_cpu_to_be_32(iph->dst_addr));
         if (index != -1) {
@@ -1246,7 +1256,7 @@ packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm_nf_
             ue_table[index].ue_nqos_tb_params.tb_tokens -= cal_pktlen;
             meta->action = ONVM_NF_ACTION_OUT;
         }
-    }
+    } */
     return status;
 }
 
@@ -1340,7 +1350,7 @@ main(int argc, char *argv[]) {
     struct onvm_nf_local_ctx *nf_local_ctx;
     struct onvm_nf_function_table *nf_function_table;
     // UTLT_SetLogLevel("Panic"); // to eliminate log print influenced jitter
-    UTLT_SetLogLevel("warning"); // to eliminate log print influenced jitter
+    UTLT_SetLogLevel("debug"); // to eliminate log print influenced jitter
 
     nf_local_ctx = onvm_nflib_init_nf_local_ctx();
     onvm_nflib_start_signal_handler(nf_local_ctx, NULL);
@@ -1392,8 +1402,8 @@ main(int argc, char *argv[]) {
     dn_eth.addr_bytes[5] = DnMac[5];
 
     // trTCM
-    trtcmConfigFlowTables();
-    initUeTable();
+    // trtcmConfigFlowTables();
+    // initUeTable();
 
     UpfSessionPoolInit();
     UeIpToUpfSessionMapInit();
