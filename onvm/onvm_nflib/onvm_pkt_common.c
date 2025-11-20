@@ -48,6 +48,10 @@
 
 #include "onvm_pkt_common.h"
 
+#define UPFU_TAG_BIT (1u << 7)
+
+#define TRACE_MIN_FRAME (RTE_ETHER_MIN_LEN - RTE_ETHER_CRC_LEN)
+
 /**********************Internal Functions Prototypes**************************/
 
 /*
@@ -83,6 +87,110 @@ onvm_pkt_process_next_action(struct queue_mgr *tx_mgr, struct rte_mbuf *pkt, int
 static int
 onvm_pkt_drop(struct rte_mbuf *pkt);
 
+
+static inline struct onvm_pkt_meta *
+pkt_meta_from_txmgr(const struct queue_mgr *tx_mgr, struct rte_mbuf *m) {
+        if (tx_mgr->pkt_meta_offset < 0)
+                return NULL;
+        return onvm_get_pkt_meta(m, tx_mgr->pkt_meta_offset);
+}
+
+static uint64_t g_tx_shortfall = 0, g_tx_shortfall_firstlen_lt60 = 0;
+static uint64_t g_tx_shortfall_firstlen_gt1518 = 0, g_tx_shortfall_multiseg = 0;
+
+static inline void dbg_dump_refused(const char* tag, uint16_t port, uint16_t qid,
+                                    struct rte_mbuf *m,
+                                    uint16_t sent, uint16_t count) {
+    uint16_t len   = rte_pktmbuf_pkt_len(m);
+    uint8_t *base  = rte_pktmbuf_mtod(m, uint8_t*);
+    uint16_t eth_t = (len >= 14) ? rte_be_to_cpu_16(*(uint16_t*)(base + 12)) : 0xffff;
+
+    printf("[%s] TX shortfall p%u q%u: sent %u/%u len=%u nb_segs=%u first=%02x %02x ethertype=0x%04x data_off=%u buf_len=%u tailroom=%u\n",
+           tag, port, qid, sent, count, len, m->nb_segs,
+           base[0], (len>1?base[1]:0), eth_t,
+           m->data_off, m->buf_len, rte_pktmbuf_tailroom(m));
+
+    g_tx_shortfall++;
+    if (len < 60) g_tx_shortfall_firstlen_lt60++;
+    if (len > 1518) g_tx_shortfall_firstlen_gt1518++;
+    if (m->nb_segs > 1) g_tx_shortfall_multiseg++;
+}
+
+static inline void
+trace_short_mbuf(const char *stage, struct rte_mbuf *m, int pkt_meta_offset) {
+        const uint16_t len = rte_pktmbuf_pkt_len(m);
+        if (likely(len >= TRACE_MIN_FRAME))
+                return;
+
+        struct onvm_pkt_meta *meta = NULL;
+        if (pkt_meta_offset >= 0)
+                meta = onvm_get_pkt_meta(m, pkt_meta_offset);
+
+        printf("[trace] %s m=%p len=%u magic=0x%08x orig=%u id=%u tag=%u src=%u dst=%u ref=%u data_off=%u\n",
+               stage, (void *)m, len,
+               m->dynfield1[UPFU_STAMP_DYNIDX],
+               m->dynfield1[UPFU_STAMP_LEN_IDX],
+               m->dynfield1[UPFU_STAMP_ID_IDX],
+               meta ? !!(meta->flags & UPFU_TAG_BIT) : 0,
+               meta ? meta->src : 0,
+               meta ? meta->destination : 0,
+               rte_mbuf_refcnt_read(m),
+               m->data_off);
+}
+
+
+
+static struct rte_eth_stats g_prev_stats[RTE_MAX_ETHPORTS];
+static uint64_t g_shortfall_events[RTE_MAX_ETHPORTS];
+
+static inline void dump_tx_stats_delta(uint16_t port, uint16_t qid, const char* tag) {
+    struct rte_eth_stats now;
+    if (rte_eth_stats_get(port, &now) < 0) return;
+
+    const struct rte_eth_stats *prev = &g_prev_stats[port];
+
+    uint64_t d_op = now.opackets - prev->opackets;
+    uint64_t d_ob = now.obytes   - prev->obytes;
+    uint64_t d_oe = now.oerrors  - prev->oerrors;
+
+    // per-queue arrays only exist up to RTE_ETHDEV_QUEUE_STAT_CNTRS
+    uint64_t d_qop = 0, d_qob = 0;
+    if (qid < RTE_ETHDEV_QUEUE_STAT_CNTRS) {
+        d_qop = now.q_opackets[qid] - prev->q_opackets[qid];
+        d_qob = now.q_obytes[qid]   - prev->q_obytes[qid];
+    }
+
+    printf("[%s] p%u q%u Δ: opk=%" PRIu64 " obytes=%" PRIu64 " oerr=%" PRIu64
+           " | q_opk=%" PRIu64 " q_obytes=%" PRIu64 " (events=%" PRIu64 ")\n",
+           tag, port, qid, d_op, d_ob, d_oe, d_qop, d_qob, ++g_shortfall_events[port]);
+
+    g_prev_stats[port] = now; // update snapshot
+}
+
+
+static inline const char* dstat2s(int s){
+  return s==RTE_ETH_TX_DESC_FULL?"FULL":
+         s==RTE_ETH_TX_DESC_DONE?"DONE":
+         s==RTE_ETH_TX_DESC_UNAVAIL?"UNAVAIL":"?";
+}
+
+static inline void dump_desc_sample(uint16_t port, uint16_t qid) {
+  const uint16_t idxs[] = {0, 32, 64, 128};
+  for (unsigned i=0; i<sizeof(idxs)/sizeof(idxs[0]); i++) {
+    int st = rte_eth_tx_descriptor_status(port, qid, idxs[i]);
+    if (st >= 0) printf("[desc] p%u q%u d%u=%s\n", port, qid, idxs[i], dstat2s(st));
+  }
+}
+
+static inline void dump_link(uint16_t port) {
+  struct rte_eth_link lk;
+  rte_eth_link_get_nowait(port, &lk);
+  printf("[link] p%u up=%d speed=%u duplex=%u\n",
+         port, lk.link_status, lk.link_speed, lk.link_duplex);
+}
+
+
+
 /**********************************Interfaces*********************************/
 
 void
@@ -94,38 +202,77 @@ onvm_pkt_process_tx_batch(struct queue_mgr *tx_mgr, struct rte_mbuf *pkts[], int
         if (tx_mgr == NULL || pkts == NULL || nf == NULL)
                 return;
 
-        for (i = 0; i < tx_count; i++) {
-                meta = onvm_get_pkt_meta(pkts[i], pkt_meta_offset);
-                meta->src = nf->instance_id;
-                if (meta->action == ONVM_NF_ACTION_DROP) {
-                        // if the packet is drop, then <return value> is 0
-                        // and !<return value> is 1.
-                        nf->stats.act_drop++;
-                        nf->stats.tx += !onvm_pkt_drop(pkts[i]);
-                } else if (meta->action == ONVM_NF_ACTION_NEXT) {
-                        /* TODO: Here we drop the packet : there will be a flow table
-                        in the future to know what to do with the packet next */
-                        nf->stats.act_next++;
-                        onvm_pkt_process_next_action(tx_mgr, pkts[i], pkt_meta_offset, nf);
-                } else if (meta->action == ONVM_NF_ACTION_TONF) {
-                        nf->stats.act_tonf++;
-                        onvm_pkt_enqueue_nf(tx_mgr, meta->destination, pkts[i], nf);
-                } else if (meta->action == ONVM_NF_ACTION_OUT) {
-                        if (tx_mgr->mgr_type_t != MGR) {
-                                nf->stats.act_out++;
-                                out_buf = tx_mgr->to_tx_buf;
-                                out_buf->buffer[out_buf->count++] = pkts[i];
-                                if (out_buf->count == PACKET_READ_SIZE) {
-                                        onvm_pkt_enqueue_tx_thread(out_buf, nf);
-                                }
-                        } else {
-                                onvm_pkt_enqueue_port(tx_mgr, meta->destination, pkts[i]);
-                        }
-                } else {
-                        printf("ERROR invalid action : this shouldn't happen.\n");
-                        onvm_pkt_drop(pkts[i]);
-                        return;
+        {
+            uint16_t zeros = 0, dups = 0;
+            for (uint16_t a = 0; a < tx_count; a++) {
+                struct rte_mbuf *ma = pkts[a];
+                if (rte_pktmbuf_pkt_len(ma) == 0) zeros++;
+                for (uint16_t b = a + 1; b < tx_count; b++) {
+                    if (pkts[b] == ma) dups++;
                 }
+            }
+            if (zeros || dups)
+                printf("[nf-batch-sum] zeros=%u dups=%u count=%u\n", zeros, dups, tx_count);
+        }
+
+        for (i = 0; i < tx_count; i++) {
+            struct rte_mbuf *m_chk = pkts[i];
+            if (unlikely(rte_pktmbuf_pkt_len(m_chk) == 0)) {
+                printf("[nf-batch-drop-zero] m=%p len=0 ref=%u\n", (void*)m_chk, rte_mbuf_refcnt_read(m_chk));
+                continue;
+            }
+            int _dup = 0;
+            for (uint16_t _j=0; _j<i; _j++) {
+                if (pkts[_j] == m_chk) {
+                    printf("[nf-batch-dup-skip] m=%p first=%u again=%u len=%u\n", (void*)m_chk, _j, i, rte_pktmbuf_pkt_len(m_chk));
+                    _dup = 1;
+                    break;
+                }
+            }
+            if (_dup) continue;
+            // printf("[nf-batch-start] m=%p len=%u\n", pkts[i], rte_pktmbuf_pkt_len(pkts[i]));
+            meta = onvm_get_pkt_meta(pkts[i], pkt_meta_offset);
+            // printf("[nf-batch-meta] m=%p len=%u meta=%p off=%d action=%u\n", pkts[i], rte_pktmbuf_pkt_len(pkts[i]), (void*)meta, pkt_meta_offset, meta->action);
+            meta->src = nf->instance_id;
+            // printf("[nf-batch-after-src] m=%p len=%u\n", pkts[i], rte_pktmbuf_pkt_len(pkts[i]));
+            if (meta->action == ONVM_NF_ACTION_OUT) {
+                    //trace_short_mbuf(tx_mgr->mgr_type_t == MGR ? "mgr-process" : "nf-process", pkts[i], pkt_meta_offset);
+                    uint32_t id = pkts[i]->dynfield1[UPFU_STAMP_ID_IDX];
+                    uint16_t len = rte_pktmbuf_pkt_len(pkts[i]);
+                    if (len >= 1400 && (id % 1000u) == 0) {
+                            printf("[nf-sample] id=%u len=%u src=%u dst=%u\n",
+                            id, len, meta->src, meta->destination);
+                    }
+            }
+            if (meta->action == ONVM_NF_ACTION_DROP) {
+                    // if the packet is drop, then <return value> is 0
+                    // and !<return value> is 1.
+                    nf->stats.act_drop++;
+                    nf->stats.tx += !onvm_pkt_drop(pkts[i]);
+            } else if (meta->action == ONVM_NF_ACTION_NEXT) {
+                    /* TODO: Here we drop the packet : there will be a flow table
+                    in the future to know what to do with the packet next */
+                    nf->stats.act_next++;
+                    onvm_pkt_process_next_action(tx_mgr, pkts[i], pkt_meta_offset, nf);
+            } else if (meta->action == ONVM_NF_ACTION_TONF) {
+                    nf->stats.act_tonf++;
+                    onvm_pkt_enqueue_nf(tx_mgr, meta->destination, pkts[i], nf);
+            } else if (meta->action == ONVM_NF_ACTION_OUT) {
+                    if (tx_mgr->mgr_type_t != MGR) {
+                            nf->stats.act_out++;
+                            out_buf = tx_mgr->to_tx_buf;
+                            out_buf->buffer[out_buf->count++] = pkts[i];
+                            if (out_buf->count == PACKET_READ_SIZE) {
+                                    onvm_pkt_enqueue_tx_thread(out_buf, nf);
+                            }
+                    } else {
+                            onvm_pkt_enqueue_port(tx_mgr, meta->destination, pkts[i]);
+                    }
+            } else {
+                    printf("ERROR invalid action : this shouldn't happen.\n");
+                    onvm_pkt_drop(pkts[i]);
+                    return;
+            }
         }
 }
 
@@ -159,19 +306,31 @@ onvm_pkt_flush_nf_queue(struct queue_mgr *tx_mgr, uint16_t nf_id, struct onvm_nf
         if (!onvm_nf_is_valid(nf))
                 return;
 
-        if (rte_ring_enqueue_bulk(nf->rx_q, (void **)nf_buf->buffer, nf_buf->count, NULL) == 0) {
-                for (i = 0; i < nf_buf->count; i++) {
-                        onvm_pkt_drop(nf_buf->buffer[i]);
+                uint16_t dups = 0, zeros = 0;
+        for (i = 0; i < nf_buf->count; i++) {
+                struct rte_mbuf *mi = nf_buf->buffer[i];
+                if (rte_pktmbuf_pkt_len(mi) == 0) zeros++;
+                for (uint16_t j = i + 1; j < nf_buf->count; j++) {
+                        if (nf_buf->buffer[j] == mi) dups++;
                 }
-                nf->stats.rx_drop += nf_buf->count;
-                if (source_nf != NULL)
-                        source_nf->stats.tx_drop += nf_buf->count;
-        } else {
-                nf->stats.rx += nf_buf->count;
-                if (source_nf != NULL)
-                        source_nf->stats.tx += nf_buf->count;
         }
-        nf_buf->count = 0;
+        if (dups || zeros) {
+                printf("[mgr-nf-flush] nf_id=%u count=%u zeros=%u dups=%u\n",
+                       nf_id, nf_buf->count, zeros, dups);
+        }
+        if (rte_ring_enqueue_bulk(nf->rx_q, (void **)nf_buf->buffer, nf_buf->count, NULL) == 0) {
+                        for (i = 0; i < nf_buf->count; i++) {
+                                onvm_pkt_drop(nf_buf->buffer[i]);
+                        }
+                        nf->stats.rx_drop += nf_buf->count;
+                        if (source_nf != NULL)
+                                source_nf->stats.tx_drop += nf_buf->count;
+                } else {
+                        nf->stats.rx += nf_buf->count;
+                        if (source_nf != NULL)
+                                source_nf->stats.tx += nf_buf->count;
+                }
+                nf_buf->count = 0;
 }
 
 void
@@ -203,11 +362,22 @@ onvm_pkt_enqueue_nf(struct queue_mgr *tx_mgr, uint16_t dst_service_id, struct rt
         }
 
         nf_buf = &tx_mgr->nf_rx_bufs[dst_instance_id];
+
+        if (nf->service_id == 1) {
+                static uint64_t to_upf = 0;
+                to_upf++;
+                if (to_upf % 10000 == 0) {
+                        printf("[mgr-to-upf] count=%" PRIu64 " nf_rx_buf_count=%u\n",
+                        to_upf, nf_buf->count);
+                }
+        }
+
         nf_buf->buffer[nf_buf->count++] = pkt;
         if (nf_buf->count == PACKET_READ_SIZE) {
                 onvm_pkt_flush_nf_queue(tx_mgr, dst_instance_id, source_nf);
         }
 }
+
 
 void
 onvm_pkt_flush_port_queue(struct queue_mgr *tx_mgr, uint16_t port) {
@@ -223,15 +393,116 @@ onvm_pkt_flush_port_queue(struct queue_mgr *tx_mgr, uint16_t port) {
                 return;
 
         tx_stats = &(ports->tx_stats);
-        sent = rte_eth_tx_burst(port, tx_mgr->id, port_buf->buffer, port_buf->count);
-        if (unlikely(sent < port_buf->count)) {
-                for (i = sent; i < port_buf->count; i++) {
-                        onvm_pkt_drop(port_buf->buffer[i]);
-                }
-                tx_stats->tx_drop[port] += (port_buf->count - sent);
-        }
-        tx_stats->tx[port] += sent;
 
+        // for (i = 0; i < port_buf->count; i++) {
+//                 trace_short_mbuf("mgr-flush-pre", port_buf->buffer[i], tx_mgr->pkt_meta_offset);
+//         }
+
+        int ok = rte_eth_tx_prepare(port, tx_mgr->id, port_buf->buffer, port_buf->count);
+        if (ok != (int)port_buf->count) {
+                printf("[prepare] p%u q%u ok=%d/%u rte_errno=%d\n",
+                       port, (unsigned)tx_mgr->id, ok, port_buf->count, rte_errno);
+
+                for (uint16_t idx = 0; idx < port_buf->count; idx++) {
+                        struct rte_mbuf *m = port_buf->buffer[idx];
+                        int one = rte_eth_tx_prepare(port, (uint16_t)tx_mgr->id, &m, 1);
+                        if (one == 0) {
+                                uint16_t len = rte_pktmbuf_pkt_len(m);
+                                uint8_t *base = rte_pktmbuf_mtod(m, uint8_t *);
+                                uint16_t et = (len >= 14) ? rte_be_to_cpu_16(*(uint16_t *)(base + 12)) : 0xffff;
+
+                                struct onvm_pkt_meta *bm = pkt_meta_from_txmgr(tx_mgr, m);
+                                uint32_t stamp_magic = m->dynfield1[UPFU_STAMP_DYNIDX];
+                                uint32_t stamp_len   = m->dynfield1[UPFU_STAMP_LEN_IDX];
+                                uint32_t stamp_id    = m->dynfield1[UPFU_STAMP_ID_IDX];
+
+                                printf("[bad] p%u q%u idx=%u m=%p tag=%u src=%u magic=0x%08x orig_len=%u id=%u len=%u nb_segs=%u data_off=%u ol=0x%lx l2=%u l3=%u tso=%u et=0x%04x first=%02x %02x errno=%d\n",
+                                       port, (unsigned)tx_mgr->id, idx, (void *)m,
+                                       bm ? !!(bm->flags & UPFU_TAG_BIT) : 0,
+                                       bm ? bm->src : 0,
+                                       stamp_magic, stamp_len, stamp_id,
+                                       len, m->nb_segs, m->data_off,
+                                       (unsigned long)m->ol_flags, m->l2_len, m->l3_len, m->tso_segsz,
+                                       et, base[0], (len>1?base[1]:0), rte_errno);
+
+                                if (stamp_magic == UPFU_STAMP_MAGIC && len == 0 && stamp_len != 0)
+                                        printf("[bad] mbuf was zeroed after UPF (expected len %u, id=%u)\n", stamp_len, stamp_id);
+                                break;
+                        }
+                }
+
+                if (ok <= 0) {
+                        for (i = 0; i < port_buf->count; i++)
+                                onvm_pkt_drop(port_buf->buffer[i]);
+                        tx_stats->tx_drop[port] += port_buf->count;
+                        port_buf->count = 0;
+                        return;
+                }
+
+                for (i = ok; i < port_buf->count; i++)
+                        onvm_pkt_drop(port_buf->buffer[i]);
+                tx_stats->tx_drop[port] += (port_buf->count - ok);
+                port_buf->count = ok;
+        }
+
+        for (uint16_t i = 0; i < port_buf->count; i++) {
+            struct rte_mbuf *m = port_buf->buffer[i];
+            uint16_t len = rte_pktmbuf_pkt_len(m);
+            if (len >= 1400) {
+                uint32_t id = m->dynfield1[UPFU_STAMP_ID_IDX];
+                if ((id % 1000u) == 0) {
+                    printf("[mgr-sample] p%u q%u id=%u len=%u\n",
+                        port, tx_mgr->id, id, len);
+                }
+            }
+        }
+
+        sent = rte_eth_tx_burst(port, tx_mgr->id, port_buf->buffer, port_buf->count);
+
+        if (unlikely(sent < port_buf->count)) {
+                uint16_t total = sent;
+                uint16_t n = port_buf->count;
+
+                int reclaimed = rte_eth_tx_done_cleanup(port, (uint16_t)tx_mgr->id, 0);
+                printf("[cleanup] p%u q%u reclaimed=%d\n", port, (unsigned)tx_mgr->id, reclaimed);
+                struct rte_mbuf *first_refused = port_buf->buffer[total];
+
+                printf("[mbuf] m=%p ol=0x%lx l2=%u l3=%u tso=%u vlan=%u\n",
+                       (void *)first_refused,
+                       (unsigned long)first_refused->ol_flags,
+                       first_refused->l2_len, first_refused->l3_len,
+                       first_refused->tso_segsz, first_refused->vlan_tci);
+
+                int ok1 = rte_eth_tx_prepare(port, (uint16_t)tx_mgr->id, &first_refused, 1);
+                printf("[prepare-1] ok=%d rte_errno=%d\n", ok1, rte_errno);
+
+                dbg_dump_refused("flush", port, tx_mgr->id, first_refused, total, n);
+                dump_tx_stats_delta(port, tx_mgr->id, "flush-shortfall");
+
+                struct rte_eth_txq_info qi;
+                if (rte_eth_tx_queue_info_get(port, (uint16_t)tx_mgr->id, &qi) == 0) {
+                        uint16_t mid = qi.nb_desc / 2;
+                        uint16_t tail = qi.nb_desc ? (qi.nb_desc - 1) : 0;
+
+                        int s0 = rte_eth_tx_descriptor_status(port, (uint16_t)tx_mgr->id, 0);
+                        int sm = rte_eth_tx_descriptor_status(port, (uint16_t)tx_mgr->id, mid);
+                        int st = rte_eth_tx_descriptor_status(port, (uint16_t)tx_mgr->id, tail);
+
+                        printf("[desc] p%u q%u d0=%s d%u=%s d%u=%s\n",
+                               port, (unsigned)tx_mgr->id,
+                               s0==RTE_ETH_TX_DESC_FULL?"FULL":s0==RTE_ETH_TX_DESC_DONE?"DONE":"UNAVAIL",
+                               mid, sm==RTE_ETH_TX_DESC_FULL?"FULL":sm==RTE_ETH_TX_DESC_DONE?"DONE":"UNAVAIL",
+                               tail,st==RTE_ETH_TX_DESC_FULL?"FULL":st==RTE_ETH_TX_DESC_DONE?"DONE":"UNAVAIL");
+                }
+
+                dump_link(port);
+
+                for (i = total; i < n; i++)
+                        onvm_pkt_drop(port_buf->buffer[i]);
+                tx_stats->tx_drop[port] += (n - total);
+        }
+
+        tx_stats->tx[port] += sent;
         port_buf->count = 0;
 }
 
@@ -241,6 +512,11 @@ onvm_pkt_enqueue_tx_thread(struct packet_buf *pkt_buf, struct onvm_nf *nf) {
 
         if (pkt_buf->count == 0)
                 return;
+
+        int pkt_meta_offset = (nf && nf->nf_tx_mgr) ? nf->nf_tx_mgr->pkt_meta_offset : -1;
+        for (i = 0; i < pkt_buf->count; i++) {
+                trace_short_mbuf("nf-enqueue", pkt_buf->buffer[i], pkt_meta_offset);
+        }
 
         if (unlikely(pkt_buf->count > 0 &&
                      rte_ring_enqueue_bulk(nf->tx_q, (void **)pkt_buf->buffer, pkt_buf->count, NULL) == 0)) {
@@ -259,15 +535,28 @@ onvm_pkt_enqueue_tx_thread(struct packet_buf *pkt_buf, struct onvm_nf *nf) {
 inline static void
 onvm_pkt_enqueue_port(struct queue_mgr *tx_mgr, uint16_t port, struct rte_mbuf *buf) {
         struct packet_buf *port_buf;
-
-        if (tx_mgr == NULL || buf == NULL || !ports->init[port])
+        if (tx_mgr == NULL || buf == NULL || !ports->init[port]) {
                 return;
 
+        }
+
+        if (!ports->init[port]) {
+            static uint8_t warned[RTE_MAX_ETHPORTS];
+            if (!warned[port]) {
+                printf("[mgr] port %u init=%u (dropping packet m=%p)\n",
+                    port, ports->init[port], (void *)buf);
+                warned[port] = 1;
+            }
+            return;
+        }
+
+        // trace_short_mbuf("mgr-queue", buf, tx_mgr ? tx_mgr->pkt_meta_offset : -1);
         port_buf = &tx_mgr->tx_thread_info->port_tx_bufs[port];
         port_buf->buffer[port_buf->count++] = buf;
         if (port_buf->count == PACKET_READ_SIZE) {
                 onvm_pkt_flush_port_queue(tx_mgr, port);
         }
+
 }
 
 inline static void

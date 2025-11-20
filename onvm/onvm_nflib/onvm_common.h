@@ -42,7 +42,6 @@
 #ifndef _ONVM_COMMON_H_
 #define _ONVM_COMMON_H_
 
-#include <stdbool.h>
 #include <stdint.h>
 
 /* Std C library includes for shared core */
@@ -113,6 +112,12 @@
 
 #define ARP_NF_ID 11
 
+#define UPFU_STAMP_MAGIC      0x55504655u
+#define UPFU_STAMP_DYNIDX     0
+#define UPFU_STAMP_LEN_IDX    (UPFU_STAMP_DYNIDX + 1)
+#define UPFU_STAMP_ID_IDX    (UPFU_STAMP_LEN_IDX + 1)
+
+
 struct onvm_pkt_meta {
         uint8_t action;       /* Action to be performed */
         uint16_t destination; /* where to go next */
@@ -172,6 +177,7 @@ struct packet_buf {
 struct queue_mgr {
         unsigned id;
         enum { NF, MGR } mgr_type_t;
+        int pkt_meta_offset;
         union {
                 struct tx_thread_info *tx_thread_info;
                 struct packet_buf *to_tx_buf;

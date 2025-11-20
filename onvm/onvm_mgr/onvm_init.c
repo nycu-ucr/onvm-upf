@@ -47,6 +47,9 @@
 
 ******************************************************************************/
 
+#include <inttypes.h>
+#include <rte_ethdev.h>
+
 #include "onvm_mgr/onvm_init.h"
 
 #include "upf/upf_context.h"
@@ -236,6 +239,7 @@ init(int argc, char *argv[]) {
         onvm_config->dynfield_offset = rte_mbuf_dynfield_register(&onvm_pkt_meta_dynfield_desc);
         if(onvm_config->dynfield_offset < 0)
                 rte_exit(EXIT_FAILURE, "Cannot register onvm_pkt_meta mbuf field\n");
+        printf("[mgr] dynfield_offset=%d sizeof(meta)=%zu\n", onvm_config->dynfield_offset, sizeof(onvm_pkt_meta_t));
 
         /* now initialise the ports we will use */
         for (i = 0; i < ports->num_ports; i++) {
@@ -414,10 +418,27 @@ init_port(uint8_t port_num) {
 
         txq_conf = dev_info.default_txconf;
         txq_conf.offloads = port_conf.txmode.offloads;
+
+        printf("[tx-lim] p%u min=%u max=%u align=%u\n",
+        port_num,
+        dev_info.tx_desc_lim.nb_min,
+        dev_info.tx_desc_lim.nb_max,
+        dev_info.tx_desc_lim.nb_align);
+
+
         for (q = 0; q < tx_rings; q++) {
                 retval = rte_eth_tx_queue_setup(port_num, q, tx_ring_size, rte_eth_dev_socket_id(port_num), &txq_conf);
-                if (retval < 0)
-                        return retval;
+                if (retval < 0) return retval;
+
+                struct rte_eth_txq_info qi;
+                if (rte_eth_tx_queue_info_get(port_num, q, &qi) == 0) {
+                printf("[txq] p%u q%u desc=%u free=%u rs=%u deferred=%u off=0x%llx\n",
+                        port_num, q, qi.nb_desc,
+                        qi.conf.tx_free_thresh, qi.conf.tx_rs_thresh,
+                        qi.conf.tx_deferred_start,
+                        (unsigned long long)qi.conf.offloads);
+                }
+
         }
 
         rte_eth_promiscuous_enable(port_num);

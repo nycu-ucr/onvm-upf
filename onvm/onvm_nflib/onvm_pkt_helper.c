@@ -195,6 +195,58 @@ onvm_pkt_ipv4_hdr(struct rte_mbuf* pkt) {
         return ipv4;
 }
 
+// struct rte_ipv4_hdr *
+// onvm_pkt_ipv4_hdr(struct rte_mbuf *m) {
+//     /* Must have at least an Ethernet header in the first segment */
+//     if (rte_pktmbuf_data_len(m) < (uint16_t)sizeof(struct rte_ether_hdr))
+//         return NULL;
+
+//     const struct rte_ether_hdr *eth =
+//         rte_pktmbuf_mtod(m, const struct rte_ether_hdr *);
+//     uint16_t etype = rte_be_to_cpu_16(eth->ether_type);
+//     uint16_t off   = (uint16_t)sizeof(struct rte_ether_hdr);
+
+//     /* Skip one or more VLAN tags (802.1Q / QinQ) without rte_vlan.h.
+//      * VLAN header is 4 bytes: [TCI (2B)][eth_proto (2B)].
+//      * We read eth_proto at offset + 2 each time.
+//      */
+//     while (etype == RTE_ETHER_TYPE_VLAN || etype == RTE_ETHER_TYPE_QINQ) {
+//         if (rte_pktmbuf_data_len(m) < (uint16_t)(off + 4))
+//             return NULL;
+//         const uint16_t *inner_be =
+//             rte_pktmbuf_mtod_offset(m, const uint16_t *, (uint16_t)(off + 2));
+//         etype = rte_be_to_cpu_16(*inner_be);
+//         off  += 4;
+//     }
+
+//     /* Must be IPv4 */
+//     if (etype != RTE_ETHER_TYPE_IPV4)
+//         return NULL;
+
+//     /* Need at least a minimal IPv4 header */
+//     if (rte_pktmbuf_data_len(m) < (uint16_t)(off + sizeof(struct rte_ipv4_hdr)))
+//         return NULL;
+
+//     struct rte_ipv4_hdr *ip =
+//         rte_pktmbuf_mtod_offset(m, struct rte_ipv4_hdr *, off);
+
+//     /* Validate version and IHL */
+//     const uint8_t version = (ip->version_ihl >> 4) & 0xF;
+//     const uint8_t ihl     = (ip->version_ihl & 0xF);
+//     if (version != 4 || ihl < 5)
+//         return NULL;
+
+//     const uint16_t ip_hlen = (uint16_t)ihl * 4;
+
+//     /* Ensure the entire IPv4 header (including options) is in the first segment */
+//     if (rte_pktmbuf_data_len(m) < (uint16_t)(off + ip_hlen))
+//         return NULL;
+
+//     return ip;
+// }
+
+
+
 int
 onvm_pkt_is_tcp(struct rte_mbuf* pkt) {
         return onvm_pkt_tcp_hdr(pkt) != NULL;

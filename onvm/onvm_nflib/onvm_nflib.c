@@ -604,6 +604,9 @@ onvm_nflib_thread_main_loop(void *arg) {
         if (ret != 0)
                 rte_exit(EXIT_FAILURE, "Unable to message manager\n");
 
+        printf("[nf] dynfield_offset=%d sizeof(meta)=%zu\n",
+               onvm_config->dynfield_offset, sizeof(onvm_pkt_meta_t));
+
         for (size_t i = 0; i < g_nf_flag_target_count; ++i) {
                 const char *needle = g_nf_flag_targets[i];
                 if (needle == NULL || nf->tag == NULL)
@@ -635,6 +638,27 @@ onvm_nflib_thread_main_loop(void *arg) {
 
                 /* TODO: Fix up the segment fault caused by timeout trigger */
                 if (likely(nb_pkts_added > 0)) {
+                    // One-shot duplicate detector + quick zero-len count
+                    for (uint16_t j = 0; j < nb_pkts_added; j++) {
+                            for (uint16_t k = j + 1; k < nb_pkts_added; k++) {
+                            if (pkts[j] == pkts[k]) {
+                                    struct rte_mbuf *mj = (struct rte_mbuf *)pkts[j];
+                                    struct rte_mbuf *mk = (struct rte_mbuf *)pkts[k];
+                                    printf("[nf-dup] m=%p idx=%u,%u len_j=%u len_k=%u ref_j=%u ref_k=%u\n",
+                                    (void *)mj, j, k,
+                                    rte_pktmbuf_pkt_len(mj), rte_pktmbuf_pkt_len(mk),
+                                    rte_mbuf_refcnt_read(mj), rte_mbuf_refcnt_read(mk));
+                                    // break (optional) if you only want the first hit
+                            }
+                            }
+                    }
+                    uint16_t zeros = 0;
+                    for (uint16_t j = 0; j < nb_pkts_added; j++) {
+                            zeros += (rte_pktmbuf_pkt_len((struct rte_mbuf *)pkts[j]) == 0);
+                    }
+                    if (zeros)
+                            printf("[nf-before-batch] zeros=%u/%u\n", zeros, nb_pkts_added);
+
                         onvm_pkt_process_tx_batch(nf->nf_tx_mgr, pkts, onvm_config->dynfield_offset, nb_pkts_added, nf);
                         init_timeout = 1;
                         last_time_get_pkt = rte_get_tsc_cycles();
@@ -650,6 +674,19 @@ onvm_nflib_thread_main_loop(void *arg) {
                 onvm_pkt_flush_all_nfs(nf->nf_tx_mgr, nf);
 
                 onvm_nflib_dequeue_messages(nf_local_ctx);
+                /* {
+                        static uint64_t last_ring_log = 0;
+                        uint64_t now = rte_get_tsc_cycles();
+                        if (last_ring_log == 0 || (now - last_ring_log) > rte_get_timer_hz()) {
+                                unsigned rx_cnt = rte_ring_count(nf->rx_q);
+                                unsigned rx_free = rte_ring_free_count(nf->rx_q);
+                                unsigned tx_cnt = rte_ring_count(nf->tx_q);
+                                unsigned tx_free = rte_ring_free_count(nf->tx_q);
+                                printf("[nf-rings] rx_cnt=%u rx_free=%u tx_cnt=%u tx_free=%u\n",
+                                       rx_cnt, rx_free, tx_cnt, tx_free);
+                                last_ring_log = now;
+                        }
+                } */
                 if (nf->function_table->user_actions != ONVM_NO_CALLBACK) {
                         rte_atomic16_set(&nf_local_ctx->keep_running,
                                          !(*nf->function_table->user_actions)(nf_local_ctx) &&
@@ -1025,16 +1062,29 @@ onvm_nflib_dequeue_packets(void **pkts, struct onvm_nf_local_ctx *nf_local_ctx, 
         for (i = 0; i < nb_pkts; i++) {
                 meta = onvm_get_pkt_meta((struct rte_mbuf *)pkts[i], pkt_meta_offset);
                 ret_act = (*handler)((struct rte_mbuf *)pkts[i], meta, nf_local_ctx);
+
+                uint16_t plen = rte_pktmbuf_pkt_len((struct rte_mbuf *)pkts[i]);
+                uint16_t refc = rte_mbuf_refcnt_read(pkts[i]);
+                printf("[nf-loop] m=%p len=%u ref=%u action=%u\n", pkts[i], plen, refc, meta->action);
+
                 /* NF returns 0 to return packets or 1 to buffer */
                 if (likely(ret_act == 0)) {
                         tx_buf.buffer[tx_buf.count++] = pkts[i];
+                        /* printf("[nf-txbuf] m=%p len=%u ref=%u\n",
+                               pkts[i],
+                               rte_pktmbuf_pkt_len((struct rte_mbuf *)pkts[i]),
+                               rte_mbuf_refcnt_read(pkts[i])); */
                 } else {
                         nf->stats.tx_buffer++;
                 }
         }
+
+
+
         if (ONVM_NF_HANDLE_TX) {
                 return nb_pkts;
         }
+
 
         onvm_pkt_enqueue_tx_thread(&tx_buf, nf);
         return 0;
@@ -1145,6 +1195,7 @@ onvm_nflib_nf_tx_mgr_init(struct onvm_nf *nf) {
                 return;
         }
         nf->nf_tx_mgr->mgr_type_t = NF;
+        nf->nf_tx_mgr->pkt_meta_offset = onvm_config ? onvm_config->dynfield_offset : -1;
         nf->nf_tx_mgr->to_tx_buf = rte_zmalloc(NULL, sizeof(struct packet_buf), RTE_CACHE_LINE_SIZE);
         if (nf->nf_tx_mgr->to_tx_buf == NULL) {
                 rte_free(nf->nf_tx_mgr);
