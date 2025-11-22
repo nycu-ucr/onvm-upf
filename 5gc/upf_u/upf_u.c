@@ -1403,7 +1403,7 @@ packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm_nf_
         return 0;
     }
 
-    {
+    /* {
         char src_s[16], dst_s[16], line[128];
         int n = 0;
 
@@ -1414,7 +1414,7 @@ packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm_nf_
         if (n > 0 && n < (int)sizeof(line)) {
             (void)write(STDOUT_FILENO, line, (size_t)n);
         }
-    }
+    } */
 
     //printf(onvm_pkt_is_ipv4(pkt) ? "It's IPv4\n" : "Not IPv4\n");
     
@@ -1494,8 +1494,8 @@ packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm_nf_
 
     meta->action = ONVM_NF_ACTION_OUT;
 
-    printf("[upf] id=%u m=%p %s len=%u l2=%u l3=%u data_off=%u ref=%u\n",
-       pkt_id, (void *)pkt, is_dl ? "DL" : "UL", plen, pkt->l2_len, pkt->l3_len, pkt->data_off, rte_mbuf_refcnt_read(pkt));
+    /* printf("[upf] id=%u m=%p %s len=%u l2=%u l3=%u data_off=%u ref=%u\n",
+       pkt_id, (void *)pkt, is_dl ? "DL" : "UL", plen, pkt->l2_len, pkt->l3_len, pkt->data_off, rte_mbuf_refcnt_read(pkt)); */
 
     return 0;
 

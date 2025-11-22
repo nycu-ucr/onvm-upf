@@ -198,6 +198,7 @@ onvm_pkt_process_tx_batch(struct queue_mgr *tx_mgr, struct rte_mbuf *pkts[], int
         uint16_t i;
         struct onvm_pkt_meta *meta;
         struct packet_buf *out_buf;
+        uint32_t out_count = 0, tonf_count = 0, drop_count = 0, next_count = 0;
 
         if (tx_mgr == NULL || pkts == NULL || nf == NULL)
                 return;
@@ -236,26 +237,55 @@ onvm_pkt_process_tx_batch(struct queue_mgr *tx_mgr, struct rte_mbuf *pkts[], int
             meta->src = nf->instance_id;
             // printf("[nf-batch-after-src] m=%p len=%u\n", pkts[i], rte_pktmbuf_pkt_len(pkts[i]));
             if (meta->action == ONVM_NF_ACTION_OUT) {
-                    //trace_short_mbuf(tx_mgr->mgr_type_t == MGR ? "mgr-process" : "nf-process", pkts[i], pkt_meta_offset);
-                    uint32_t id = pkts[i]->dynfield1[UPFU_STAMP_ID_IDX];
-                    uint16_t len = rte_pktmbuf_pkt_len(pkts[i]);
-                    if (len >= 1400 && (id % 1000u) == 0) {
-                            printf("[nf-sample] id=%u len=%u src=%u dst=%u\n",
-                            id, len, meta->src, meta->destination);
-                    }
+                //trace_short_mbuf(tx_mgr->mgr_type_t == MGR ? "mgr-process" : "nf-process", pkts[i], pkt_meta_offset);
+                uint32_t id = pkts[i]->dynfield1[UPFU_STAMP_ID_IDX];
+                uint16_t len = rte_pktmbuf_pkt_len(pkts[i]);
+                out_count++;
+
+                /* if (len >= 1400 && (id % 10000u) == 0) {
+                        printf("[nf-sample] id=%u len=%u src=%u dst=%u\n",
+                        id, len, meta->src, meta->destination);
+                } */
+
+                if (meta->destination == 0) {
+                        static uint64_t ul_tx = 0;
+                        ul_tx++;
+                        if (ul_tx % 10000 == 0) {
+                                printf("[mgr-tx-thread] id=%u ul_tx=%" PRIu64 " last_len=%u\n",
+                                id, ul_tx, len);
+                        }
+                }
+
+                if (nf->instance_id == 1) {
+                        static uint64_t out_log = 0;
+                        if ((++out_log % 10000) == 0) {
+                                printf("[mgr-tx-out] id=%u dst=%u len=%u\n", id, meta->destination, len);
+                        }
+                }
+
             }
             if (meta->action == ONVM_NF_ACTION_DROP) {
                     // if the packet is drop, then <return value> is 0
                     // and !<return value> is 1.
+                    drop_count++;
                     nf->stats.act_drop++;
                     nf->stats.tx += !onvm_pkt_drop(pkts[i]);
             } else if (meta->action == ONVM_NF_ACTION_NEXT) {
                     /* TODO: Here we drop the packet : there will be a flow table
                     in the future to know what to do with the packet next */
+                    next_count++;
                     nf->stats.act_next++;
                     onvm_pkt_process_next_action(tx_mgr, pkts[i], pkt_meta_offset, nf);
             } else if (meta->action == ONVM_NF_ACTION_TONF) {
+                    tonf_count++;
                     nf->stats.act_tonf++;
+                    if (nf->instance_id == 1) {
+                            uint32_t id = pkts[i]->dynfield1[UPFU_STAMP_ID_IDX];
+                            static uint64_t tonf_log = 0;
+                            if ((++tonf_log % 10000) == 0) {
+                                    printf("[mgr-tx-tonf] id=%u dst_service=%u\n", id, meta->destination);
+                            }
+                    }
                     onvm_pkt_enqueue_nf(tx_mgr, meta->destination, pkts[i], nf);
             } else if (meta->action == ONVM_NF_ACTION_OUT) {
                     if (tx_mgr->mgr_type_t != MGR) {
@@ -273,6 +303,14 @@ onvm_pkt_process_tx_batch(struct queue_mgr *tx_mgr, struct rte_mbuf *pkts[], int
                     onvm_pkt_drop(pkts[i]);
                     return;
             }
+        }
+
+        if (nf->instance_id == 1) {
+                static uint64_t batch_log = 0;
+                if ((++batch_log % 1000) == 0) {
+                        printf("[mgr-tx-batch] total=%u out=%u tonf=%u drop=%u next=%u\n",
+                               tx_count, out_count, tonf_count, drop_count, next_count);
+                }
         }
 }
 
@@ -306,7 +344,7 @@ onvm_pkt_flush_nf_queue(struct queue_mgr *tx_mgr, uint16_t nf_id, struct onvm_nf
         if (!onvm_nf_is_valid(nf))
                 return;
 
-                uint16_t dups = 0, zeros = 0;
+        /* uint16_t dups = 0, zeros = 0;
         for (i = 0; i < nf_buf->count; i++) {
                 struct rte_mbuf *mi = nf_buf->buffer[i];
                 if (rte_pktmbuf_pkt_len(mi) == 0) zeros++;
@@ -315,9 +353,8 @@ onvm_pkt_flush_nf_queue(struct queue_mgr *tx_mgr, uint16_t nf_id, struct onvm_nf
                 }
         }
         if (dups || zeros) {
-                printf("[mgr-nf-flush] nf_id=%u count=%u zeros=%u dups=%u\n",
-                       nf_id, nf_buf->count, zeros, dups);
-        }
+                printf("[mgr-nf-flush] nf_id=%u count=%u zeros=%u dups=%u\n", nf_id, nf_buf->count, zeros, dups);
+        } */
         if (rte_ring_enqueue_bulk(nf->rx_q, (void **)nf_buf->buffer, nf_buf->count, NULL) == 0) {
                         for (i = 0; i < nf_buf->count; i++) {
                                 onvm_pkt_drop(nf_buf->buffer[i]);
@@ -367,8 +404,7 @@ onvm_pkt_enqueue_nf(struct queue_mgr *tx_mgr, uint16_t dst_service_id, struct rt
                 static uint64_t to_upf = 0;
                 to_upf++;
                 if (to_upf % 10000 == 0) {
-                        printf("[mgr-to-upf] count=%" PRIu64 " nf_rx_buf_count=%u\n",
-                        to_upf, nf_buf->count);
+                        //printf("[mgr-to-upf] count=%" PRIu64 " nf_rx_buf_count=%u\n", to_upf, nf_buf->count);
                 }
         }
 
@@ -394,42 +430,11 @@ onvm_pkt_flush_port_queue(struct queue_mgr *tx_mgr, uint16_t port) {
 
         tx_stats = &(ports->tx_stats);
 
-        // for (i = 0; i < port_buf->count; i++) {
-//                 trace_short_mbuf("mgr-flush-pre", port_buf->buffer[i], tx_mgr->pkt_meta_offset);
-//         }
-
+        // optional: keep batch-level prepare for the entire burst
         int ok = rte_eth_tx_prepare(port, tx_mgr->id, port_buf->buffer, port_buf->count);
         if (ok != (int)port_buf->count) {
                 printf("[prepare] p%u q%u ok=%d/%u rte_errno=%d\n",
                        port, (unsigned)tx_mgr->id, ok, port_buf->count, rte_errno);
-
-                for (uint16_t idx = 0; idx < port_buf->count; idx++) {
-                        struct rte_mbuf *m = port_buf->buffer[idx];
-                        int one = rte_eth_tx_prepare(port, (uint16_t)tx_mgr->id, &m, 1);
-                        if (one == 0) {
-                                uint16_t len = rte_pktmbuf_pkt_len(m);
-                                uint8_t *base = rte_pktmbuf_mtod(m, uint8_t *);
-                                uint16_t et = (len >= 14) ? rte_be_to_cpu_16(*(uint16_t *)(base + 12)) : 0xffff;
-
-                                struct onvm_pkt_meta *bm = pkt_meta_from_txmgr(tx_mgr, m);
-                                uint32_t stamp_magic = m->dynfield1[UPFU_STAMP_DYNIDX];
-                                uint32_t stamp_len   = m->dynfield1[UPFU_STAMP_LEN_IDX];
-                                uint32_t stamp_id    = m->dynfield1[UPFU_STAMP_ID_IDX];
-
-                                printf("[bad] p%u q%u idx=%u m=%p tag=%u src=%u magic=0x%08x orig_len=%u id=%u len=%u nb_segs=%u data_off=%u ol=0x%lx l2=%u l3=%u tso=%u et=0x%04x first=%02x %02x errno=%d\n",
-                                       port, (unsigned)tx_mgr->id, idx, (void *)m,
-                                       bm ? !!(bm->flags & UPFU_TAG_BIT) : 0,
-                                       bm ? bm->src : 0,
-                                       stamp_magic, stamp_len, stamp_id,
-                                       len, m->nb_segs, m->data_off,
-                                       (unsigned long)m->ol_flags, m->l2_len, m->l3_len, m->tso_segsz,
-                                       et, base[0], (len>1?base[1]:0), rte_errno);
-
-                                if (stamp_magic == UPFU_STAMP_MAGIC && len == 0 && stamp_len != 0)
-                                        printf("[bad] mbuf was zeroed after UPF (expected len %u, id=%u)\n", stamp_len, stamp_id);
-                                break;
-                        }
-                }
 
                 if (ok <= 0) {
                         for (i = 0; i < port_buf->count; i++)
@@ -448,13 +453,13 @@ onvm_pkt_flush_port_queue(struct queue_mgr *tx_mgr, uint16_t port) {
         for (uint16_t i = 0; i < port_buf->count; i++) {
             struct rte_mbuf *m = port_buf->buffer[i];
             uint16_t len = rte_pktmbuf_pkt_len(m);
-            if (len >= 1400) {
+            /* if (len >= 1400) {
                 uint32_t id = m->dynfield1[UPFU_STAMP_ID_IDX];
-                if ((id % 1000u) == 0) {
+                if ((id % 10000u) == 0) {
                     printf("[mgr-sample] p%u q%u id=%u len=%u\n",
                         port, tx_mgr->id, id, len);
                 }
-            }
+            } */
         }
 
         sent = rte_eth_tx_burst(port, tx_mgr->id, port_buf->buffer, port_buf->count);
@@ -464,20 +469,68 @@ onvm_pkt_flush_port_queue(struct queue_mgr *tx_mgr, uint16_t port) {
                 uint16_t n = port_buf->count;
 
                 int reclaimed = rte_eth_tx_done_cleanup(port, (uint16_t)tx_mgr->id, 0);
-                printf("[cleanup] p%u q%u reclaimed=%d\n", port, (unsigned)tx_mgr->id, reclaimed);
                 struct rte_mbuf *first_refused = port_buf->buffer[total];
 
-                printf("[mbuf] m=%p ol=0x%lx l2=%u l3=%u tso=%u vlan=%u\n",
+                /* printf("[mbuf] m=%p ol=0x%lx l2=%u l3=%u tso=%u vlan=%u\n",
                        (void *)first_refused,
                        (unsigned long)first_refused->ol_flags,
                        first_refused->l2_len, first_refused->l3_len,
-                       first_refused->tso_segsz, first_refused->vlan_tci);
+                       first_refused->tso_segsz, first_refused->vlan_tci); */
 
                 int ok1 = rte_eth_tx_prepare(port, (uint16_t)tx_mgr->id, &first_refused, 1);
-                printf("[prepare-1] ok=%d rte_errno=%d\n", ok1, rte_errno);
 
-                dbg_dump_refused("flush", port, tx_mgr->id, first_refused, total, n);
-                dump_tx_stats_delta(port, tx_mgr->id, "flush-shortfall");
+                if (port == 0 && sent == 0) {
+                        uint16_t f_len = rte_pktmbuf_pkt_len(first_refused);
+                        uint16_t f_l2 = first_refused->l2_len;
+                        uint16_t f_l3 = first_refused->l3_len;
+                        uint32_t f_ol = (uint32_t)first_refused->ol_flags;
+                        uint16_t f_ref = rte_mbuf_refcnt_read(first_refused);
+
+                        struct rte_eth_link lk;
+                        rte_eth_link_get_nowait(port, &lk);
+
+                        struct rte_eth_txq_info qi_dbg;
+                        int qi_ok = rte_eth_tx_queue_info_get(port, (uint16_t)tx_mgr->id, &qi_dbg);
+
+                        printf("[port0-tx-debug] ok1=%d errno=%d len=%u l2=%u l3=%u nb_segs=%u ol=0x%x ref=%u link_up=%d speed=%u duplex=%u txq_ok=%d desc=%u\n",
+                               ok1, rte_errno, f_len, f_l2, f_l3, first_refused->nb_segs, f_ol, f_ref,
+                               lk.link_status, lk.link_speed, lk.link_duplex,
+                               qi_ok, qi_ok == 0 ? qi_dbg.nb_desc : 0);
+
+                        if (qi_ok == 0) {
+                                uint16_t mid_idx = qi_dbg.nb_desc / 2;
+                                uint16_t tail_idx = qi_dbg.nb_desc ? (qi_dbg.nb_desc - 1) : 0;
+
+                                int s0 = rte_eth_tx_descriptor_status(port, (uint16_t)tx_mgr->id, 0);
+                                int sm = rte_eth_tx_descriptor_status(port, (uint16_t)tx_mgr->id, mid_idx);
+                                int st = rte_eth_tx_descriptor_status(port, (uint16_t)tx_mgr->id, tail_idx);
+
+                                int reclaimed_all = rte_eth_tx_done_cleanup(port, (uint16_t)tx_mgr->id, UINT32_MAX);
+
+                                int s0b = rte_eth_tx_descriptor_status(port, (uint16_t)tx_mgr->id, 0);
+                                int smb = rte_eth_tx_descriptor_status(port, (uint16_t)tx_mgr->id, mid_idx);
+                                int stb = rte_eth_tx_descriptor_status(port, (uint16_t)tx_mgr->id, tail_idx);
+
+                                const char *stat_str0  = (s0  == RTE_ETH_TX_DESC_FULL) ? "FULL" : (s0  == RTE_ETH_TX_DESC_DONE) ? "DONE" : "UNAVAIL";
+                                const char *stat_strm  = (sm  == RTE_ETH_TX_DESC_FULL) ? "FULL" : (sm  == RTE_ETH_TX_DESC_DONE) ? "DONE" : "UNAVAIL";
+                                const char *stat_strt  = (st  == RTE_ETH_TX_DESC_FULL) ? "FULL" : (st  == RTE_ETH_TX_DESC_DONE) ? "DONE" : "UNAVAIL";
+                                const char *stat_str0b = (s0b == RTE_ETH_TX_DESC_FULL) ? "FULL" : (s0b == RTE_ETH_TX_DESC_DONE) ? "DONE" : "UNAVAIL";
+                                const char *stat_strmb = (smb == RTE_ETH_TX_DESC_FULL) ? "FULL" : (smb == RTE_ETH_TX_DESC_DONE) ? "DONE" : "UNAVAIL";
+                                const char *stat_strtb = (stb == RTE_ETH_TX_DESC_FULL) ? "FULL" : (stb == RTE_ETH_TX_DESC_DONE) ? "DONE" : "UNAVAIL";
+
+                                struct rte_eth_stats stx;
+                                rte_eth_stats_get(port, &stx);
+                                uint64_t qerr = (tx_mgr->id < RTE_ETHDEV_QUEUE_STAT_CNTRS) ? stx.q_errors[tx_mgr->id] : 0;
+
+                                printf("[port0-tx-desc] pre d0=%s dm=%s dt=%s | post d0=%s dm=%s dt=%s | reclaimed_all=%d oerr=%" PRIu64 " qerr=%" PRIu64 "\n",
+                                       stat_str0, stat_strm, stat_strt,
+                                       stat_str0b, stat_strmb, stat_strtb,
+                                       reclaimed_all, stx.oerrors, qerr);
+                        }
+                }
+
+                // dbg_dump_refused("flush", port, tx_mgr->id, first_refused, total, n);
+                //dump_tx_stats_delta(port, tx_mgr->id, "flush-shortfall");
 
                 struct rte_eth_txq_info qi;
                 if (rte_eth_tx_queue_info_get(port, (uint16_t)tx_mgr->id, &qi) == 0) {
@@ -488,14 +541,14 @@ onvm_pkt_flush_port_queue(struct queue_mgr *tx_mgr, uint16_t port) {
                         int sm = rte_eth_tx_descriptor_status(port, (uint16_t)tx_mgr->id, mid);
                         int st = rte_eth_tx_descriptor_status(port, (uint16_t)tx_mgr->id, tail);
 
-                        printf("[desc] p%u q%u d0=%s d%u=%s d%u=%s\n",
+                        /* printf("[desc] p%u q%u d0=%s d%u=%s d%u=%s\n",
                                port, (unsigned)tx_mgr->id,
                                s0==RTE_ETH_TX_DESC_FULL?"FULL":s0==RTE_ETH_TX_DESC_DONE?"DONE":"UNAVAIL",
                                mid, sm==RTE_ETH_TX_DESC_FULL?"FULL":sm==RTE_ETH_TX_DESC_DONE?"DONE":"UNAVAIL",
-                               tail,st==RTE_ETH_TX_DESC_FULL?"FULL":st==RTE_ETH_TX_DESC_DONE?"DONE":"UNAVAIL");
+                               tail,st==RTE_ETH_TX_DESC_FULL?"FULL":st==RTE_ETH_TX_DESC_DONE?"DONE":"UNAVAIL"); */
                 }
 
-                dump_link(port);
+                // dump_link(port);
 
                 for (i = total; i < n; i++)
                         onvm_pkt_drop(port_buf->buffer[i]);
@@ -503,20 +556,51 @@ onvm_pkt_flush_port_queue(struct queue_mgr *tx_mgr, uint16_t port) {
         }
 
         tx_stats->tx[port] += sent;
+
+        if (port == 0) {
+                static uint64_t flush_log;
+                if ((++flush_log % 10000) == 0) {
+                        printf("[port0-flush] queued=%" PRIu16 " sent=%" PRIu16 " drop_total=%" PRIu64 "\n",
+                               port_buf->count, sent, tx_stats->tx_drop[port]);
+                }
+        }
         port_buf->count = 0;
 }
 
 void
 onvm_pkt_enqueue_tx_thread(struct packet_buf *pkt_buf, struct onvm_nf *nf) {
+
+
         uint16_t i;
+
+        uint16_t counter_for_log;
 
         if (pkt_buf->count == 0)
                 return;
 
         int pkt_meta_offset = (nf && nf->nf_tx_mgr) ? nf->nf_tx_mgr->pkt_meta_offset : -1;
-        for (i = 0; i < pkt_buf->count; i++) {
+        /* for (i = 0; i < pkt_buf->count; i++) {
                 trace_short_mbuf("nf-enqueue", pkt_buf->buffer[i], pkt_meta_offset);
+        } */
+
+        struct onvm_pkt_meta *meta = NULL;
+        if (pkt_meta_offset >= 0 && nf->instance_id == 1) {
+                for (counter_for_log = 0; counter_for_log < pkt_buf->count; counter_for_log++) {
+                        meta = onvm_get_pkt_meta(pkt_buf->buffer[counter_for_log], pkt_meta_offset);
+                        //meta->src = nf->instance_id;
+                        uint32_t id = pkt_buf->buffer[counter_for_log]->dynfield1[UPFU_STAMP_ID_IDX];
+                        uint16_t len = rte_pktmbuf_pkt_len(pkt_buf->buffer[counter_for_log]);
+
+                        static uint64_t ul_tx_enqueue = 0;
+                        ul_tx_enqueue++;
+                        if (ul_tx_enqueue % 10000 == 0) {
+                                printf("[enqueue_tx_thread] id=%u ul_tx_enqueue=%" PRIu64 " last_len=%u\n",
+                                id, ul_tx_enqueue, len);
+                        }
+                }
+                
         }
+                
 
         if (unlikely(pkt_buf->count > 0 &&
                      rte_ring_enqueue_bulk(nf->tx_q, (void **)pkt_buf->buffer, pkt_buf->count, NULL) == 0)) {

@@ -1065,7 +1065,7 @@ onvm_nflib_dequeue_packets(void **pkts, struct onvm_nf_local_ctx *nf_local_ctx, 
 
                 uint16_t plen = rte_pktmbuf_pkt_len((struct rte_mbuf *)pkts[i]);
                 uint16_t refc = rte_mbuf_refcnt_read(pkts[i]);
-                printf("[nf-loop] m=%p len=%u ref=%u action=%u\n", pkts[i], plen, refc, meta->action);
+                // printf("[nf-loop] m=%p len=%u ref=%u action=%u\n", pkts[i], plen, refc, meta->action);
 
                 /* NF returns 0 to return packets or 1 to buffer */
                 if (likely(ret_act == 0)) {

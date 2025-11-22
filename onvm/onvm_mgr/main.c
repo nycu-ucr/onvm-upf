@@ -239,6 +239,22 @@ tx_thread_main(void *arg) {
 
                         /* Now process the Client packets read */
                         if (likely(tx_count > 0)) {
+                                int pkt_meta_offset = onvm_config->dynfield_offset;
+                                if (pkt_meta_offset >= 0 && nf->instance_id == 1) {          // only UPF-U
+                                for (unsigned j = 0; j < tx_count; j++) {
+                                        struct onvm_pkt_meta *meta = onvm_get_pkt_meta(pkts[j], pkt_meta_offset);
+                                        uint32_t id = pkts[j]->dynfield1[UPFU_STAMP_ID_IDX];
+                                        uint16_t len = rte_pktmbuf_pkt_len(pkts[j]);
+
+                                        static uint64_t ul_tx_thread = 0;
+                                        ul_tx_thread++;
+                                        if ((ul_tx_thread % 10000) == 0) {
+                                        printf("[tx_thread] id=%u ul_tx_thread=%" PRIu64 " src=%u dst=%u len=%u\n",
+                                                id, ul_tx_thread, meta ? meta->src : 0, meta ? meta->destination : 0, len);
+                                        }
+                                }
+                                }
+
                                 onvm_pkt_process_tx_batch(tx_mgr, pkts, onvm_config->dynfield_offset, tx_count, nf);
                         }
                 }
