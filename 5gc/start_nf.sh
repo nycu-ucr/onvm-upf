@@ -7,7 +7,7 @@ function usage {
         echo "$0 NF-NAME -F config.json [other args]"
         echo ""
         echo "$0 upf_u_ingress 1   --> UPF-U ingress"
-        echo "$0 upf_u_egress 13  --> UPF-U egress"
+        echo "$0 upf_u_egress 14  --> UPF-U egress"
         exit 1
 }
 

@@ -6,7 +6,7 @@
 #endif
 
 #ifndef UPF_EGRESS_SERVICE_ID
-#define UPF_EGRESS_SERVICE_ID 13
+#define UPF_EGRESS_SERVICE_ID 14
 #endif
 
 #ifndef UPF_U_SERVICE_ID
