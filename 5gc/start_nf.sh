@@ -38,7 +38,12 @@ case "$NF_NAME" in
     ;;
 esac
 
-BINARY=$NF_PATH/build/app/$BIN_NAME
+# Locate binary: L25GC NFs are built under build/5gc/, others under build/app/
+if [[ "$BIN_NAME" == l25gc_* ]]; then
+  BINARY=$SCRIPTPATH/build/5gc/$BIN_NAME
+else
+  BINARY=$NF_PATH/build/app/$BIN_NAME
+fi
 DPDK_BASE_ARGS="-n 3 --proc-type=secondary"
 # For simple mode, only used for initial dpdk startup
 DEFAULT_CORE_ID=0
