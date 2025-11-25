@@ -35,6 +35,7 @@
 #include <rte_ether.h>
 #include <rte_mbuf.h>
 #include <rte_meter.h>
+#include <rte_ring.h>
 
 #include "gtp.h"
 #include "upf_context.h"
@@ -46,13 +47,15 @@
 
 #include "upf_events.h"
 #include "upf_cls_ctrl.h"
+#include "upf_session_dl.h"
+#include "upf_u_common.h"
 
 #include "../classifiers/upf_cls_adapter.h"
 #include "../classifiers/classifier_wrapper.h"
 
 #include "upf_u_config.h"
 
-#define NF_TAG "upf_u"
+#define NF_TAG "upf_ingress"
 
 // #if 0
 // #define SELF_IP RTE_IPV4(10, 100, 200, 3)
@@ -72,7 +75,6 @@
 #define DEFAULT_TB_TOKENS 10000
 #define APP_FLOWS_MAX 256
 #define IP_MASKED(BIGENDIINT, LEN) (BIGENDIINT & (0xFFFFFFFF << (32-LEN)))
-#define MAX_UE 256 // Max number of UEs
 #define MIN(x, y) (((x) < (y)) ? (x) : (y))
 #define MAX_OF_BUFFER_PACKET_SIZE 30000
 
@@ -93,13 +95,25 @@ static inline int UpfSendEvt1(uint16_t dest_sid, uint32_t type, uintptr_t a0) {
     return rc;
 }
 
-static struct rte_ether_addr dn_eth;
-static struct rte_ether_addr cn_dn_eth;
-static struct rte_ether_addr cn_ue_eth;
+static inline int UpfSendEvt2(uint16_t dest_sid, uint32_t type, uintptr_t a0, uintptr_t a1) {
+    Event *e = (Event *)rte_calloc("upf_evt", 1, sizeof(*e), 0);
+    if (!e) return -1;
+    e->type = (uintptr_t)type;
+    e->argc = 2;
+    e->arg0 = a0;
+    e->arg1 = a1;
+    int rc = onvm_nflib_send_msg_to_nf(dest_sid, e);
+    if (rc < 0) rte_free(e);
+    return rc;
+}
+
+struct rte_ether_addr dn_eth;
+struct rte_ether_addr cn_dn_eth;
+struct rte_ether_addr cn_ue_eth;
 
 uint8_t DnMac[RTE_ETHER_ADDR_LEN];
 uint8_t AnMac[RTE_ETHER_ADDR_LEN];
-int SELF_IP;
+uint32_t SELF_IP;
 
 enum { IF_UNKNOWN = -1 };
 
@@ -136,17 +150,10 @@ uint32_t iPFlowsLen = 0;
 uint32_t trTCMidx = 0;
 
 
-typedef struct {
-    void    *ptr;          // current active snapshot (cls_handle_t*)
-    uint32_t ver;          // last applied version
-    uint32_t pending_ver;  // version announced by UPF-C via REQ
-    uint8_t  flip_pending; // 1 when a flip is requested; cleared after flip
-} upf_cls_local_t;
-
-static upf_cls_local_t g_cls_local = {0};
+upf_cls_local_t g_cls_local = {0};
 
 // Flip to the latest published snapshot (called at burst boundary)
-static inline void UpfClsMaybeFlipAndAck(void) {
+void UpfClsMaybeFlipAndAck(uint32_t consumer_id) {
     if (likely(!g_cls_local.flip_pending))
         return;
 
@@ -183,7 +190,7 @@ static inline void UpfClsMaybeFlipAndAck(void) {
     g_cls_local.ver = v2;
     g_cls_local.flip_pending = 0;
 
-    (void)UpfSendEvt1(UPF_C_SERVICE_ID, EVT_CLS_GC_ACK, (uintptr_t)v2);
+    (void)UpfSendEvt2(UPF_C_SERVICE_ID, EVT_CLS_GC_ACK, (uintptr_t)v2, (uintptr_t)consumer_id);
 }
 
 
@@ -278,7 +285,7 @@ uint32_t charStr2MaskedIP(char *str, uint32_t *prefix_val){
     return IP_MASKED(ip_addr.s_addr, prefix_len);
 }
 
-static inline int SourceInterfaceToPort(source_interface_t srcIf) {
+int SourceInterfaceToPort(source_interface_t srcIf) {
     switch (srcIf) {
       case SRC_IF_ACCESS:   return g_access_port;
       case SRC_IF_CORE:     return g_core_port;
@@ -438,7 +445,7 @@ static inline source_interface_t PortToSourceInterface(uint8_t port) {
     return SRC_IF_ACCESS;
 }
 
-static int
+int
 trtcmConfigFlowTables(void){
     uint32_t i;
     int rtn;
@@ -462,7 +469,7 @@ trtcmConfigFlowTables(void){
     return 0;
 }
 
-static inline int
+int
 trtcmColorHandle(uint32_t pkt_len, uint64_t time, uint8_t qfi, struct rte_meter_trtcm_profile *target_profile){
     uint8_t out_color = 0;
     // check configured flow
@@ -481,7 +488,7 @@ trtcmColorHandle(uint32_t pkt_len, uint64_t time, uint8_t qfi, struct rte_meter_
     return out_color;
 }
 
-static inline int
+int
 trtcmPolicer(struct onvm_pkt_meta *meta, int color_result){
     if (meta->action == ONVM_NF_ACTION_DROP) {
         meta->flags = RTE_COLOR_RED;
@@ -543,24 +550,6 @@ void ftInit() {
 }
 
 /* Token Bucket */
-struct tb_config {
-    uint64_t tb_rate;    // rate at which tokens are generated (in MBps)
-    uint64_t tb_depth;   // depth of the token bucket (in bytes)
-    uint64_t tb_tokens;  // number of the tokens in the bucket at any given time (in bytes)
-    uint64_t last_cycle;
-    uint64_t cur_cycles;
-    uint16_t used;
-};
-
-struct ue_tb {
-    uint32_t ue_ip;
-    uint32_t ue_ambr;
-    uint32_t ue_gbr;
-    uint32_t ue_mbr;
-    struct tb_config ue_nqos_tb_params;
-    struct tb_config ue_qos_tb_params;
-};
-
 struct ue_tb ue_table[MAX_UE];
 
 void 
@@ -995,7 +984,7 @@ Encap(struct rte_mbuf *pkt, UPDK_FAR *far, UPDK_QER *qer) {
     ipv4_hdr->hdr_checksum = rte_ipv4_cksum(ipv4_hdr);
 }
 
-static int
+int
 HandlePacketWithFar(struct rte_mbuf *pkt, UPDK_FAR *far, UPDK_QER *qer, struct onvm_pkt_meta *meta) {
     int buff = 0;
 #define FAR_ACTION_MASK 0x07
@@ -1058,7 +1047,7 @@ HandlePacketWithFar(struct rte_mbuf *pkt, UPDK_FAR *far, UPDK_QER *qer, struct o
     return buff;
 }
 
-static inline void
+void
 AttachL2Header(struct rte_mbuf *pkt, bool is_dl) {
     // Prepend ethernet header
     struct rte_ether_hdr *eth_hdr =
@@ -1080,328 +1069,4 @@ AttachL2Header(struct rte_mbuf *pkt, bool is_dl) {
     }
 
     eth_hdr->ether_type = rte_cpu_to_be_16(RTE_ETHER_TYPE_IPV4);
-}
-
-static int
-packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm_nf_local_ctx *nf_local_ctx) {
-    if (pkt == NULL || meta == NULL) {
-        return 0;
-    }
-    uint32_t cal_pktlen = 0;
-    UTLT_Trace("Get packet\n");
-    UTLT_Info("Handle PKT from port: %d [len: %d]", pkt->port, pkt->pkt_len);
-    cal_pktlen = pkt->pkt_len - sizeof(struct rte_ether_hdr) - sizeof(struct rte_ipv4_hdr) - sizeof(struct rte_udp_hdr);
-
-    bool is_dl = false;
-    meta->action = ONVM_NF_ACTION_DROP;
-    struct rte_ipv4_hdr *iph = onvm_pkt_ipv4_hdr(pkt);
-
-    if (iph == NULL) {
-        UTLT_Info("Not IP packet, ignore it\n");
-        return 0;
-    }
-
-    // Flip to a newly published snapshot if a REQ was received
-    UpfClsMaybeFlipAndAck();
-
-    UPDK_PDR *pdr = NULL;
-
-    char *src_address = convertToIpAddress(iph->src_addr);
-    UTLT_Info("Src IP is %s\n", src_address);
-    char *dst_address = convertToIpAddress(iph->dst_addr);
-    UTLT_Info("Dst IP is %s\n", dst_address);
-
-    if (iph->dst_addr == SELF_IP) {  //
-        UTLT_Info("It is uplink\n");
-
-        struct rte_udp_hdr *udp_header = onvm_pkt_udp_hdr(pkt);
-        if (udp_header == NULL) {
-            return 0;
-        }
-        // invariant(dst_port == GTPV1_PORT);
-        // extract TEID from
-        // Step 2: Get PDR rule
-        uint32_t teid = get_teid_gtp_packet(pkt, udp_header);
-        pdr = GetPdrByTeid(pkt, teid);
-
-    } else {
-        UTLT_Info("It is downlink, dst is %s\n", convertToIpAddress(iph->dst_addr));
-        pdr = GetPdrByUeIpAddress(pkt, rte_cpu_to_be_32(iph->dst_addr));
-        GetQerByUEIpAddress(rte_cpu_to_be_32(iph->dst_addr), convertToIpAddress(iph->dst_addr));
-        is_dl = true;
-    }
-
-    if (!pdr) {
-        UTLT_Error("no PDR found for %s, skip\n", convertToIpAddress(iph->dst_addr));
-        // TODO(vivek): what to do?
-        return 0;
-    }
-    UTLT_Info("Got PDR ID is %u\n", pdr->pdrId);
-    rte_pktmbuf_adj(pkt, sizeof(struct rte_ether_hdr));
-
-    UPDK_FAR *far;
-    far = pdr->far;
-    if (!far) {
-        UTLT_Error("There is no FAR related to PDR[%u]\n", pdr->pdrId);
-        meta->action = ONVM_NF_ACTION_DROP;
-        return 0;
-    }
-
-    if (pdr->flags.outerHeaderRemoval) {
-        uint16_t outerHeaderLen = 0;
-        switch (pdr->outerHeaderRemoval) {
-            case OUTER_HEADER_REMOVAL_GTP_IP4: {
-                outerHeaderLen = sizeof(struct rte_ipv4_hdr) + sizeof(struct rte_udp_hdr);
-
-                // get gtp_header length
-                uint16_t gtp_length = get_gtpu_header_len(pkt);
-                outerHeaderLen += gtp_length;
-
-                rte_pktmbuf_adj(pkt, outerHeaderLen);
-            } break;
-            case OUTER_HEADER_REMOVAL_GTP_IP6:
-            case OUTER_HEADER_REMOVAL_UDP_IP4:
-            case OUTER_HEADER_REMOVAL_UDP_IP6:
-            case OUTER_HEADER_REMOVAL_IP4:
-            case OUTER_HEADER_REMOVAL_IP6:
-            case OUTER_HEADER_REMOVAL_GTP:
-            case OUTER_HEADER_REMOVAL_S_TAG:
-            case OUTER_HEADER_REMOVAL_S_C_TAG:
-            default:
-                printf("unknown or not implement\n");
-        }
-    }
-
-    int status = 0, color_result = 0;
-    status = HandlePacketWithFar(pkt, far, pdr->qer, meta);
-    if (meta->action == ONVM_NF_ACTION_DROP) {
-        UTLT_Info("Action is drop\n");
-    } else if (meta->action == ONVM_NF_ACTION_OUT) {
-        UTLT_Info("Action is out\n");
-    } else {
-        UTLT_Trace("Action is unknown\n");
-    }
-    AttachL2Header(pkt, is_dl);
-    if (meta->action == ONVM_NF_ACTION_OUT && is_dl) {
-        // check if the UE IP exists in the table and update the token
-        int index = findIndexByUeIpAddress(rte_cpu_to_be_32(iph->dst_addr));
-        if (index != -1) {
-            UTLT_Trace("Update token for UE IP: %s", convertToIpAddress(iph->dst_addr));
-            updateTokenbyIndex(index);
-        }
-        else {
-            UTLT_Error("No UE IP found in the table");
-            return status;
-        }
-
-        // Step 1. trTCM (QoS flow)
-        int key, fd_target, prefix_len;
-        bool isQos = false;
-        uint64_t curr_time = rte_get_tsc_cycles();
-        struct rte_meter_trtcm_profile *trtcm_profile = NULL;
-
-        char *ip_str = strstr(pdr->pdi.sdfFilter.flowDescription, "from");
-        if (ip_str != NULL) {
-            ip_str += 5; // Skip "from "
-            char *end_ptr = strchr(ip_str, ' ');
-            if (end_ptr != NULL) {
-                *end_ptr = '\0'; // Null-terminate the extracted IP
-            }
-        }
-
-        if (ip_str != NULL && strcmp(ip_str, "any") != 0) {
-            isQos = true;
-            fd_target = charStr2MaskedIP(ip_str, &prefix_len);
-            trtcm_profile = &app_flow_trtcm_profile;
-            key = (pdr->pdi.flags.sdfFilter) ? SourceInterfaceToPort(pdr->pdi.sourceInterface) + fd_target : SourceInterfaceToPort(pdr->pdi.sourceInterface);
-            color_result = trtcmColorHandle(cal_pktlen, curr_time, ftSearch(key), trtcm_profile);
-            if (trtcmPolicer(meta, color_result) > 0)
-                UTLT_Error("trTCM Policer error");
-        }
-        
-        // Step 2. bucket (QoS flow)
-        if (isQos) {
-            if (meta->flags == RTE_COLOR_RED) {
-                meta->action = ONVM_NF_ACTION_DROP;
-            }
-            if (meta->flags == RTE_COLOR_GREEN) {
-                ue_table[index].ue_qos_tb_params.tb_tokens -= cal_pktlen;
-                meta->action = ONVM_NF_ACTION_OUT;
-            }
-            if (meta->flags == RTE_COLOR_YELLOW) {
-                while (ue_table[index].ue_qos_tb_params.tb_tokens < cal_pktlen) {
-                    updateTokenbyIndex(index);
-                    usleep(1);
-                }
-                ue_table[index].ue_qos_tb_params.tb_tokens -= cal_pktlen;
-                meta->action = ONVM_NF_ACTION_OUT;      
-            }
-        }
-        // Step 2. bucket (non QoS flow)
-        else {
-            while (ue_table[index].ue_nqos_tb_params.tb_tokens < cal_pktlen) {
-                updateTokenbyIndex(index);
-                usleep(1);
-            }
-            ue_table[index].ue_nqos_tb_params.tb_tokens -= cal_pktlen;
-            meta->action = ONVM_NF_ACTION_OUT;
-        }
-    }
-    return status;
-}
-
-void
-msg_handler(void *msg_data, struct onvm_nf_local_ctx *nf_local_ctx) {
-
-    Event *e = (Event *)msg_data;
-
-    /* Our NF→NF control path: CP tells us to flip */
-    if (e && (uint32_t)e->type == EVT_CLS_GC_REQ) {
-        g_cls_local.pending_ver = (uint32_t)e->arg0;
-        g_cls_local.flip_pending = 1;      // The actual flip happens at burst boundary
-
-        // logging block
-
-        UTLT_Info("EVT_CLS_GC_REQ: requested_ver=%u ctrl.active=%p ctrl.ver=%u",
-          (uint32_t)e->arg0,
-          (void*)(g_upf_cls_ctrl ? g_upf_cls_ctrl->active : NULL),
-          (g_upf_cls_ctrl ? g_upf_cls_ctrl->version : 0));
-
-        rte_free(e);
-        return;
-    }
-
-
-    struct onvm_nf *nf = nf_local_ctx->nf;
-
-    if (buffer_length <= 0) {
-        if (e) rte_free(e);
-        return;
-    }
-
-    // struct onvm_pkt_meta *meta;
-//#ifdef FIX_BUFFER
-//    for (i = 0; i < buffer_length; i++) {
-        // TODO: (@vivek fix it)
-//        Encap(buffer[i]);
-//        AttachL2Header(buffer[i], 1); // 1 == Downlink packet
-//        meta = onvm_get_pkt_meta(buffer[i]);
-//        meta = ONVM_NF_ACTION_OUT;
-//    }
-//#endif
-
-    struct onvm_configuration *onvm_config = onvm_nflib_get_onvm_config();
-    if (onvm_config == NULL) {
-        fprintf(stderr, "Error: onvm_nflib_get_onvm_config() returned NULL\n");
-        exit(EXIT_FAILURE);
-    }
-    onvm_pkt_process_tx_batch(nf->nf_tx_mgr, buffer, onvm_config->dynfield_offset, buffer_length, nf);
-    onvm_pkt_flush_all_nfs(nf->nf_tx_mgr, nf);
-    UTLT_Debug("Sending out %u packets\n", buffer_length);
-    buffer_length = 0;
-    if (e) rte_free(e);
-}
-
-uint64_t last_p = NULL;
-
-static int 
-callback_handler(struct onvm_nf_local_ctx *nf_local_ctx) {
-    if (unlikely(!last_p)) last_p = rte_get_tsc_cycles();
-    uint64_t cur_p = rte_get_tsc_cycles(), before;
-    struct onvm_nf *nf;
-    struct onvm_pkt_meta *meta;
-    struct packet_buf *out_buf;
-    nf = nf_local_ctx->nf;
-
-    // if (buffer_length > 0){
-    //     for (int i = 0; i < buffer_length; i++) {
-    //         meta = onvm_get_pkt_meta(buffer[i]);
-    //         meta->action = ONVM_NF_ACTION_OUT;
-    //     }
-    //     onvm_pkt_process_tx_batch(nf->nf_tx_mgr, buffer, buffer_length, nf);
-    //     onvm_pkt_enqueue_tx_thread(nf->nf_tx_mgr->to_tx_buf, nf);
-    //     UTLT_Debug("Sending out %u packets\n", buffer_length);
-    //     buffer_length = 0;
-    // } 
-
-    if (unlikely((cur_p - last_p)/(double)rte_get_timer_hz() > 1)){
-        last_p = cur_p;
-        UTLT_Debug("Stats perform: ");
-        UTLT_Debug("act out: %d", nf->stats.act_out);
-        UTLT_Debug("buffered: %d", nf->stats.tx_buffer);
-    }
-
-    return 0;
-}
-
-int
-main(int argc, char *argv[]) {
-    int arg_offset;
-    struct onvm_nf_local_ctx *nf_local_ctx;
-    struct onvm_nf_function_table *nf_function_table;
-    // UTLT_SetLogLevel("Panic"); // to eliminate log print influenced jitter
-    UTLT_SetLogLevel("warning"); // to eliminate log print influenced jitter
-
-    nf_local_ctx = onvm_nflib_init_nf_local_ctx();
-    onvm_nflib_start_signal_handler(nf_local_ctx, NULL);
-    nf_function_table = onvm_nflib_init_nf_function_table();
-    nf_function_table->pkt_handler = &packet_handler;
-    nf_function_table->msg_handler = &msg_handler;
-    // nf_function_table->user_actions = &callback_handler;
-
-    if ((arg_offset = onvm_nflib_init(argc, argv, NF_TAG, nf_local_ctx, nf_function_table)) < 0) {
-        onvm_nflib_stop(nf_local_ctx);
-        if (arg_offset == ONVM_SIGNAL_TERMINATION) {
-            printf("Exiting due to user termination\n");
-            return 0;
-        } else {
-            rte_exit(EXIT_FAILURE, "Failed ONVM init\n");
-        }
-    }
-
-    if (UpfClsCtrlInit() < 0) {
-        rte_exit(EXIT_FAILURE, "CLS_CTRL memzone init failed\n");
-    }
-
-    int ret;
-    ret = rte_eth_macaddr_get(0, &cn_ue_eth);
-    if (ret < 0)
-        rte_exit(EXIT_FAILURE, "Cannot get MAC address: err=%d, port=%u\n", ret, 0);
-    ret = rte_eth_macaddr_get(1, &cn_dn_eth);
-    if (ret < 0)
-        rte_exit(EXIT_FAILURE, "Cannot get MAC address: err=%d, port=%u\n", ret, 1);
-
-    /* Parse DN & AN MAC address from config/upf_u.yaml */
-    const char *config_path = "config/upf_u.yaml";
-
-    if (argc > arg_offset + 1) {
-        config_path = argv[arg_offset + 1];
-    }
-    printf("[UPF-U] Using config: %s\n", config_path);
-    UpfU_LoadAndParseConfig(config_path);
-
-    /* UTLT_Info("[UPF-U][CONFIG] Port map: ACCESS=%d CORE=%d SGI=%d",
-          g_access_port, g_core_port, g_sgi_port); */
-
-    // 8c:dc:d4:ac:6c:7d
-    dn_eth.addr_bytes[0] = DnMac[0];
-    dn_eth.addr_bytes[1] = DnMac[1];
-    dn_eth.addr_bytes[2] = DnMac[2];
-    dn_eth.addr_bytes[3] = DnMac[3];
-    dn_eth.addr_bytes[4] = DnMac[4];
-    dn_eth.addr_bytes[5] = DnMac[5];
-
-    // trTCM
-    trtcmConfigFlowTables();
-    initUeTable();
-
-    UpfSessionPoolInit();
-    UeIpToUpfSessionMapInit();
-    TeidToUpfSessionMapInit();
-
-    onvm_nflib_run(nf_local_ctx);
-
-    onvm_nflib_stop(nf_local_ctx);
-    printf("If we reach here, program is ending\n");
-    return 0;
 }

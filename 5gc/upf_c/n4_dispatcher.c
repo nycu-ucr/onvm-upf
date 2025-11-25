@@ -25,6 +25,7 @@
 #include "pfcp_path.h"
 #include "n4_onvm_pfcp_build.h"
 #include "upf_context.h"
+#include "upf_events.h"
 
 void UpfDispatcher(const Event *event) {
     switch ((UpfEvent)event->type) {
@@ -96,6 +97,12 @@ void UpfDispatcher(const Event *event) {
                     // without SEID
                     if (pfcpMessage->header.type == PFCP_SESSION_ESTABLISHMENT_REQUEST) {
                         session = UpfSessionAddByMessage(pfcpMessage);
+                        if (session) {
+                            UpfSendEvt1(UPF_INGRESS_SERVICE_ID, UPF_EVENT_REGISTER_SESSION, (uintptr_t)session->sess_id);
+                            if (UPF_EGRESS_SERVICE_ID != UPF_INGRESS_SERVICE_ID) {
+                                UpfSendEvt1(UPF_EGRESS_SERVICE_ID, UPF_EVENT_REGISTER_SESSION, (uintptr_t)session->sess_id);
+                            }
+                        }
                     } else {
                         UTLT_Assert(0, goto freeBuf,
                                     "no SEID but not SESSION ESTABLISHMENT");

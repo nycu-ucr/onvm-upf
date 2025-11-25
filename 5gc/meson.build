@@ -1,35 +1,20 @@
-subdir('classifiers')
-
-
-l25gc_nfs = [
-    'upf_u',
-    'upf_c',
-    'dn_app'
-]
-
 rt_dep = cc.find_library('rt', required: false)
 
-foreach nf : l25gc_nfs
-    name = 'l25gc_' + nf
-    sources = []
-    includes = [include_directories(nf), onvm_includes]
+subdir('classifiers')
+subdir('upf_u')
+subdir('upf_c')
+subdir('dn_app')
 
-    subdir(nf)
+# Explicit dn_app executable (keeps dn_app/meson.build minimal)
+dn_app_includes = [ include_directories('dn_app'), onvm_includes ]
+dn_app_deps = [ onvm_dpdk_dep, onvm_nflib_dep, onvm_l25gc_dep, rt_dep, classifier_dep ]
 
-    # base deps for every NF
-    deps = [ onvm_dpdk_dep, onvm_nflib_dep, onvm_l25gc_dep, rt_dep, classifier_dep ]
-
-    if nf == 'upf_u'
-        deps += upf_u_link_deps
-    endif
-
-    executable(
-        name,
-        sources,
-        include_directories: includes,
-        dependencies: deps,
-        install: true,
-        install_tag: 'onvm',
-        install_dir: onvm_output_dir + '/nf/' + nf
-    )
-endforeach
+executable(
+    'l25gc_dn_app',
+    sources,
+    include_directories: dn_app_includes,
+    dependencies: dn_app_deps,
+    install: true,
+    install_tag: 'onvm',
+    install_dir: onvm_output_dir + '/nf/dn_app'
+)

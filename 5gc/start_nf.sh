@@ -6,7 +6,8 @@ function usage {
         echo "$0 NF-NAME DPDK_ARGS -- ONVM_ARGS -- NF_ARGS"
         echo "$0 NF-NAME -F config.json [other args]"
         echo ""
-        echo "$0 upf_u 1  --> UPF U NF"
+        echo "$0 upf_u_ingress 1   --> UPF-U ingress"
+        echo "$0 upf_u_egress 13  --> UPF-U egress"
         exit 1
 }
 
@@ -21,9 +22,23 @@ SCRIPT=$(readlink -f "$0")
 SCRIPTPATH=$(dirname "$SCRIPT")
 NF_NAME=$1
 NF_PATH=$SCRIPTPATH/$NF_NAME
-# For NFD NF
-NF_NAME=${NF_PATH##*/}
-BINARY=$NF_PATH/build/app/$NF_NAME
+
+# Support split UPF-U roles using a shared source directory
+case "$NF_NAME" in
+  upf_u_ingress)
+    NF_PATH=$SCRIPTPATH/upf_u
+    BIN_NAME=l25gc_upf_ingress
+    ;;
+  upf_u_egress)
+    NF_PATH=$SCRIPTPATH/upf_u
+    BIN_NAME=l25gc_upf_egress
+    ;;
+  *)
+    BIN_NAME=${NF_PATH##*/}
+    ;;
+esac
+
+BINARY=$NF_PATH/build/app/$BIN_NAME
 DPDK_BASE_ARGS="-n 3 --proc-type=secondary"
 # For simple mode, only used for initial dpdk startup
 DEFAULT_CORE_ID=0

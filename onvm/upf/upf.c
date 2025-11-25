@@ -13,6 +13,7 @@
 #include <rte_malloc.h>
 #include <rte_memory.h>
 #include <rte_memzone.h>
+#include <rte_atomic.h>
 
 #include "upf_context.h"
 
@@ -371,6 +372,10 @@ UpfSession *UpfSessionAlloc(const uint64_t seid) {
     session->index = status;
     session->hashKey = cal_hash;
     session->upfSeid = seid;
+    session->sess_id = (uint32_t)seid;
+    session->dl_ring = NULL;
+    rte_atomic32_init(&session->buffering);
+    rte_atomic32_set(&session->buffering, 0);
     // UTLT_Debug("UpfSessionAlloc: dump");
     // DumpUpfSession();
     // UTLT_Debug("UpfSessionAlloc: dump done");

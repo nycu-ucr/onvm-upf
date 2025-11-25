@@ -148,6 +148,8 @@ static inline uint32_t upf_cls_publish(void *new_snap, void **retired_out) {
 
 static void *g_cls_retired_snapshot = NULL;
 static uint32_t g_cls_retired_version = 0;
+static uint32_t g_cls_retired_ack_mask = 0;
+static uint32_t g_cls_ack_need_mask = (1u << UPF_CLS_CONS_MAX) - 1u;
 
 
 // bool UpfClsRebuildAndPublish(uint32_t *out_version) {
@@ -314,13 +316,21 @@ bool UpfClsRebuildAndPublish(uint32_t *out_version) {
     if (retired) {
         __atomic_store_n(&g_cls_retired_snapshot, retired, __ATOMIC_RELEASE);
         __atomic_store_n(&g_cls_retired_version,  ver,     __ATOMIC_RELEASE);
+        __atomic_store_n(&g_cls_retired_ack_mask, 0u,      __ATOMIC_RELEASE);
         UTLT_Debug("CLS publish: new=%p retired=%p ver=%u", snap, retired, ver);
     } else {
         UTLT_Debug("CLS publish: new=%p retired=<none> ver=%u", snap, ver);
     }
 
-    /* Notify DP exactly once to flip to this version */
-    UpfSendEvt1(UPF_U_SERVICE_ID, EVT_CLS_GC_REQ, (uintptr_t)ver);
+    uint32_t need_mask = (1u << UPF_CLS_CONS_INGRESS);
+
+    /* Notify DP consumers to flip to this version */
+    UpfSendEvt1(UPF_INGRESS_SERVICE_ID, EVT_CLS_GC_REQ, (uintptr_t)ver);
+    if (UPF_EGRESS_SERVICE_ID != UPF_INGRESS_SERVICE_ID) {
+        UpfSendEvt1(UPF_EGRESS_SERVICE_ID, EVT_CLS_GC_REQ, (uintptr_t)ver);
+        need_mask |= (1u << UPF_CLS_CONS_EGRESS);
+    }
+    __atomic_store_n(&g_cls_ack_need_mask, need_mask, __ATOMIC_RELEASE);
 
     if (out_version) *out_version = ver;
     return true;
@@ -339,20 +349,37 @@ bool UpfClsRebuildAndPublish(uint32_t *out_version) {
     }
 } */
 
-void UpfClsOnAckFree(uint32_t ver) {
+void UpfClsOnAckFree(uint32_t ver, uint32_t who) {
     // Acquire load so we compare against a coherent value
     uint32_t rver = __atomic_load_n(&g_cls_retired_version, __ATOMIC_ACQUIRE);
     if (ver != rver) return;
+
+    if (who >= UPF_CLS_CONS_MAX) who = UPF_CLS_CONS_INGRESS;
+
+    uint32_t bit = 1u << who;
+    uint32_t prev = __atomic_load_n(&g_cls_retired_ack_mask, __ATOMIC_RELAXED);
+    while ((prev & bit) == 0) {
+        uint32_t desired = prev | bit;
+        if (__atomic_compare_exchange_n(&g_cls_retired_ack_mask, &prev, desired,
+                                        false, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) {
+            prev = desired;
+            break;
+        }
+    }
+
+    uint32_t need = __atomic_load_n(&g_cls_ack_need_mask, __ATOMIC_ACQUIRE);
+    if (prev != need) return;
 
     // Atomic exchange to NULL to make it double-free proof
     void *to_free = __atomic_exchange_n(&g_cls_retired_snapshot, NULL, __ATOMIC_ACQ_REL);
     if (!to_free) return;  // already freed
 
-    UTLT_Debug("CLS GC: ACK ver=%u, freeing retired snapshot %p", ver, to_free);
+    UTLT_Debug("CLS GC: ACK ver=%u mask=0x%x, freeing retired snapshot %p", ver, prev, to_free);
     cls_destroy((cls_handle_t*)to_free);
 
     // Optional: clear version (release) so duplicate ACKs are cheap no-ops
     __atomic_store_n(&g_cls_retired_version, 0, __ATOMIC_RELEASE);
+    __atomic_store_n(&g_cls_retired_ack_mask, 0u, __ATOMIC_RELEASE);
     PdrFreeUpTo(ver);
 }
 
@@ -1654,6 +1681,10 @@ Status UpfN4HandleSessionDeletionRequest(UpfSession *session, PfcpXact *xact,
     Bufblk *bufBlk = NULL;
 
     /* delete session */
+    UpfSendEvt1(UPF_INGRESS_SERVICE_ID, UPF_EVENT_DELETE_SESSION, (uintptr_t)session->sess_id);
+    if (UPF_EGRESS_SERVICE_ID != UPF_INGRESS_SERVICE_ID) {
+        UpfSendEvt1(UPF_EGRESS_SERVICE_ID, UPF_EVENT_DELETE_SESSION, (uintptr_t)session->sess_id);
+    }
     UTLT_Assert(UpfSessionRemove(session) == STATUS_OK, return STATUS_ERROR,
         "UpfSessionRemove failed");
 

@@ -6,6 +6,7 @@
 #include <net/if.h>
 #include <pthread.h>
 
+#include <rte_atomic.h>
 #include <rte_malloc.h>
 
 #include "utlt_list.h"
@@ -33,6 +34,8 @@ extern "C" {
 #endif /* __cplusplus */
 
 extern list_t *g_all_pdr_list;
+
+struct rte_ring;
 
 
 typedef struct _UpfUeIp      UpfUeIp;
@@ -145,6 +148,11 @@ typedef struct _UpfSession {
     list_t          *qer_list;
 
     bool srr_flag;
+
+    /* DL scheduling state shared across ingress/egress */
+    uint32_t        sess_id;    /* 32-bit process-agnostic identifier */
+    struct rte_ring *dl_ring;   /* per-session DL FIFO (MP_ENQ | SC_DEQ) */
+    rte_atomic32_t  buffering;  /* 0 = live, 1 = paused */
 } UpfSession;
 
 typedef struct {

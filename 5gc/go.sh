@@ -17,4 +17,12 @@ then
     exit 1
 fi
 
-../start_nf.sh "$NF_DIR" "$@"
+# Allow role selection for split UPF-U
+if [[ "$NF_DIR" == "upf_u" && ( "$1" == "ingress" || "$1" == "egress" ) ]]; then
+    ROLE=$1
+    shift 1
+    TARGET="upf_u_${ROLE}"
+    ../start_nf.sh "$TARGET" "$@"
+else
+    ../start_nf.sh "$NF_DIR" "$@"
+fi
