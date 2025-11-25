@@ -7,6 +7,7 @@
 
 #include "upf_u_common.h"
 #include "upf_session_dl.h"
+#include "upf_cls_ctrl.h"
 
 #include "gtp.h"
 #include "upf_context.h"
@@ -208,4 +209,3 @@ main(int argc, char *argv[]) {
     printf("If we reach here, program is ending\n");
     return 0;
 }
-

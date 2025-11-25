@@ -12,6 +12,7 @@
 #include "upf_session_dl.h"
 #include "upf_u_common.h"
 #include "upf_u_config.h"
+#include "upf_cls_ctrl.h"
 
 #include "onvm_nflib.h"
 #include "onvm_pkt_helper.h"

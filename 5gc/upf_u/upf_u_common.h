@@ -9,6 +9,8 @@
 #include "upf_context.h"
 #include "onvm_common.h"
 #include "upf_events.h"
+#include "upf_cls_ctrl.h"
+#include "../classifiers/classifier_wrapper.h"
 
 #ifndef MAX_UE
 #define MAX_UE 256

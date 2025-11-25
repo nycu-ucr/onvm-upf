@@ -574,7 +574,7 @@ initUeTable(){
     }
 }
 
-uint32_t 
+int 
 findIndexByUeIpAddress(uint32_t ue_ip) {
     int index = -1;
     for (int i = 0; i < MAX_UE; i++) {
