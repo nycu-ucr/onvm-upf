@@ -21,6 +21,7 @@
 
 static int
 packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm_nf_local_ctx *nf_local_ctx) {
+    // uint64_t t0 = rte_get_tsc_cycles();
     if (!pkt || !meta) {
         return 0;
     }
@@ -118,7 +119,13 @@ packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm_nf_
         return 0;  // manager will free
     }
 
-    // Ownership transferred to egress; do not return it to ONVM TX path
+    /* int ret = 1;
+    
+    uint64_t t1 = rte_get_tsc_cycles();
+    double us = (double)(t1 - t0) * 1e6 / rte_get_timer_hz();
+    UTLT_Info("[INGRESS] packet_handler time: %.3f us", us);
+
+    return ret;*/
     return 1;
 }
 
@@ -148,7 +155,7 @@ main(int argc, char *argv[]) {
     int arg_offset;
     struct onvm_nf_local_ctx *nf_local_ctx;
     struct onvm_nf_function_table *nf_function_table;
-    UTLT_SetLogLevel("warning"); // to eliminate log print influenced jitter
+    UTLT_SetLogLevel("warning"); // set log level
 
     nf_local_ctx = onvm_nflib_init_nf_local_ctx();
     onvm_nflib_start_signal_handler(nf_local_ctx, NULL);

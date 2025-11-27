@@ -63,6 +63,7 @@ static inline void registry_next_cursor(void) {
 
 static int
 process_downlink_pkt(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta) {
+    // uint64_t t0 = rte_get_tsc_cycles();
     if (!pkt || !meta) return 0;
 
     uint32_t cal_pktlen = pkt->pkt_len - sizeof(struct rte_ether_hdr) -
@@ -178,6 +179,15 @@ process_downlink_pkt(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta) {
         rte_pktmbuf_free(pkt);
         return 0;
     }
+
+    /* int ret = 1;
+
+    uint64_t t1 = rte_get_tsc_cycles();
+    double us = (double)(t1 - t0) * 1e6 / rte_get_timer_hz();
+    UTLT_Info("[EGRESS] process_downlink_pkt time: %.3f us", us);
+
+    return ret; */
+
     return 1;
 }
 
@@ -198,10 +208,11 @@ drain_session(uint32_t sess_id, struct onvm_nf_local_ctx *nf_local_ctx,
     if (!ring) return;
 
     struct rte_mbuf *burst[DL_DEQ_BURST];
-    while (rte_ring_sc_dequeue_burst(ring, (void **)burst, DL_DEQ_BURST, NULL) > 0) {
-        for (uint16_t i = 0; i < DL_DEQ_BURST; i++) {
+    uint16_t nb;
+    while ((nb = rte_ring_sc_dequeue_burst(ring, (void **)burst, DL_DEQ_BURST, NULL)) > 0) {
+        for (uint16_t i = 0; i < nb; i++) {
             struct rte_mbuf *pkt = burst[i];
-            if (!pkt) break;
+            if (!pkt) continue;
 
             struct onvm_pkt_meta *meta = onvm_get_pkt_meta(pkt, g_dynfield_offset);
             meta->action = ONVM_NF_ACTION_DROP;
@@ -294,7 +305,7 @@ main(int argc, char *argv[]) {
     int arg_offset;
     struct onvm_nf_local_ctx *nf_local_ctx;
     struct onvm_nf_function_table *nf_function_table;
-    UTLT_SetLogLevel("warning"); // to eliminate log print influenced jitter
+    UTLT_SetLogLevel("warning"); // set log level
 
     nf_local_ctx = onvm_nflib_init_nf_local_ctx();
     onvm_nflib_start_signal_handler(nf_local_ctx, NULL);
