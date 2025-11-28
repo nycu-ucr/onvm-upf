@@ -200,10 +200,11 @@ drain_session(uint32_t sess_id, struct onvm_nf_local_ctx *nf_local_ctx,
     if (!ring) return;
 
     struct rte_mbuf *burst[DL_DEQ_BURST];
-    while (rte_ring_sc_dequeue_burst(ring, (void **)burst, DL_DEQ_BURST, NULL) > 0) {
-        for (uint16_t i = 0; i < DL_DEQ_BURST; i++) {
+    uint16_t nb;
+    while ((nb = rte_ring_sc_dequeue_burst(ring, (void **)burst, DL_DEQ_BURST, NULL)) > 0) {
+        for (uint16_t i = 0; i < nb; i++) {
             struct rte_mbuf *pkt = burst[i];
-            if (!pkt) break;
+            if (!pkt) continue;
 
             struct onvm_pkt_meta *meta = onvm_get_pkt_meta(pkt, g_dynfield_offset);
             meta->action = ONVM_NF_ACTION_DROP;
