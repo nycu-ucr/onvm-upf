@@ -107,6 +107,9 @@ struct onvm_service_chain *default_chain;
 /* Shared data for onvm config */
 struct onvm_configuration *onvm_config;
 
+/* DL enqueue timestamp dynfield offset (configured by manager) */
+int onvm_dl_ts_offset;
+
 /* Flag to check if shared core mutex sleep/wakeup is enabled */
 uint8_t ONVM_NF_SHARE_CORES;
 
@@ -1000,6 +1003,7 @@ onvm_nflib_lookup_shared_structs(void) {
 static void
 onvm_nflib_parse_config(struct onvm_configuration *config) {
         ONVM_NF_SHARE_CORES = config->flags.ONVM_NF_SHARE_CORES;
+        onvm_dl_ts_offset    = config->dl_ts_dynfield_offset;
 }
 
 static inline uint16_t

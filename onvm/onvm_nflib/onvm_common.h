@@ -113,6 +113,9 @@
 
 #define ARP_NF_ID 11
 
+/* Optional DL timestamp dynfield offset (set by manager, used by NFs) */
+extern int onvm_dl_ts_offset;
+
 struct onvm_pkt_meta {
         uint8_t action;       /* Action to be performed */
         uint16_t destination; /* where to go next */
@@ -217,6 +220,7 @@ struct onvm_configuration {
                 uint8_t ONVM_NF_SHARE_CORES;
         } flags;
         int dynfield_offset;
+        int dl_ts_dynfield_offset;
 };
 
 struct core_status {

@@ -215,6 +215,12 @@ init(int argc, char *argv[]) {
                 .align = alignof(onvm_pkt_meta_t)
         };
 
+        static const struct rte_mbuf_dynfield onvm_dl_ts_dynfield_desc = {
+                .name  = "upf_dl_ts",
+                .size  = sizeof(uint64_t),
+                .align = __alignof__(uint64_t),
+        };
+
         /* initialise mbuf pools */
         retval = init_mbuf_pools();
         if (retval != 0)
@@ -236,6 +242,10 @@ init(int argc, char *argv[]) {
         onvm_config->dynfield_offset = rte_mbuf_dynfield_register(&onvm_pkt_meta_dynfield_desc);
         if(onvm_config->dynfield_offset < 0)
                 rte_exit(EXIT_FAILURE, "Cannot register onvm_pkt_meta mbuf field\n");
+
+        onvm_config->dl_ts_dynfield_offset = rte_mbuf_dynfield_register(&onvm_dl_ts_dynfield_desc);
+        if (onvm_config->dl_ts_dynfield_offset < 0)
+                rte_exit(EXIT_FAILURE, "Cannot register upf_dl_ts mbuf field\n");
 
         /* now initialise the ports we will use */
         for (i = 0; i < ports->num_ports; i++) {

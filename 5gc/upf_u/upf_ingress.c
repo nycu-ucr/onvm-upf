@@ -111,6 +111,11 @@ packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm_nf_
         return 0;
     }
 
+    if (likely(onvm_dl_ts_offset >= 0)) {
+        uint64_t *ts = RTE_MBUF_DYNFIELD(pkt, onvm_dl_ts_offset, uint64_t *);
+        if (ts) *ts = rte_get_tsc_cycles();
+    }
+
     int rc = rte_ring_mp_enqueue(ring, pkt);
     if (rc < 0) {
         meta->action = ONVM_NF_ACTION_DROP;

@@ -65,6 +65,16 @@ static inline void registry_next_cursor(void) {
 
 static int
 process_downlink_pkt(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta) {
+    if (likely(onvm_dl_ts_offset >= 0)) {
+        uint64_t *ts = RTE_MBUF_DYNFIELD(pkt, onvm_dl_ts_offset, uint64_t *);
+        if (ts && *ts) {
+            uint64_t diff = rte_get_tsc_cycles() - *ts;
+            double us = (double)diff * 1e6 / rte_get_timer_hz();
+            UTLT_Info("[DL] enqueue→dequeue latency: %.3f us", us);
+            *ts = 0;
+        }
+    }
+
     if (!pkt || !meta) return 0;
 
     uint32_t cal_pktlen = pkt->pkt_len - sizeof(struct rte_ether_hdr) -
@@ -202,8 +212,6 @@ drain_session(uint32_t sess_id, struct onvm_nf_local_ctx *nf_local_ctx,
     struct rte_mbuf *burst[DL_DEQ_BURST];
     uint16_t nb;
     while ((nb = rte_ring_sc_dequeue_burst(ring, (void **)burst, DL_DEQ_BURST, NULL)) > 0) {
-        UTLT_Info("drain sess=%u nb=%u buffering=%d ring=%p",
-                  sess_id, nb, UpfSessionIsBuffered(session), (void*)ring);
         for (uint16_t i = 0; i < nb; i++) {
             struct rte_mbuf *pkt = burst[i];
             if (!pkt) continue;
@@ -270,13 +278,6 @@ pkt_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm_nf_loc
 static int
 egress_tick(struct onvm_nf_local_ctx *nf_local_ctx) {
     UpfClsMaybeFlipAndAck(UPF_CLS_CONS_EGRESS);
-
-    static uint64_t iter = 0;
-    /* Log occasionally for early debugging; adjust or remove when stable */
-    if ((iter++ % 1000000ULL) == 0) {
-        UTLT_Info("tick iter=%" PRIu64 " reg_count=%u cursor=%u",
-                  iter, g_registry.count, g_registry.cursor);
-    }
 
     if (g_registry.count == 0)
         return 0;
