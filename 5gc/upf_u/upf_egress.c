@@ -202,6 +202,8 @@ drain_session(uint32_t sess_id, struct onvm_nf_local_ctx *nf_local_ctx,
     struct rte_mbuf *burst[DL_DEQ_BURST];
     uint16_t nb;
     while ((nb = rte_ring_sc_dequeue_burst(ring, (void **)burst, DL_DEQ_BURST, NULL)) > 0) {
+        UTLT_Info("drain sess=%u nb=%u buffering=%d ring=%p",
+                  sess_id, nb, UpfSessionIsBuffered(session), (void*)ring);
         for (uint16_t i = 0; i < nb; i++) {
             struct rte_mbuf *pkt = burst[i];
             if (!pkt) continue;
@@ -268,6 +270,13 @@ pkt_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm_nf_loc
 static int
 egress_tick(struct onvm_nf_local_ctx *nf_local_ctx) {
     UpfClsMaybeFlipAndAck(UPF_CLS_CONS_EGRESS);
+
+    static uint64_t iter = 0;
+    /* Log occasionally for early debugging; adjust or remove when stable */
+    if ((iter++ % 1000000ULL) == 0) {
+        UTLT_Info("tick iter=%" PRIu64 " reg_count=%u cursor=%u",
+                  iter, g_registry.count, g_registry.cursor);
+    }
 
     if (g_registry.count == 0)
         return 0;
