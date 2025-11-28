@@ -169,7 +169,7 @@ onvm_nflib_dequeue_packets(void **pkts, struct onvm_nf_local_ctx *nf_local_ctx,
  * Check if there is a message available for this NF and process it
  */
 void
-onvm_nflib_dequeue_messages(struct onvm_nf_local_ctx *nf_local_ctx) __attribute__((always_inline));
+onvm_nflib_dequeue_messages(struct onvm_nf_local_ctx *nf_local_ctx);
 
 /*
  * Terminate the children spawned by the NF
