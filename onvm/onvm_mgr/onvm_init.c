@@ -196,7 +196,7 @@ init(int argc, char *argv[]) {
         nf_per_service_count = mz_nf_per_service->addr;
 
         /* set up custom flags */
-        mz_onvm_config = rte_memzone_reserve(MZ_ONVM_CONFIG, sizeof(uint16_t), rte_socket_id(), NO_FLAGS);
+        mz_onvm_config = rte_memzone_reserve(MZ_ONVM_CONFIG, sizeof(struct onvm_configuration), rte_socket_id(), NO_FLAGS);
         if (mz_onvm_config == NULL) {
                 rte_exit(EXIT_FAILURE, "Cannot reserve memory zone for ONVM custom flags.\n");
         }
@@ -213,6 +213,12 @@ init(int argc, char *argv[]) {
                 .name = "onvm_pkt_meta_dynfield",
                 .size = sizeof(onvm_pkt_meta_t),
                 .align = alignof(onvm_pkt_meta_t)
+        };
+
+        static const struct rte_mbuf_dynfield onvm_dl_ts_dynfield_desc = {
+                .name  = "upf_dl_ts",
+                .size  = sizeof(uint64_t),
+                .align = __alignof__(uint64_t),
         };
 
         /* initialise mbuf pools */
@@ -236,6 +242,10 @@ init(int argc, char *argv[]) {
         onvm_config->dynfield_offset = rte_mbuf_dynfield_register(&onvm_pkt_meta_dynfield_desc);
         if(onvm_config->dynfield_offset < 0)
                 rte_exit(EXIT_FAILURE, "Cannot register onvm_pkt_meta mbuf field\n");
+
+        onvm_config->dl_ts_dynfield_offset = rte_mbuf_dynfield_register(&onvm_dl_ts_dynfield_desc);
+        if (onvm_config->dl_ts_dynfield_offset < 0)
+                rte_exit(EXIT_FAILURE, "Cannot register upf_dl_ts mbuf field\n");
 
         /* now initialise the ports we will use */
         for (i = 0; i < ports->num_ports; i++) {
@@ -291,7 +301,8 @@ init(int argc, char *argv[]) {
 static void
 set_default_config(struct onvm_configuration *config) {
         config->flags.ONVM_NF_SHARE_CORES = ONVM_NF_SHARE_CORES_DEFAULT;
-        config->dynfield_offset = -1; 
+        config->dynfield_offset = -1;
+        config->dl_ts_dynfield_offset = -1; 
 }
 
 /**

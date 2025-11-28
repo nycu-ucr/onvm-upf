@@ -13,6 +13,7 @@
 #include "upf_u_common.h"
 #include "upf_u_config.h"
 #include "upf_cls_ctrl.h"
+#include "onvm_common.h"
 
 #include "onvm_nflib.h"
 #include "onvm_pkt_helper.h"
@@ -63,6 +64,16 @@ static inline void registry_next_cursor(void) {
 
 static int
 process_downlink_pkt(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta) {
+    if (likely(onvm_dl_ts_offset >= 0)) {
+        uint64_t *ts = RTE_MBUF_DYNFIELD(pkt, onvm_dl_ts_offset, uint64_t *);
+        if (ts && *ts) {
+            uint64_t diff = rte_get_tsc_cycles() - *ts;
+            double us = (double)diff * 1e6 / rte_get_timer_hz();
+            UTLT_Info("[DL] enqueue→dequeue latency: %.3f us", us);
+            *ts = 0; // clear for reuse
+        }
+    }
+
     // uint64_t t0 = rte_get_tsc_cycles();
     if (!pkt || !meta) return 0;
 
@@ -150,6 +161,7 @@ process_downlink_pkt(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta) {
         }
 
         if (isQos) {
+            printf("%u", meta->flags);
             if (meta->flags == RTE_COLOR_RED) {
                 meta->action = ONVM_NF_ACTION_DROP;
             }
@@ -305,7 +317,7 @@ main(int argc, char *argv[]) {
     int arg_offset;
     struct onvm_nf_local_ctx *nf_local_ctx;
     struct onvm_nf_function_table *nf_function_table;
-    UTLT_SetLogLevel("warning"); // set log level
+    UTLT_SetLogLevel("info"); // set log level
 
     nf_local_ctx = onvm_nflib_init_nf_local_ctx();
     onvm_nflib_start_signal_handler(nf_local_ctx, NULL);

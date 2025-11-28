@@ -8,6 +8,7 @@
 #include "upf_u_common.h"
 #include "upf_session_dl.h"
 #include "upf_cls_ctrl.h"
+#include "onvm_common.h"
 
 #include "gtp.h"
 #include "upf_context.h"
@@ -110,6 +111,11 @@ packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm_nf_
     if (!ring) {
         UTLT_Error("DL ring missing for sess_id=%u ue=%s", session->sess_id, convertToIpAddress(iph->dst_addr));
         return 0;
+    }
+
+    if (likely(onvm_dl_ts_offset >= 0)) {
+        uint64_t *ts = RTE_MBUF_DYNFIELD(pkt, onvm_dl_ts_offset, uint64_t *);
+        if (ts) *ts = rte_get_tsc_cycles();
     }
 
     int rc = rte_ring_mp_enqueue(ring, pkt);

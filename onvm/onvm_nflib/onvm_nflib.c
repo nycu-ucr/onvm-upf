@@ -110,6 +110,8 @@ struct onvm_configuration *onvm_config;
 /* Flag to check if shared core mutex sleep/wakeup is enabled */
 uint8_t ONVM_NF_SHARE_CORES;
 
+int onvm_dl_ts_offset;
+
 static const char *const g_nf_flag_targets[] = {
         "upf_c",
         "smf",
@@ -1000,6 +1002,7 @@ onvm_nflib_lookup_shared_structs(void) {
 static void
 onvm_nflib_parse_config(struct onvm_configuration *config) {
         ONVM_NF_SHARE_CORES = config->flags.ONVM_NF_SHARE_CORES;
+        onvm_dl_ts_offset    = config->dl_ts_dynfield_offset;
 }
 
 static inline uint16_t
