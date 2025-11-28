@@ -5,6 +5,7 @@
 
 #include <rte_ethdev.h>
 #include <rte_mbuf.h>
+#include <rte_pause.h>
 #include <rte_ring.h>
 
 #include "gtp.h"
@@ -15,6 +16,7 @@
 #include "upf_cls_ctrl.h"
 
 #include "onvm_nflib.h"
+#include "onvm_threading.h"
 #include "onvm_pkt_helper.h"
 #include "utlt_debug.h"
 
@@ -299,9 +301,7 @@ main(int argc, char *argv[]) {
     nf_local_ctx = onvm_nflib_init_nf_local_ctx();
     onvm_nflib_start_signal_handler(nf_local_ctx, NULL);
     nf_function_table = onvm_nflib_init_nf_function_table();
-    nf_function_table->pkt_handler = &pkt_handler;
     nf_function_table->msg_handler = &msg_handler;
-    nf_function_table->user_actions = &egress_tick;
 
     if ((arg_offset = onvm_nflib_init(argc, argv, NF_TAG, nf_local_ctx, nf_function_table)) < 0) {
         onvm_nflib_stop(nf_local_ctx);
@@ -352,7 +352,19 @@ main(int argc, char *argv[]) {
     UeIpToUpfSessionMapInit();
     TeidToUpfSessionMapInit();
 
-    onvm_nflib_run(nf_local_ctx);
+    struct onvm_nf *nf = nf_local_ctx->nf;
+    onvm_threading_core_affinitize(nf->thread_info.core);
+
+    printf("Sending NF_READY message to manager...\n");
+    if (onvm_nflib_nf_ready(nf) != 0) {
+        rte_exit(EXIT_FAILURE, "Unable to message manager\n");
+    }
+
+    while (rte_atomic16_read(&nf_local_ctx->keep_running)) {
+        onvm_nflib_dequeue_messages(nf_local_ctx);
+        egress_tick(nf_local_ctx);
+        rte_pause();
+    }
 
     onvm_nflib_stop(nf_local_ctx);
     printf("If we reach here, program is ending\n");

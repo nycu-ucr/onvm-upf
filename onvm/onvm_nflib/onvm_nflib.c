@@ -168,7 +168,7 @@ onvm_nflib_dequeue_packets(void **pkts, struct onvm_nf_local_ctx *nf_local_ctx,
 /*
  * Check if there is a message available for this NF and process it
  */
-static inline void
+void
 onvm_nflib_dequeue_messages(struct onvm_nf_local_ctx *nf_local_ctx) __attribute__((always_inline));
 
 /*
@@ -1040,7 +1040,7 @@ onvm_nflib_dequeue_packets(void **pkts, struct onvm_nf_local_ctx *nf_local_ctx, 
         return 0;
 }
 
-static inline void
+void
 onvm_nflib_dequeue_messages(struct onvm_nf_local_ctx *nf_local_ctx) {
         struct onvm_nf_msg *msg;
         struct rte_ring *msg_q;

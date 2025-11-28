@@ -154,6 +154,9 @@ onvm_nflib_return_pkt(struct onvm_nf *nf, struct rte_mbuf *pkt);
 int
 onvm_nflib_return_pkt_bulk(struct onvm_nf *nf, struct rte_mbuf **pkts, uint16_t count);
 
+void
+onvm_nflib_dequeue_messages(struct onvm_nf_local_ctx *nf_local_ctx);
+
 /**
  * Inform the manager that the NF is ready to receive packets.
  * This only needs to be called when the NF is using advanced rings
