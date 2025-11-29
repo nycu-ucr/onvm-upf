@@ -130,7 +130,7 @@ process_downlink_pkt(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta) {
     AttachL2Header(pkt, true);
 
     if (meta->action == ONVM_NF_ACTION_OUT) {
-        /* QoS handling copied from legacy fast path */
+        // QoS handling
         int index = findIndexByUeIpAddress(ue_ip);
         if (index != -1) {
             updateTokenbyIndex(index);
@@ -307,7 +307,7 @@ main(int argc, char *argv[]) {
     int arg_offset;
     struct onvm_nf_local_ctx *nf_local_ctx;
     struct onvm_nf_function_table *nf_function_table;
-    UTLT_SetLogLevel("info"); // to eliminate log print influenced jitter
+    UTLT_SetLogLevel("info"); // set log level
 
     nf_local_ctx = onvm_nflib_init_nf_local_ctx();
     onvm_nflib_start_signal_handler(nf_local_ctx, NULL);
