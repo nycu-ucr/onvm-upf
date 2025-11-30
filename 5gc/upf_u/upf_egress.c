@@ -324,6 +324,13 @@ main(int argc, char *argv[]) {
         }
     }
 
+    const char *config_path = "config/upf_u.yaml";
+    if (argc > arg_offset + 1) {
+        config_path = argv[arg_offset + 1];
+    }
+    printf("[UPF-Egress] Using config: %s\n", config_path);
+    UpfU_LoadAndParseConfig(config_path);
+
     struct onvm_configuration *onvm_config = onvm_nflib_get_onvm_config();
     if (!onvm_config) {
         rte_exit(EXIT_FAILURE, "onvm_nflib_get_onvm_config() returned NULL\n");
@@ -335,19 +342,12 @@ main(int argc, char *argv[]) {
     }
 
     int ret;
-    ret = rte_eth_macaddr_get(0, &cn_ue_eth);
+    ret = rte_eth_macaddr_get(g_access_port, &cn_ue_eth);
     if (ret < 0)
-        rte_exit(EXIT_FAILURE, "Cannot get MAC address: err=%d, port=%u\n", ret, 0);
-    ret = rte_eth_macaddr_get(1, &cn_dn_eth);
+        rte_exit(EXIT_FAILURE, "Cannot get MAC address: err=%d, port=%d\n", ret, g_access_port);
+    ret = rte_eth_macaddr_get(g_core_port, &cn_dn_eth);
     if (ret < 0)
-        rte_exit(EXIT_FAILURE, "Cannot get MAC address: err=%d, port=%u\n", ret, 1);
-
-    const char *config_path = "config/upf_u.yaml";
-    if (argc > arg_offset + 1) {
-        config_path = argv[arg_offset + 1];
-    }
-    printf("[UPF-Egress] Using config: %s\n", config_path);
-    UpfU_LoadAndParseConfig(config_path);
+        rte_exit(EXIT_FAILURE, "Cannot get MAC address: err=%d, port=%d\n", ret, g_core_port);
 
     dn_eth.addr_bytes[0] = DnMac[0];
     dn_eth.addr_bytes[1] = DnMac[1];
