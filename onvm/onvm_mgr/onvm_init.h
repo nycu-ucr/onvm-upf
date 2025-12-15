@@ -109,6 +109,7 @@ extern struct port_info *ports;
 extern struct core_status *cores;
 
 extern struct rte_mempool *pktmbuf_pool;
+extern struct rte_mempool *cp_pktmbuf_pool;
 extern struct rte_mempool *nf_msg_pool;
 extern uint16_t num_nfs;
 extern uint16_t num_services;

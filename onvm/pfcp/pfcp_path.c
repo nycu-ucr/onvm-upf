@@ -95,7 +95,7 @@ Status PfcpSend(PfcpNode *node, Bufblk *bufBlk) {
     uint32_t i;
     struct rte_mempool *pktmbuf_pool;
 
-    pktmbuf_pool = rte_mempool_lookup(PKTMBUF_POOL_NAME);
+    pktmbuf_pool = rte_mempool_lookup(CP_PKTMBUF_POOL_NAME);
     if (pktmbuf_pool == NULL) {
         return STATUS_ERROR;
     }
