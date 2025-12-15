@@ -1359,19 +1359,6 @@ main(int argc, char *argv[]) {
         }
     }
 
-    if (UpfClsCtrlInit() < 0) {
-        rte_exit(EXIT_FAILURE, "CLS_CTRL memzone init failed\n");
-    }
-
-    int ret;
-    ret = rte_eth_macaddr_get(0, &cn_ue_eth);
-    if (ret < 0)
-        rte_exit(EXIT_FAILURE, "Cannot get MAC address: err=%d, port=%u\n", ret, 0);
-    ret = rte_eth_macaddr_get(1, &cn_dn_eth);
-    if (ret < 0)
-        rte_exit(EXIT_FAILURE, "Cannot get MAC address: err=%d, port=%u\n", ret, 1);
-
-    /* Parse DN & AN MAC address from config/upf_u.yaml */
     const char *config_path = "config/upf_u.yaml";
 
     if (argc > arg_offset + 1) {
@@ -1379,6 +1366,18 @@ main(int argc, char *argv[]) {
     }
     printf("[UPF-U] Using config: %s\n", config_path);
     UpfU_LoadAndParseConfig(config_path);
+
+    if (UpfClsCtrlInit() < 0) {
+        rte_exit(EXIT_FAILURE, "CLS_CTRL memzone init failed\n");
+    }
+
+    int ret;
+    ret = rte_eth_macaddr_get(g_access_port, &cn_ue_eth);
+    if (ret < 0)
+        rte_exit(EXIT_FAILURE, "Cannot get MAC address: err=%d, port=%d\n", ret, g_access_port);
+    ret = rte_eth_macaddr_get(g_core_port, &cn_dn_eth);
+    if (ret < 0)
+        rte_exit(EXIT_FAILURE, "Cannot get MAC address: err=%d, port=%d\n", ret, g_core_port);
 
     /* UTLT_Info("[UPF-U][CONFIG] Port map: ACCESS=%d CORE=%d SGI=%d",
           g_access_port, g_core_port, g_sgi_port); */
