@@ -4,8 +4,8 @@ info:
 
 configuration:
   dataplane:
-    dn_mac: "3c:fd:fe:b4:ff:a1"
-    an_mac: "3c:fd:fe:b4:fd:19"
+    dn_mac: "3c:fd:fe:b4:fb:28"
+    an_mac: "3c:fd:fe:b0:f1:f9"
     upf_ip: "192.168.1.2"
 
     ports:

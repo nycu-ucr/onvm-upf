@@ -1,9 +1,16 @@
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+
 #include <inttypes.h>
 #include <stdio.h>
 #include <string.h>
+#include <sched.h>
+#include <time.h>
 #include <unistd.h>
 
 #include <rte_ethdev.h>
+#include <rte_lcore.h>
 #include <rte_mbuf.h>
 #include <rte_ring.h>
 
@@ -32,6 +39,109 @@ struct session_registry {
 
 static struct session_registry g_registry = {0};
 static uint16_t g_dynfield_offset = 0;
+
+/* Debug instrumentation to correlate enqueue→dequeue spikes with egress scheduling. */
+#define UPF_EGRESS_TICK_GAP_WARN_US 1000.0
+#define UPF_EGRESS_TICK_DUR_WARN_US 1000.0
+#define UPF_DL_ENQ_DEQ_WARN_US 1000.0
+#define UPF_EGRESS_WARN_PERIOD_US 1000000.0
+
+static uint64_t g_tick_start_cycles = 0;
+static uint64_t g_last_tick_start_cycles = 0;
+static uint64_t g_last_tick_gap_cycles = 0;
+static uint64_t g_last_tick_dur_cycles = 0;
+static uint64_t g_last_tick_cpu_dur_ns = 0;
+static uint64_t g_last_tick_end_cycles = 0;
+static uint64_t g_last_tick_cpu_end_ns = 0;
+static uint16_t g_nf_core_id = UINT16_MAX;
+
+static uint64_t g_warn_window_start_cycles = 0;
+static uint64_t g_tick_gap_warn_count = 0;
+static uint64_t g_tick_gap_warn_max_cycles = 0;
+static uint64_t g_tick_dur_warn_count = 0;
+static uint64_t g_tick_dur_warn_max_cycles = 0;
+static uint64_t g_tick_cpu_dur_warn_count = 0;
+static uint64_t g_tick_cpu_dur_warn_max_ns = 0;
+static uint64_t g_tick_cpu_dur_max_ns = 0;
+static uint64_t g_tick_wait_warn_count = 0;
+static uint64_t g_tick_wait_warn_max_cycles = 0;
+static uint64_t g_tick_wait_cpu_max_ns = 0;
+static uint64_t g_tick_window_count = 0;
+static uint64_t g_tick_window_drained = 0;
+
+static inline uint64_t
+thread_cpu_time_ns(void) {
+    struct timespec ts;
+    if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts) != 0)
+        return 0;
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+
+static inline double
+cycles_to_us(uint64_t cycles) {
+    return (double)cycles * 1e6 / (double)rte_get_timer_hz();
+}
+
+static inline uint64_t
+us_to_cycles(double us) {
+    return (uint64_t)(us * (double)rte_get_timer_hz() / 1e6);
+}
+
+static inline void
+maybe_emit_tick_warn_summary(uint64_t now_cycles) {
+    const uint64_t period_cycles = us_to_cycles(UPF_EGRESS_WARN_PERIOD_US);
+    if (period_cycles == 0)
+        return;
+
+    if (g_warn_window_start_cycles == 0) {
+        g_warn_window_start_cycles = now_cycles;
+        return;
+    }
+
+    if (now_cycles - g_warn_window_start_cycles < period_cycles)
+        return;
+
+    if (g_tick_gap_warn_count || g_tick_dur_warn_count || g_tick_cpu_dur_warn_count || g_tick_wait_warn_count) {
+        UTLT_Warning(
+            "[EGRESS][~1s] core=%u cpu=%d reg=%u ticks=%" PRIu64 " drained=%" PRIu64
+            " gap>%.0fus: count=%" PRIu64 " max=%.3f us; dur>%.0fus: count=%" PRIu64 " max=%.3f us"
+            "; cpu_dur>%.0fus: count=%" PRIu64 " max=%.3f us; cpu_dur_max=%.3f us"
+            "; wait>%.0fus: count=%" PRIu64 " max=%.3f us; wait_cpu_max=%.3f us",
+            (unsigned)g_nf_core_id,
+            sched_getcpu(),
+            g_registry.count,
+            g_tick_window_count,
+            g_tick_window_drained,
+            UPF_EGRESS_TICK_GAP_WARN_US,
+            g_tick_gap_warn_count,
+            cycles_to_us(g_tick_gap_warn_max_cycles),
+            UPF_EGRESS_TICK_DUR_WARN_US,
+            g_tick_dur_warn_count,
+            cycles_to_us(g_tick_dur_warn_max_cycles),
+            UPF_EGRESS_TICK_DUR_WARN_US,
+            g_tick_cpu_dur_warn_count,
+            (double)g_tick_cpu_dur_warn_max_ns / 1000.0,
+            (double)g_tick_cpu_dur_max_ns / 1000.0,
+            UPF_EGRESS_TICK_GAP_WARN_US,
+            g_tick_wait_warn_count,
+            cycles_to_us(g_tick_wait_warn_max_cycles),
+            (double)g_tick_wait_cpu_max_ns / 1000.0);
+    }
+
+    g_warn_window_start_cycles = now_cycles;
+    g_tick_gap_warn_count = 0;
+    g_tick_gap_warn_max_cycles = 0;
+    g_tick_dur_warn_count = 0;
+    g_tick_dur_warn_max_cycles = 0;
+    g_tick_cpu_dur_warn_count = 0;
+    g_tick_cpu_dur_warn_max_ns = 0;
+    g_tick_cpu_dur_max_ns = 0;
+    g_tick_wait_warn_count = 0;
+    g_tick_wait_warn_max_cycles = 0;
+    g_tick_wait_cpu_max_ns = 0;
+    g_tick_window_count = 0;
+    g_tick_window_drained = 0;
+}
 
 static inline void registry_add(uint32_t sess_id) {
     for (uint32_t i = 0; i < g_registry.count; i++) {
@@ -64,21 +174,8 @@ static inline void registry_next_cursor(void) {
 
 static int
 process_downlink_pkt(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta) {
-    if (likely(onvm_dl_ts_offset >= 0)) {
-        uint64_t *ts = RTE_MBUF_DYNFIELD(pkt, onvm_dl_ts_offset, uint64_t *);
-        if (ts && *ts) {
-            uint64_t diff = rte_get_tsc_cycles() - *ts;
-            double us = (double)diff * 1e6 / rte_get_timer_hz();
-            UTLT_Info("[DL] enqueue→dequeue latency: %.3f us", us);
-            *ts = 0; // clear for reuse
-        }
-    }
-
     // uint64_t t0 = rte_get_tsc_cycles();
     if (!pkt || !meta) return 0;
-
-    uint32_t cal_pktlen = pkt->pkt_len - sizeof(struct rte_ether_hdr) -
-                          sizeof(struct rte_ipv4_hdr) - sizeof(struct rte_udp_hdr);
 
     struct rte_ipv4_hdr *iph = onvm_pkt_ipv4_hdr(pkt);
     if (!iph) {
@@ -87,6 +184,48 @@ process_downlink_pkt(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta) {
     }
 
     uint32_t ue_ip = rte_be_to_cpu_32(iph->dst_addr);
+
+    if (likely(onvm_dl_ts_offset >= 0)) {
+        uint64_t *ts = RTE_MBUF_DYNFIELD(pkt, onvm_dl_ts_offset, uint64_t *);
+        if (ts && *ts) {
+            const uint64_t now = rte_get_tsc_cycles();
+            const uint64_t diff = now - *ts;
+            const double us = cycles_to_us(diff);
+
+            if (us >= UPF_DL_ENQ_DEQ_WARN_US) {
+                UpfSession *session = UpfSessionFindByUeIP(ue_ip);
+                const uint32_t sess_id = session ? session->sess_id : 0;
+                uint32_t qdepth = 0;
+                if (session) {
+                    struct rte_ring *ring = __atomic_load_n(&session->dl_ring, __ATOMIC_ACQUIRE);
+                    if (ring) qdepth = (uint32_t)rte_ring_count(ring);
+                }
+
+                const double tick_gap_us = cycles_to_us(g_last_tick_gap_cycles);
+                const double tick_pos_us = g_tick_start_cycles ? cycles_to_us(now - g_tick_start_cycles) : 0.0;
+
+                UTLT_Warning(
+                    "[DL] enqueue→dequeue spike: %.3f us (ue=%s sess=%u q=%u reg=%u tick_gap=%.3f us tick_pos=%.3f us core=%u cpu=%d)",
+                    us,
+                    convertToIpAddress(iph->dst_addr),
+                    sess_id,
+                    qdepth,
+                    g_registry.count,
+                    tick_gap_us,
+                    tick_pos_us,
+                    (unsigned)g_nf_core_id,
+                    sched_getcpu());
+            } else {
+                UTLT_Info("[DL] enqueue→dequeue latency: %.3f us", us);
+            }
+
+            *ts = 0; // clear for reuse
+        }
+    }
+
+    uint32_t cal_pktlen = pkt->pkt_len - sizeof(struct rte_ether_hdr) -
+                          sizeof(struct rte_ipv4_hdr) - sizeof(struct rte_udp_hdr);
+
     UPDK_PDR *pdr = GetPdrByUeIpAddress(pkt, ue_ip);
     GetQerByUEIpAddress(ue_ip, convertToIpAddress(iph->dst_addr));
     if (!pdr) {
@@ -202,25 +341,27 @@ process_downlink_pkt(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta) {
     return 1;
 }
 
-static void
+static uint32_t
 drain_session(uint32_t sess_id, struct onvm_nf_local_ctx *nf_local_ctx,
               struct rte_mbuf **tx_buf, uint16_t *tx_count) {
     UpfSession *session = UpfSessionFindBySeid(sess_id);
     if (!session) {
         registry_remove(sess_id);
-        return;
+        return 0;
     }
 
     if (UpfSessionIsBuffered(session)) {
-        return;
+        return 0;
     }
 
     struct rte_ring *ring = __atomic_load_n(&session->dl_ring, __ATOMIC_ACQUIRE);
-    if (!ring) return;
+    if (!ring) return 0;
 
+    uint32_t drained = 0;
     struct rte_mbuf *burst[DL_DEQ_BURST];
     uint16_t nb;
     while ((nb = rte_ring_sc_dequeue_burst(ring, (void **)burst, DL_DEQ_BURST, NULL)) > 0) {
+        drained += nb;
         for (uint16_t i = 0; i < nb; i++) {
             struct rte_mbuf *pkt = burst[i];
             if (!pkt) continue;
@@ -238,6 +379,8 @@ drain_session(uint32_t sess_id, struct onvm_nf_local_ctx *nf_local_ctx,
             }
         }
     }
+
+    return drained;
 }
 
 void
@@ -286,20 +429,50 @@ pkt_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm_nf_loc
 
 static int
 egress_tick(struct onvm_nf_local_ctx *nf_local_ctx) {
+    const uint64_t tick_start = rte_get_tsc_cycles();
+    const uint64_t tick_cpu_start_ns = thread_cpu_time_ns();
+    g_tick_start_cycles = tick_start;
+    g_nf_core_id = nf_local_ctx && nf_local_ctx->nf ? nf_local_ctx->nf->thread_info.core : UINT16_MAX;
+    struct rte_mbuf *tx_buf[PACKET_READ_SIZE];
+    uint16_t tx_count = 0;
+    uint32_t drained_pkts = 0;
+    if (g_last_tick_end_cycles) {
+        const uint64_t wait_cycles = tick_start - g_last_tick_end_cycles;
+        const double wait_us = cycles_to_us(wait_cycles);
+        if (wait_us >= UPF_EGRESS_TICK_GAP_WARN_US) {
+            g_tick_wait_warn_count++;
+            if (wait_cycles > g_tick_wait_warn_max_cycles)
+                g_tick_wait_warn_max_cycles = wait_cycles;
+        }
+
+        if (g_last_tick_cpu_end_ns && tick_cpu_start_ns && tick_cpu_start_ns >= g_last_tick_cpu_end_ns) {
+            const uint64_t wait_cpu_ns = tick_cpu_start_ns - g_last_tick_cpu_end_ns;
+            if (wait_cpu_ns > g_tick_wait_cpu_max_ns)
+                g_tick_wait_cpu_max_ns = wait_cpu_ns;
+        }
+    }
+    if (g_last_tick_start_cycles) {
+        g_last_tick_gap_cycles = tick_start - g_last_tick_start_cycles;
+        const double gap_us = cycles_to_us(g_last_tick_gap_cycles);
+        if (gap_us >= UPF_EGRESS_TICK_GAP_WARN_US) {
+            g_tick_gap_warn_count++;
+            if (g_last_tick_gap_cycles > g_tick_gap_warn_max_cycles)
+                g_tick_gap_warn_max_cycles = g_last_tick_gap_cycles;
+        }
+    }
+    g_last_tick_start_cycles = tick_start;
+
     UpfClsMaybeFlipAndAck(UPF_CLS_CONS_EGRESS);
 
     if (g_registry.count == 0)
-        return 0;
-
-    struct rte_mbuf *tx_buf[PACKET_READ_SIZE];
-    uint16_t tx_count = 0;
+        goto out;
 
     uint32_t visits = g_registry.count;
     while (visits--) {
         uint32_t idx = g_registry.cursor;
         uint32_t sess_id = g_registry.ids[idx];
         registry_next_cursor();
-        drain_session(sess_id, nf_local_ctx, tx_buf, &tx_count);
+        drained_pkts += drain_session(sess_id, nf_local_ctx, tx_buf, &tx_count);
     }
 
     if (tx_count > 0) {
@@ -307,6 +480,37 @@ egress_tick(struct onvm_nf_local_ctx *nf_local_ctx) {
         onvm_pkt_process_tx_batch(nf->nf_tx_mgr, tx_buf, g_dynfield_offset, tx_count, nf);
         onvm_pkt_flush_all_nfs(nf->nf_tx_mgr, nf);
     }
+
+out:
+    const uint64_t tick_end = rte_get_tsc_cycles();
+    const uint64_t tick_cpu_end_ns = thread_cpu_time_ns();
+    g_last_tick_dur_cycles = tick_end - tick_start;
+    const double dur_us = cycles_to_us(g_last_tick_dur_cycles);
+    if (dur_us >= UPF_EGRESS_TICK_DUR_WARN_US) {
+        g_tick_dur_warn_count++;
+        if (g_last_tick_dur_cycles > g_tick_dur_warn_max_cycles)
+            g_tick_dur_warn_max_cycles = g_last_tick_dur_cycles;
+    }
+
+    if (tick_cpu_start_ns && tick_cpu_end_ns && tick_cpu_end_ns >= tick_cpu_start_ns) {
+        g_last_tick_cpu_dur_ns = tick_cpu_end_ns - tick_cpu_start_ns;
+        if (g_last_tick_cpu_dur_ns > g_tick_cpu_dur_max_ns)
+            g_tick_cpu_dur_max_ns = g_last_tick_cpu_dur_ns;
+        if ((double)g_last_tick_cpu_dur_ns / 1000.0 >= UPF_EGRESS_TICK_DUR_WARN_US) {
+            g_tick_cpu_dur_warn_count++;
+            if (g_last_tick_cpu_dur_ns > g_tick_cpu_dur_warn_max_ns)
+                g_tick_cpu_dur_warn_max_ns = g_last_tick_cpu_dur_ns;
+        }
+    } else {
+        g_last_tick_cpu_dur_ns = 0;
+    }
+
+    g_last_tick_end_cycles = tick_end;
+    g_last_tick_cpu_end_ns = tick_cpu_end_ns;
+
+    g_tick_window_count++;
+    g_tick_window_drained += drained_pkts;
+    maybe_emit_tick_warn_summary(tick_end);
 
     return 0;
 }
