@@ -60,6 +60,7 @@ struct onvm_configuration *onvm_config = NULL;
 struct nf_wakeup_info *nf_wakeup_infos = NULL;
 
 struct rte_mempool *pktmbuf_pool;
+struct rte_mempool *cp_pktmbuf_pool;
 struct rte_mempool *nf_init_cfg_pool;
 struct rte_mempool *nf_msg_pool;
 struct rte_ring *incoming_msg_queue;
@@ -296,7 +297,7 @@ set_default_config(struct onvm_configuration *config) {
 
 /**
  * Initialise the mbuf pool for packet reception for the NIC, and any other
- * buffer pools needed by the app - currently none.
+ * buffer pools needed by the app - currently L25GC+ control plane SBI.
  */
 static int
 init_mbuf_pools(void) {
@@ -312,6 +313,11 @@ init_mbuf_pools(void) {
         printf("Creating mbuf pool '%s' [%u mbufs] ...\n", PKTMBUF_POOL_NAME, NUM_MBUFS);
         /* NOTE: override MBUF_SIZE */
         pktmbuf_pool = rte_mempool_create(PKTMBUF_POOL_NAME, NUM_MBUFS, MBUF_SIZE, MBUF_CACHE_SIZE,
+                                          sizeof(struct rte_pktmbuf_pool_private), rte_pktmbuf_pool_init, NULL,
+                                          rte_pktmbuf_init, NULL, rte_socket_id(), NO_FLAGS);
+
+        printf("Creating L25GC+ control plane SBI mbuf pool '%s' [%u mbufs] ...\n", CP_PKTMBUF_POOL_NAME, NUM_MBUFS);
+        cp_pktmbuf_pool = rte_mempool_create(CP_PKTMBUF_POOL_NAME, NUM_MBUFS, MBUF_SIZE, MBUF_CACHE_SIZE,
                                           sizeof(struct rte_pktmbuf_pool_private), rte_pktmbuf_pool_init, NULL,
                                           rte_pktmbuf_init, NULL, rte_socket_id(), NO_FLAGS);
 

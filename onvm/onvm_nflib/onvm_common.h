@@ -388,6 +388,7 @@ struct ft_request {
 #define MP_NF_TXQ_NAME "MProc_Client_%u_TX"
 #define MP_CLIENT_SEM_NAME "MProc_Client_%u_SEM"
 #define PKTMBUF_POOL_NAME "MProc_pktmbuf_pool"
+#define CP_PKTMBUF_POOL_NAME "CP_MProc_pktmbuf_pool"
 #define MZ_PORT_INFO "MProc_port_info"
 #define MZ_CORES_STATUS "MProc_cores_info"
 #define MZ_NF_INFO "MProc_nf_init_cfg"
