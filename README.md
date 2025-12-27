@@ -86,8 +86,8 @@ We provide step-by-step instructions for [manual installation](./MANUAL_INSTALL.
 [onvm-upf]: https://github.com/nycu-ucr/onvm-upf
 [opensou]: https://github.com/nycu-ucr/onvm-upf/tree/opensource
 [next]: https://github.com/nycu-ucr/onvm-upf/tree/next
-[upfc]: 5gc/upf_c_complete/
-[upfu]: 5gc/upf_u_complete/
+[upfc]: 5gc/upf_c/
+[upfu]: 5gc/upf_u/
 [license]: LICENSE
 [dpdk]: http://dpdk.org
 [docker]: https://www.docker.com/

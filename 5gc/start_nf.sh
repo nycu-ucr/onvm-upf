@@ -23,15 +23,24 @@ NF_NAME=$1
 NF_PATH=$SCRIPTPATH/$NF_NAME
 # For NFD NF
 NF_NAME=${NF_PATH##*/}
-BINARY=$NF_PATH/build/app/$NF_NAME
+BINARY_DIR=$NF_PATH/build/app
+BINARY=$BINARY_DIR/$NF_NAME
 DPDK_BASE_ARGS="-n 3 --proc-type=secondary"
 # For simple mode, only used for initial dpdk startup
 DEFAULT_CORE_ID=0
 
 if [ ! -f "$BINARY" ]; then
-  echo "ERROR: NF executable not found, $BINARY doesn't exist"
-  echo "Please verify NF binary name and run script from the NF folder"
-  exit 1
+  ALT_BINARY=$BINARY_DIR/${NF_NAME}_complete
+
+  if [ -f "$ALT_BINARY" ]; then
+    BINARY=$ALT_BINARY
+  else
+    echo "ERROR: NF executable not found. Tried:"
+    echo "  $BINARY"
+    echo "  $ALT_BINARY"
+    echo "Please verify NF binary name and run script from the NF folder"
+    exit 1
+  fi
 fi
 
 shift 1

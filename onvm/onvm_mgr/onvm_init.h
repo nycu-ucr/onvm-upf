@@ -88,8 +88,8 @@
 #define NF_MSG_SIZE sizeof(struct onvm_nf_msg)
 #define NF_MSG_CACHE_SIZE 8
 
-#define RTE_MP_RX_DESC_DEFAULT 1024
-#define RTE_MP_TX_DESC_DEFAULT 1024
+#define RTE_MP_RX_DESC_DEFAULT 512
+#define RTE_MP_TX_DESC_DEFAULT 512
 #define NF_MSG_QUEUE_SIZE 128
 
 #define NO_FLAGS 0
@@ -109,6 +109,7 @@ extern struct port_info *ports;
 extern struct core_status *cores;
 
 extern struct rte_mempool *pktmbuf_pool;
+extern struct rte_mempool *cp_pktmbuf_pool;
 extern struct rte_mempool *nf_msg_pool;
 extern uint16_t num_nfs;
 extern uint16_t num_services;

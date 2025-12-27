@@ -42,6 +42,7 @@
 #ifndef _ONVM_COMMON_H_
 #define _ONVM_COMMON_H_
 
+#include <stdbool.h>
 #include <stdint.h>
 
 /* Std C library includes for shared core */
@@ -70,7 +71,7 @@
 #define MAX_SERVICES 32          // total number of unique services allowed
 #define MAX_NFS_PER_SERVICE 32   // max number of NFs per service.
 
-#define NUM_MBUFS 262144          // total number of mbufs (2^15 - 1)
+#define NUM_MBUFS 32767          // total number of mbufs (2^15 - 1)
 #define NF_QUEUE_RINGSIZE 65536  // size of queue for NFs
 
 #define PACKET_READ_SIZE ((uint16_t)32)
@@ -276,6 +277,7 @@ struct onvm_nf {
         uint16_t instance_id;
         uint16_t service_id;
         uint8_t status;
+        bool timeout_flag;
         char *tag;
         /* Pointer to NF defined state data */
         void *data;
@@ -386,6 +388,7 @@ struct ft_request {
 #define MP_NF_TXQ_NAME "MProc_Client_%u_TX"
 #define MP_CLIENT_SEM_NAME "MProc_Client_%u_SEM"
 #define PKTMBUF_POOL_NAME "MProc_pktmbuf_pool"
+#define CP_PKTMBUF_POOL_NAME "CP_MProc_pktmbuf_pool"
 #define MZ_PORT_INFO "MProc_port_info"
 #define MZ_CORES_STATUS "MProc_cores_info"
 #define MZ_NF_INFO "MProc_nf_init_cfg"

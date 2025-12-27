@@ -563,7 +563,7 @@ GetPdrByUeIpAddress(struct rte_mbuf *pkt, uint32_t ue_ip) { // dl
                 // new ft entry
                 key = pdr->pdi.flags.sdfFilter ? pkt->port + fd_target : pkt->port;
                 if (ftSearch(key) < 0 && qer->flags.maximumBitrate) {
-                    /* UTLT_Info("QER ID: %d key: %d", qerId, key);
+                    UTLT_Info("QER ID: %d key: %d", qerId, key);
                     struct rte_meter_trtcm_params trtcm_params = app_trtcm_params;
                     if (!ftAddEntry(key, trTCMidx)) {
                         UTLT_Warning("FT add failed");
@@ -584,7 +584,7 @@ GetPdrByUeIpAddress(struct rte_mbuf *pkt, uint32_t ue_ip) { // dl
                     }
                     // config trtcm table 
                     UTLT_Info("TRTCM params: %d %d %d %d\n", trtcm_params.cir, trtcm_params.pir, trtcm_params.cbs, trtcm_params.pbs);
-                    trTCMidx ++; */
+                    trTCMidx ++;
                 }
             }
         }
@@ -679,7 +679,7 @@ GetPdrByTeid(struct rte_mbuf *pkt, uint32_t td) {
     if (pdr) {
         seid = session->smfSeid;
         pdrId = pdr->pdrId;
-        /* for (int i=0; i<2; i++){
+        for (int i=0; i<2; i++){
             if (!pdr->qerId[i]) continue;
             UpfQER *qer = NULL;
             uint32_t key = 0, qerId = pdr->qerId[i];
@@ -713,7 +713,7 @@ GetPdrByTeid(struct rte_mbuf *pkt, uint32_t td) {
                     trTCMidx ++;
                 }
             }
-        } */
+        }
     }
     return pdr;
 }
@@ -892,9 +892,8 @@ packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm_nf_
         // UTLT_Info("It is downlink, dst is %d\n", rte_cpu_to_be_32(iph->dst_addr));
         UTLT_Info("It is downlink, dst is %s\n", convertToIpAddress(iph->dst_addr));
 
-        struct timespec ts;
-        timespec_get(&ts, TIME_UTC);
-        // UTLT_Info("(%d) Time: %ld.%09ld\n", rte_cpu_to_be_32(iph->dst_addr), ts.tv_sec, ts.tv_nsec);
+        //struct timespec ts;
+        //timespec_get(&ts, TIME_UTC);
         UTLT_Info("(%s) Time: %ld.%09ld\n", convertToIpAddress(iph->dst_addr), ts.tv_sec, ts.tv_nsec);
         //  Step 2: Get PDR rule
         pdr = GetPdrByUeIpAddress(pkt, rte_cpu_to_be_32(iph->dst_addr));
@@ -954,7 +953,7 @@ packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm_nf_
         UTLT_Trace("Action is unknown\n");
     }
     AttachL2Header(pkt, is_dl);
-    upf_print_port_stats_periodic();
+    // upf_print_port_stats_periodic();
     return 0;
     if (meta->action == ONVM_NF_ACTION_OUT && is_dl) {
         // check if the UE IP exists in the table and update the token
@@ -1143,8 +1142,8 @@ main(int argc, char *argv[]) {
     dn_eth.addr_bytes[5] = DnMac[5];
 
     // trTCM
-    //trtcmConfigFlowTables();
-    // initUeTable();
+    trtcmConfigFlowTables();
+    initUeTable();
 
     UpfSessionPoolInit();
     UeIpToUpfSessionMapInit();
