@@ -52,6 +52,20 @@
 
 #include "upf_u_config.h"
 
+#ifndef UPF_U_FASTPATH_LOG
+#define UPF_U_FASTPATH_LOG 0
+#endif
+
+#if UPF_U_FASTPATH_LOG
+#define FP_LOGT(...) UTLT_Trace(__VA_ARGS__)
+#define FP_LOGD(...) UTLT_Debug(__VA_ARGS__)
+#define FP_LOGI(...) UTLT_Info(__VA_ARGS__)
+#else
+#define FP_LOGT(...) do { if (0) UTLT_Trace(__VA_ARGS__); } while (0)
+#define FP_LOGD(...) do { if (0) UTLT_Debug(__VA_ARGS__); } while (0)
+#define FP_LOGI(...) do { if (0) UTLT_Info(__VA_ARGS__); } while (0)
+#endif
+
 #define NF_TAG "upf_u"
 
 // #if 0
@@ -208,7 +222,7 @@ static inline uint16_t UpfClassifyGetPdrId(const ps_packet_t *key) {
 
     // logging block
     void *engine = *(void**)snap;
-    UTLT_Debug("CLS classify: snap=%p engine=%p ver=%u", (void*)snap, engine, g_cls_local.ver);
+    FP_LOGD("CLS classify: snap=%p engine=%p ver=%u", (void*)snap, engine, g_cls_local.ver);
 
     uint32_t  precedence = 0;
     uintptr_t pdrId     = 0;
@@ -339,7 +353,7 @@ ConfigureQerFlows(UpfSession *session,
             }
 
             if (qer->flags.maximumBitrate) {
-                UTLT_Info("QER ID: %u key: %u", qerId, key);
+                FP_LOGI("QER ID: %u key: %u", qerId, key);
             } */
 
             // only add on miss, and only if MBR exists
@@ -361,7 +375,7 @@ ConfigureQerFlows(UpfSession *session,
                 if (!ftAddEntry(key, trTCMidx)) {
                     UTLT_Warning("FT add failed");
                 }
-                UTLT_Info("Successfully add %u(%d) %u", key, hashFunc(key), trTCMidx);
+                FP_LOGI("Successfully add %u(%d) %u", key, hashFunc(key), trTCMidx);
 
                 // Match config profile to what color-check later uses:
                 // DL + SDF present → app_flow_trtcm_profile; else app_trtcm_profile
@@ -374,18 +388,18 @@ ConfigureQerFlows(UpfSession *session,
                 }
 
                 if (is_uplink) {
-                    UTLT_Info("Find MBR (UL: %lu) in QERs", qer->maximumBitrate.ul);
+                    FP_LOGI("Find MBR (UL: %lu) in QERs", qer->maximumBitrate.ul);
                     if (qer->flags.guaranteedBitrate)
-                        UTLT_Info("Find GBR (UL: %lu) in QERs", qer->guaranteedBitrate.ul);
+                        FP_LOGI("Find GBR (UL: %lu) in QERs", qer->guaranteedBitrate.ul);
                 } else {
-                    UTLT_Info("Find MBR (DL: %lu) in QERs", qer->maximumBitrate.dl);
+                    FP_LOGI("Find MBR (DL: %lu) in QERs", qer->maximumBitrate.dl);
                     if (qer->flags.guaranteedBitrate)
-                        UTLT_Info("Find GBR (DL: %lu) in QERs", qer->guaranteedBitrate.dl);
+                        FP_LOGI("Find GBR (DL: %lu) in QERs", qer->guaranteedBitrate.dl);
                 }
 
-                UTLT_Info("TRTCM params: %d %d %d %d\n",
-                          trtcm_params.cir, trtcm_params.pir,
-                          trtcm_params.cbs, trtcm_params.pbs);
+                FP_LOGI("TRTCM params: %d %d %d %d\n",
+                         trtcm_params.cir, trtcm_params.pir,
+                         trtcm_params.cbs, trtcm_params.pbs);
 
                 trTCMidx++;
             }
@@ -467,11 +481,11 @@ trtcmColorHandle(uint32_t pkt_len, uint64_t time, uint8_t qfi, struct rte_meter_
     uint8_t out_color = 0;
     // check configured flow
     if (unlikely(app_trtcm_profile.cir_period == 0)){
-        UTLT_Info("flow cir_period set err");
+        FP_LOGI("flow cir_period set err");
         return -1;
     }
     if (unlikely(app_trtcm_profile.pir_period == 0)) {
-        UTLT_Info("flow pir_period set err");    
+        FP_LOGI("flow pir_period set err");
         return -1;
     }
     out_color = (uint8_t) rte_meter_trtcm_color_blind_check(&app_flows[qfi], 
@@ -485,22 +499,22 @@ static inline int
 trtcmPolicer(struct onvm_pkt_meta *meta, int color_result){
     if (meta->action == ONVM_NF_ACTION_DROP) {
         meta->flags = RTE_COLOR_RED;
-        UTLT_Info("TB not enough & traffic flow");
+        FP_LOGI("TB not enough & traffic flow");
         return 0;
     }
     switch (color_result){
     case RTE_COLOR_RED:
-        UTLT_Info("\033[0;31mRED(%d)\033[0m, drop pkt", RTE_COLOR_RED);
+        FP_LOGI("\033[0;31mRED(%d)\033[0m, drop pkt", RTE_COLOR_RED);
         meta->flags = RTE_COLOR_RED;
         meta->action = ONVM_NF_ACTION_DROP;
         break;
     case RTE_COLOR_YELLOW:
-        UTLT_Info("\033[0;32mYELLOW(%d)\033[0m, best effort pkt fwd", RTE_COLOR_YELLOW);
+        FP_LOGI("\033[0;32mYELLOW(%d)\033[0m, best effort pkt fwd", RTE_COLOR_YELLOW);
         meta->flags = RTE_COLOR_YELLOW;
         meta->action = ONVM_NF_ACTION_DROP;
         break;
     case RTE_COLOR_GREEN:
-        UTLT_Info("\033[0;33mGREEEN(%d)\033[0m, guaranted pkt fwd.", RTE_COLOR_GREEN);
+        FP_LOGI("\033[0;33mGREEEN(%d)\033[0m, guaranted pkt fwd.", RTE_COLOR_GREEN);
         meta->flags = RTE_COLOR_GREEN;
         meta->action = ONVM_NF_ACTION_OUT;
         break;
@@ -611,7 +625,7 @@ addEntrybyUeIp(uint32_t ue_ip, uint32_t ue_ambr, uint32_t ue_gbr,uint32_t ue_mbr
             ue_table[i].ue_qos_tb_params.tb_tokens = qos_rate;
             ue_table[i].ue_qos_tb_params.last_cycle = rte_get_tsc_cycles();
             ue_table[i].ue_qos_tb_params.cur_cycles = rte_get_tsc_cycles(); 
-            UTLT_Info("QoS Rate: %d", qos_rate);
+            FP_LOGI("QoS Rate: %d", qos_rate);
 
             uint32_t nqos_rate = ue_ambr - qos_rate;
 
@@ -620,7 +634,7 @@ addEntrybyUeIp(uint32_t ue_ip, uint32_t ue_ambr, uint32_t ue_gbr,uint32_t ue_mbr
             ue_table[i].ue_nqos_tb_params.tb_tokens = nqos_rate;
             ue_table[i].ue_nqos_tb_params.last_cycle = rte_get_tsc_cycles();
             ue_table[i].ue_nqos_tb_params.cur_cycles = rte_get_tsc_cycles();
-            UTLT_Info("non QoS Rate: %d", nqos_rate); 
+            FP_LOGI("non QoS Rate: %d", nqos_rate);
 
 
             break;
@@ -766,10 +780,10 @@ UPDK_PDR *GetPdrByTeid(struct rte_mbuf *pkt, uint32_t td) {
     // Outer IPv4
     struct rte_ipv4_hdr *outer4 = onvm_pkt_ipv4_hdr(pkt);
     if (!outer4) return NULL;
-    UTLT_Debug("Outer IPv4 src=%s dst=%s totlen=%u",
-               ip4_to_buf(outer4->src_addr, o_src),
-               ip4_to_buf(outer4->dst_addr, o_dst),
-               data_len);
+    FP_LOGD("Outer IPv4 src=%s dst=%s totlen=%u",
+            ip4_to_buf(outer4->src_addr, o_src),
+            ip4_to_buf(outer4->dst_addr, o_dst),
+            data_len);
 
     // Outer UDP
     struct rte_udp_hdr *outerU = onvm_pkt_udp_hdr(pkt);
@@ -778,12 +792,12 @@ UPDK_PDR *GetPdrByTeid(struct rte_mbuf *pkt, uint32_t td) {
 
     // TEID extraction
     uint32_t teid = get_teid_gtp_packet(pkt, outerU);
-    UTLT_Debug("Extracted TEID (host order): %u", teid);
+    FP_LOGD("Extracted TEID (host order): %u", teid);
 
     // GTP-U header length + QFI
     uint8_t qfi = 0;
     uint16_t payload_offset = get_gtpu_header_len_with_qfi(pkt, &qfi);
-    UTLT_Debug("Computed GTP-U payload_offset=%u QFI=%u", payload_offset, qfi);
+    FP_LOGD("Computed GTP-U payload_offset=%u QFI=%u", payload_offset, qfi);
 
     // Base pointer to GTP header
     uint8_t *base = rte_pktmbuf_mtod(pkt, uint8_t *) +
@@ -799,15 +813,15 @@ UPDK_PDR *GetPdrByTeid(struct rte_mbuf *pkt, uint32_t td) {
     uint8_t *inner_ptr = base + payload_offset;
 
     if ((inner_ptr[0] >> 4) != 4 || (inner_ptr[0] & 0x0F) < 5) {
-        UTLT_Info("Non-IPv4 start at offset %u (0x%02x), scanning for IPv4...",
-                     payload_offset, inner_ptr[0]);
+        FP_LOGI("Non-IPv4 start at offset %u (0x%02x), scanning for IPv4...",
+                payload_offset, inner_ptr[0]);
         int found = 0;
         for (int delta = -4; delta <= 4; delta++) {
             if ((int)payload_offset + delta < 0) continue;
             uint8_t *cand = base + payload_offset + delta;
             if ((cand[0] >> 4) == 4 && (cand[0] & 0x0F) >= 5) {
-                UTLT_Info("Adjusted payload_offset from %u to %u",
-                             payload_offset, payload_offset + delta);
+                FP_LOGI("Adjusted payload_offset from %u to %u",
+                        payload_offset, payload_offset + delta);
                 payload_offset += delta;
                 inner_ptr = cand;
                 found = 1;
@@ -831,10 +845,10 @@ UPDK_PDR *GetPdrByTeid(struct rte_mbuf *pkt, uint32_t td) {
         return NULL;
     struct rte_udp_hdr *innerU = (struct rte_udp_hdr *)(inner_ptr + inner_ihl);
 
-    UTLT_Debug("Inner IPv4 src=%s dst=%s proto=%u QFI=%u",
-               ip4_to_buf(inner4->src_addr, i_src),
-               ip4_to_buf(inner4->dst_addr, i_dst),
-               inner4->next_proto_id, qfi);
+    FP_LOGD("Inner IPv4 src=%s dst=%s proto=%u QFI=%u",
+            ip4_to_buf(inner4->src_addr, i_src),
+            ip4_to_buf(inner4->dst_addr, i_dst),
+            inner4->next_proto_id, qfi);
 
     // Build classifier key
     ps_packet_t key = {0};
@@ -942,7 +956,7 @@ GetQerByUEIpAddress(uint32_t ue_ip, char *IP) {
         }
     }
     else {
-        UTLT_Trace("The UE IP already exists in the table");
+        FP_LOGT("The UE IP already exists in the table");
         return NULL;
     }
 }
@@ -1048,7 +1062,7 @@ HandlePacketWithFar(struct rte_mbuf *pkt, UPDK_FAR *far, UPDK_QER *qer, struct o
             msg->seid = seid;
             msg->pdrId = pdrId;
             */
-            UTLT_Debug("Send to upf-c, namely service id is 2\n");
+            FP_LOGD("Send to upf-c, namely service id is 2\n");
             onvm_nflib_send_msg_to_nf(2, msg);
         }
         if (far->applyAction & UPDK_FAR_APPLY_ACTION_DUPL) {
@@ -1088,8 +1102,8 @@ packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm_nf_
         return 0;
     }
     uint32_t cal_pktlen = 0;
-    UTLT_Trace("Get packet\n");
-    UTLT_Info("Handle PKT from port: %d [len: %d]", pkt->port, pkt->pkt_len);
+    FP_LOGT("Get packet\n");
+    FP_LOGI("Handle PKT from port: %d [len: %d]", pkt->port, pkt->pkt_len);
     cal_pktlen = pkt->pkt_len - sizeof(struct rte_ether_hdr) - sizeof(struct rte_ipv4_hdr) - sizeof(struct rte_udp_hdr);
 
     bool is_dl = false;
@@ -1097,7 +1111,7 @@ packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm_nf_
     struct rte_ipv4_hdr *iph = onvm_pkt_ipv4_hdr(pkt);
 
     if (iph == NULL) {
-        UTLT_Info("Not IP packet, ignore it\n");
+        FP_LOGI("Not IP packet, ignore it\n");
         return 0;
     }
 
@@ -1106,13 +1120,11 @@ packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm_nf_
 
     UPDK_PDR *pdr = NULL;
 
-    char *src_address = convertToIpAddress(iph->src_addr);
-    UTLT_Info("Src IP is %s\n", src_address);
-    char *dst_address = convertToIpAddress(iph->dst_addr);
-    UTLT_Info("Dst IP is %s\n", dst_address);
+    FP_LOGI("Src IP is %s\n", convertToIpAddress(iph->src_addr));
+    FP_LOGI("Dst IP is %s\n", convertToIpAddress(iph->dst_addr));
 
     if (iph->dst_addr == SELF_IP) {  //
-        UTLT_Info("It is uplink\n");
+        FP_LOGI("It is uplink\n");
 
         struct rte_udp_hdr *udp_header = onvm_pkt_udp_hdr(pkt);
         if (udp_header == NULL) {
@@ -1125,7 +1137,7 @@ packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm_nf_
         pdr = GetPdrByTeid(pkt, teid);
 
     } else {
-        UTLT_Info("It is downlink, dst is %s\n", convertToIpAddress(iph->dst_addr));
+        FP_LOGI("It is downlink, dst is %s\n", convertToIpAddress(iph->dst_addr));
         pdr = GetPdrByUeIpAddress(pkt, rte_cpu_to_be_32(iph->dst_addr));
         GetQerByUEIpAddress(rte_cpu_to_be_32(iph->dst_addr), convertToIpAddress(iph->dst_addr));
         is_dl = true;
@@ -1136,7 +1148,7 @@ packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm_nf_
         // TODO(vivek): what to do?
         return 0;
     }
-    UTLT_Info("Got PDR ID is %u\n", pdr->pdrId);
+    FP_LOGI("Got PDR ID is %u\n", pdr->pdrId);
     rte_pktmbuf_adj(pkt, sizeof(struct rte_ether_hdr));
 
     UPDK_FAR *far;
@@ -1175,18 +1187,18 @@ packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm_nf_
     int status = 0, color_result = 0;
     status = HandlePacketWithFar(pkt, far, pdr->qer, meta);
     if (meta->action == ONVM_NF_ACTION_DROP) {
-        UTLT_Info("Action is drop\n");
+        FP_LOGI("Action is drop\n");
     } else if (meta->action == ONVM_NF_ACTION_OUT) {
-        UTLT_Info("Action is out\n");
+        FP_LOGI("Action is out\n");
     } else {
-        UTLT_Trace("Action is unknown\n");
+        FP_LOGT("Action is unknown\n");
     }
     AttachL2Header(pkt, is_dl);
     if (meta->action == ONVM_NF_ACTION_OUT && is_dl) {
         // check if the UE IP exists in the table and update the token
         int index = findIndexByUeIpAddress(rte_cpu_to_be_32(iph->dst_addr));
         if (index != -1) {
-            UTLT_Trace("Update token for UE IP: %s", convertToIpAddress(iph->dst_addr));
+            FP_LOGT("Update token for UE IP: %s", convertToIpAddress(iph->dst_addr));
             updateTokenbyIndex(index);
         }
         else {
