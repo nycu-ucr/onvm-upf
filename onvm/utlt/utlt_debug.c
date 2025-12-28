@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <errno.h>
 #include <string.h>
+#include <strings.h>
 #include <stdarg.h>
 
 #include "logger.h"
@@ -12,8 +13,29 @@
 #define MAX_SIZE_OF_BUFFER 32768
 
 unsigned int reportCaller = 0;
+/* Fast-path log filter (avoids formatting when message would be dropped).
+ * Default = most verbose to preserve historical behavior until UTLT_SetLogLevel is called. */
+static int g_utlt_min_level = LOG_TRACE;
+
+static inline int
+utlt_parse_level(const char *level) {
+    if (level == NULL) return -1;
+    if (strcasecmp(level, "panic") == 0)   return LOG_PANIC;
+    if (strcasecmp(level, "fatal") == 0)   return LOG_FATAL;
+    if (strcasecmp(level, "error") == 0)   return LOG_ERROR;
+    if (strcasecmp(level, "warning") == 0) return LOG_WARNING;
+    if (strcasecmp(level, "warn") == 0)    return LOG_WARNING;
+    if (strcasecmp(level, "info") == 0)    return LOG_INFO;
+    if (strcasecmp(level, "debug") == 0)   return LOG_DEBUG;
+    if (strcasecmp(level, "trace") == 0)   return LOG_TRACE;
+    return -1;
+}
 
 Status UTLT_SetLogLevel(const char *level) {
+    int parsed = utlt_parse_level(level);
+    if (parsed >= 0) {
+        __atomic_store_n(&g_utlt_min_level, parsed, __ATOMIC_RELEASE);
+    }
     if (UpfUtilLog_SetLogLevel(UTLT_CStr2GoStr(level)))
         return STATUS_OK;
     else
@@ -33,6 +55,11 @@ Status UTLT_SetReportCaller(unsigned int flag) {
 int UTLT_LogPrint(int level, const char *filename, const int line, 
                   const char *funcname, const char *fmt, ...) {
     static char buffer[MAX_SIZE_OF_BUFFER];
+
+    const int min_level = __atomic_load_n(&g_utlt_min_level, __ATOMIC_ACQUIRE);
+    if (level > min_level) {
+        return STATUS_OK;
+    }
 
     unsigned int cnt = 0, vspCnt = 0;
     if (reportCaller == REPORTCALLER_TRUE) {
