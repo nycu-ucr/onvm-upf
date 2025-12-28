@@ -251,6 +251,100 @@ static inline const UPDK_PDR *UpfClassifyGetPdrPtr(const ps_packet_t *key) {
     return (const UPDK_PDR *)descriptor;
 }
 
+static inline bool
+UpfPdrFastPathEligible(const UPDK_PDR *pdr, bool is_uplink) {
+    const UPDK_PDI *pdi = &pdr->pdi;
+
+    if (pdi->flags.trafficEndpointId ||
+        pdi->flags.applicationId ||
+        pdi->flags.ethernetPduSessionInformation ||
+        pdi->flags.ethernetPacketFilter ||
+        pdi->flags.qfi ||
+        pdi->flags.framedRoute ||
+        pdi->flags.framedRouting ||
+        pdi->flags.framedIpv6Route) {
+        return false;
+    }
+
+    if (pdi->flags.sdfFilter) {
+        const UPDK_SDFFilter *sdf = &pdi->sdfFilter;
+        if (sdf->flags.ttc || sdf->flags.spi || sdf->flags.fl || sdf->flags.bid)
+            return false;
+        if (sdf->flags.fd) {
+            const char *desc = sdf->flowDescription;
+            if (!desc || !strstr(desc, "from any") || !strstr(desc, "to assigned"))
+                return false;
+        }
+    }
+
+    if (pdi->flags.sourceInterface) {
+        if (is_uplink && pdi->sourceInterface != SRC_IF_ACCESS)
+            return false;
+        if (!is_uplink && pdi->sourceInterface != SRC_IF_CORE)
+            return false;
+    } else if (is_uplink) {
+        return false; /* classifier treats missing SourceInterface as CORE */
+    }
+
+    return true;
+}
+
+static inline const UPDK_PDR *
+UpfFastPathPdrByTeid(uint32_t teid, UpfSession **out_session) {
+    UpfSession *session = UpfSessionFindByTeid(teid);
+    if (!session || !session->pdr_list) return NULL;
+
+    const UPDK_PDR *best = NULL;
+    uint32_t best_prec = UINT32_MAX;
+
+    for (list_node_t *node = session->pdr_list->head; node; node = node->next) {
+        const UPDK_PDR *pdr = (const UPDK_PDR *)node->val;
+        if (!pdr) continue;
+        if (!pdr->pdi.flags.fTeid) continue;
+        if (!pdr->pdi.fTeid.flags.v4) continue;
+        if (pdr->pdi.fTeid.teid != teid) continue;
+        if (!UpfPdrFastPathEligible(pdr, true)) continue;
+
+        if (pdr->precedence < best_prec) {
+            best = pdr;
+            best_prec = pdr->precedence;
+        }
+    }
+
+    if (best && out_session)
+        *out_session = session;
+
+    return best;
+}
+
+static inline const UPDK_PDR *
+UpfFastPathPdrByUeIp(uint32_t ue_ip, UpfSession **out_session) {
+    UpfSession *session = UpfSessionFindByUeIP(ue_ip);
+    if (!session || !session->pdr_list) return NULL;
+
+    const UPDK_PDR *best = NULL;
+    uint32_t best_prec = UINT32_MAX;
+
+    for (list_node_t *node = session->pdr_list->head; node; node = node->next) {
+        const UPDK_PDR *pdr = (const UPDK_PDR *)node->val;
+        if (!pdr) continue;
+        if (!pdr->pdi.flags.ueIpAddress) continue;
+        if (!pdr->pdi.ueIpAddress.flags.v4) continue;
+        if (rte_be_to_cpu_32(pdr->pdi.ueIpAddress.ipv4.s_addr) != ue_ip) continue;
+        if (!UpfPdrFastPathEligible(pdr, false)) continue;
+
+        if (pdr->precedence < best_prec) {
+            best = pdr;
+            best_prec = pdr->precedence;
+        }
+    }
+
+    if (best && out_session)
+        *out_session = session;
+
+    return best;
+}
+
 
 
 bool ftAddEntry(uint32_t subnet, int flow_idx) {
@@ -691,6 +785,15 @@ GetPdrByUeIpAddress(struct rte_mbuf *pkt, uint32_t ue_ip)
     if (!outer4) return NULL;
     struct rte_udp_hdr  *outerU = onvm_pkt_udp_hdr(pkt);
 
+    UpfSession *fp_session = NULL;
+    const UPDK_PDR *fp_pdr = UpfFastPathPdrByUeIp(ue_ip, &fp_session);
+    if (fp_pdr) {
+#if UPF_U_ENABLE_QOS
+        ConfigureQerFlows(fp_session, fp_pdr, pkt->port, false);
+#endif
+        return fp_pdr;
+    }
+
     key.src_ip = rte_be_to_cpu_32(outer4->src_addr);
     key.dst_ip = rte_be_to_cpu_32(outer4->dst_addr);
     key.tos_tc = outer4->type_of_service;
@@ -799,6 +902,15 @@ UPDK_PDR *GetPdrByTeid(struct rte_mbuf *pkt, uint32_t td) {
     // TEID extraction
     uint32_t teid = get_teid_gtp_packet(pkt, outerU);
     FP_LOGD("Extracted TEID (host order): %u", teid);
+
+    UpfSession *fp_session = NULL;
+    const UPDK_PDR *fp_pdr = UpfFastPathPdrByTeid(teid, &fp_session);
+    if (fp_pdr) {
+#if UPF_U_ENABLE_QOS
+        ConfigureQerFlows(fp_session, fp_pdr, pkt->port, true);
+#endif
+        return (UPDK_PDR *)fp_pdr;
+    }
 
     // GTP-U header length + QFI
     uint8_t qfi = 0;
