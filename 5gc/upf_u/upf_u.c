@@ -1014,7 +1014,6 @@ Encap(struct rte_mbuf *pkt, UPDK_FAR *far, UPDK_QER *qer) {
                IPPROTO_UDP);
     ipv4_hdr->total_length = rte_cpu_to_be_16(payloadLen + sizeof(gtpv1_t) + sizeof(struct rte_udp_hdr) +
                           sizeof(struct rte_ipv4_hdr));  // raw+gtp8+udp8+ip20
-    ipv4_hdr->hdr_checksum = rte_ipv4_cksum(ipv4_hdr);
 }
 
 static int
@@ -1102,6 +1101,14 @@ AttachL2Header(struct rte_mbuf *pkt, bool is_dl) {
     }
 
     eth_hdr->ether_type = rte_cpu_to_be_16(RTE_ETHER_TYPE_IPV4);
+}
+
+static inline void
+UpfSetChecksumsForPort(struct rte_mbuf *pkt, uint16_t port) {
+    uint16_t orig_port = pkt->port;
+    pkt->port = port;
+    onvm_pkt_set_checksums(pkt);
+    pkt->port = orig_port;
 }
 
 static int
@@ -1206,6 +1213,9 @@ packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm_nf_
         FP_LOGT("Action is unknown\n");
     }
     AttachL2Header(pkt, is_dl);
+    if (meta->action == ONVM_NF_ACTION_OUT) {
+        UpfSetChecksumsForPort(pkt, meta->destination);
+    }
 #if UPF_U_ENABLE_QOS
     if (meta->action == ONVM_NF_ACTION_OUT && is_dl) {
         const uint32_t cal_pktlen =
