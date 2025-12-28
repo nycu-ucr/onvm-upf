@@ -56,6 +56,10 @@
 #define UPF_U_FASTPATH_LOG 0
 #endif
 
+#ifndef UPF_U_ENABLE_QOS
+#define UPF_U_ENABLE_QOS 0
+#endif
+
 #if UPF_U_FASTPATH_LOG
 #define FP_LOGT(...) UTLT_Trace(__VA_ARGS__)
 #define FP_LOGD(...) UTLT_Debug(__VA_ARGS__)
@@ -753,7 +757,9 @@ GetPdrByUeIpAddress(struct rte_mbuf *pkt, uint32_t ue_ip)
 
     UpfSession *session = UpfSessionFindByUeIP(ue_ip);
     if (session) {
+#if UPF_U_ENABLE_QOS
         ConfigureQerFlows(session, pdr, pkt->port, false);
+#endif
     }
     return pdr;
 }
@@ -912,7 +918,9 @@ UPDK_PDR *GetPdrByTeid(struct rte_mbuf *pkt, uint32_t td) {
 
     UpfSession *session = UpfSessionFindByTeid(td);
     if (session) {
+#if UPF_U_ENABLE_QOS
         ConfigureQerFlows(session, pdr, pkt->port, true);
+#endif
     }
 
     return pdr;
@@ -1101,10 +1109,8 @@ packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm_nf_
     if (pkt == NULL || meta == NULL) {
         return 0;
     }
-    uint32_t cal_pktlen = 0;
     FP_LOGT("Get packet\n");
     FP_LOGI("Handle PKT from port: %d [len: %d]", pkt->port, pkt->pkt_len);
-    cal_pktlen = pkt->pkt_len - sizeof(struct rte_ether_hdr) - sizeof(struct rte_ipv4_hdr) - sizeof(struct rte_udp_hdr);
 
     bool is_dl = false;
     meta->action = ONVM_NF_ACTION_DROP;
@@ -1139,7 +1145,9 @@ packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm_nf_
     } else {
         FP_LOGI("It is downlink, dst is %s\n", convertToIpAddress(iph->dst_addr));
         pdr = GetPdrByUeIpAddress(pkt, rte_cpu_to_be_32(iph->dst_addr));
+#if UPF_U_ENABLE_QOS
         GetQerByUEIpAddress(rte_cpu_to_be_32(iph->dst_addr), convertToIpAddress(iph->dst_addr));
+#endif
         is_dl = true;
     }
 
@@ -1184,8 +1192,12 @@ packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm_nf_
         }
     }
 
-    int status = 0, color_result = 0;
-    status = HandlePacketWithFar(pkt, far, pdr->qer, meta);
+    int status = 0;
+    UPDK_QER *qer = NULL;
+#if UPF_U_ENABLE_QOS
+    qer = pdr->qer;
+#endif
+    status = HandlePacketWithFar(pkt, far, qer, meta);
     if (meta->action == ONVM_NF_ACTION_DROP) {
         FP_LOGI("Action is drop\n");
     } else if (meta->action == ONVM_NF_ACTION_OUT) {
@@ -1194,7 +1206,11 @@ packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm_nf_
         FP_LOGT("Action is unknown\n");
     }
     AttachL2Header(pkt, is_dl);
+#if UPF_U_ENABLE_QOS
     if (meta->action == ONVM_NF_ACTION_OUT && is_dl) {
+        const uint32_t cal_pktlen =
+            pkt->pkt_len - sizeof(struct rte_ether_hdr) - sizeof(struct rte_ipv4_hdr) - sizeof(struct rte_udp_hdr);
+        int color_result = 0;
         // check if the UE IP exists in the table and update the token
         int index = findIndexByUeIpAddress(rte_cpu_to_be_32(iph->dst_addr));
         if (index != -1) {
@@ -1259,6 +1275,7 @@ packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm_nf_
             meta->action = ONVM_NF_ACTION_OUT;
         }
     }
+#endif
     return status;
 }
 
@@ -1402,9 +1419,11 @@ main(int argc, char *argv[]) {
     dn_eth.addr_bytes[4] = DnMac[4];
     dn_eth.addr_bytes[5] = DnMac[5];
 
-    // trTCM
+    // trTCM / QoS
+#if UPF_U_ENABLE_QOS
     trtcmConfigFlowTables();
     initUeTable();
+#endif
 
     UpfSessionPoolInit();
     UeIpToUpfSessionMapInit();
