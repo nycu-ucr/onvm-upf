@@ -1027,13 +1027,16 @@ onvm_nflib_dequeue_packets(void **pkts, struct onvm_nf_local_ctx *nf_local_ctx, 
                 ret_act = (*handler)((struct rte_mbuf *)pkts[i], meta, nf_local_ctx);
                 /* NF returns 0 to return packets or 1 to buffer */
                 if (likely(ret_act == 0)) {
+                        /* Compact returned packets to the front of pkts[] so callers
+                         * that use ONVM_NF_HANDLE_TX only process non-buffered pkts. */
+                        pkts[tx_buf.count] = pkts[i];
                         tx_buf.buffer[tx_buf.count++] = pkts[i];
                 } else {
                         nf->stats.tx_buffer++;
                 }
         }
         if (ONVM_NF_HANDLE_TX) {
-                return nb_pkts;
+                return tx_buf.count;
         }
 
         onvm_pkt_enqueue_tx_thread(&tx_buf, nf);
