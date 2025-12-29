@@ -90,8 +90,16 @@ static Rule to_cpp_rule(const pdr_t *in) {
     return R;
 }
 
-static Packet to_cpp_pkt(const ps_packet_t *p) {
-    Packet P(PDI_MAX_FLD);
+static inline Packet& packet_scratch(void) {
+    static thread_local Packet P;
+    if (P.size() != PDI_MAX_FLD) {
+        P.resize(PDI_MAX_FLD);
+    }
+    return P;
+}
+
+static inline const Packet& to_cpp_pkt(const ps_packet_t *p) {
+    Packet &P = packet_scratch();
     P[0]  = p->ue_ip;
     P[1]  = p->src_ip;
     P[2]  = p->dst_ip;
