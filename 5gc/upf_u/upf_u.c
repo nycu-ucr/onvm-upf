@@ -54,6 +54,24 @@
 
 #define NF_TAG "upf_u"
 
+/* Optional instrumentation: log packet_handler() timing (off by default).
+ * Enable with -DUPF_U_HANDLER_TIMING_LOG=1. */
+#ifndef UPF_U_HANDLER_TIMING_LOG
+#define UPF_U_HANDLER_TIMING_LOG 1
+#endif
+
+#if UPF_U_HANDLER_TIMING_LOG
+static uint64_t g_upf_u_timing_tsc_base = 0;
+static uint64_t g_upf_u_timing_tsc_hz = 0;
+static uint64_t g_upf_u_timing_sum_cycles = 0;
+static uint32_t g_upf_u_timing_count = 0;
+
+static inline uint64_t upf_u_cycles_to_us(uint64_t cycles) {
+    if (unlikely(g_upf_u_timing_tsc_hz == 0)) return 0;
+    return (uint64_t)(((__uint128_t)cycles * 1000000u) / g_upf_u_timing_tsc_hz);
+}
+#endif
+
 // #if 0
 // #define SELF_IP RTE_IPV4(10, 100, 200, 3)
 // #else
@@ -1087,6 +1105,27 @@ packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm_nf_
     if (pkt == NULL || meta == NULL) {
         return 0;
     }
+
+#if UPF_U_HANDLER_TIMING_LOG
+    const uint64_t t0_cycles = rte_get_tsc_cycles();
+#define UPF_U_HANDLER_LOG_AND_RETURN(rc) \
+    do { \
+        const uint64_t t1_cycles = rte_get_tsc_cycles(); \
+        const uint64_t dur_cycles = t1_cycles - t0_cycles; \
+        g_upf_u_timing_sum_cycles += dur_cycles; \
+        g_upf_u_timing_count++; \
+        if (g_upf_u_timing_count == 10) { \
+            const uint64_t avg_cycles = g_upf_u_timing_sum_cycles / 10u; \
+            const double avg_us = (double)avg_cycles * 1e6 / (double)g_upf_u_timing_tsc_hz; \
+            UTLT_Warning("[PKT_HANDLER_TIMING] avg_over_10 dur_us=%.2f", avg_us); \
+            g_upf_u_timing_sum_cycles = 0; \
+            g_upf_u_timing_count = 0; \
+        } \
+        return (rc); \
+    } while (0)
+#else
+#define UPF_U_HANDLER_LOG_AND_RETURN(rc) return (rc)
+#endif
     uint32_t cal_pktlen = 0;
     UTLT_Trace("Get packet\n");
     UTLT_Info("Handle PKT from port: %d [len: %d]", pkt->port, pkt->pkt_len);
@@ -1220,34 +1259,35 @@ packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm_nf_
         }
         
         // Step 2. bucket (QoS flow)
-        if (isQos) {
-            if (meta->flags == RTE_COLOR_RED) {
-                meta->action = ONVM_NF_ACTION_DROP;
-            }
-            if (meta->flags == RTE_COLOR_GREEN) {
-                ue_table[index].ue_qos_tb_params.tb_tokens -= cal_pktlen;
-                meta->action = ONVM_NF_ACTION_OUT;
-            }
-            if (meta->flags == RTE_COLOR_YELLOW) {
-                while (ue_table[index].ue_qos_tb_params.tb_tokens < cal_pktlen) {
-                    updateTokenbyIndex(index);
-                    usleep(1);
-                }
-                ue_table[index].ue_qos_tb_params.tb_tokens -= cal_pktlen;
-                meta->action = ONVM_NF_ACTION_OUT;      
-            }
+    if (isQos) {
+        if (meta->flags == RTE_COLOR_RED) {
+            meta->action = ONVM_NF_ACTION_DROP;
         }
-        // Step 2. bucket (non QoS flow)
-        else {
-            while (ue_table[index].ue_nqos_tb_params.tb_tokens < cal_pktlen) {
+        if (meta->flags == RTE_COLOR_GREEN) {
+            ue_table[index].ue_qos_tb_params.tb_tokens -= cal_pktlen;
+            meta->action = ONVM_NF_ACTION_OUT;
+        }
+        if (meta->flags == RTE_COLOR_YELLOW) {
+            while (ue_table[index].ue_qos_tb_params.tb_tokens < cal_pktlen) {
                 updateTokenbyIndex(index);
                 usleep(1);
             }
-            ue_table[index].ue_nqos_tb_params.tb_tokens -= cal_pktlen;
-            meta->action = ONVM_NF_ACTION_OUT;
+            ue_table[index].ue_qos_tb_params.tb_tokens -= cal_pktlen;
+            meta->action = ONVM_NF_ACTION_OUT;      
         }
     }
-    return status;
+    // Step 2. bucket (non QoS flow)
+    else {
+        while (ue_table[index].ue_nqos_tb_params.tb_tokens < cal_pktlen) {
+            updateTokenbyIndex(index);
+            usleep(1);
+        }
+        ue_table[index].ue_nqos_tb_params.tb_tokens -= cal_pktlen;
+        meta->action = ONVM_NF_ACTION_OUT;
+    }
+}
+
+    UPF_U_HANDLER_LOG_AND_RETURN(status);
 }
 
 void
@@ -1397,6 +1437,14 @@ main(int argc, char *argv[]) {
     UpfSessionPoolInit();
     UeIpToUpfSessionMapInit();
     TeidToUpfSessionMapInit();
+
+#if UPF_U_HANDLER_TIMING_LOG
+    g_upf_u_timing_tsc_hz = rte_get_timer_hz();
+    g_upf_u_timing_tsc_base = rte_get_tsc_cycles();
+    g_upf_u_timing_sum_cycles = 0;
+    g_upf_u_timing_count = 0;
+    UTLT_Warning("[PKT_HANDLER_TIMING] enabled (hz=%" PRIu64 ")", g_upf_u_timing_tsc_hz);
+#endif
 
     onvm_nflib_run(nf_local_ctx);
 
