@@ -63,7 +63,7 @@
 /* Optional instrumentation: log packet_handler() timing (off by default).
  * Enable with -DUPF_U_HANDLER_TIMING_LOG=1. */
 #ifndef UPF_U_HANDLER_TIMING_LOG
-#define UPF_U_HANDLER_TIMING_LOG 0
+#define UPF_U_HANDLER_TIMING_LOG 1
 #endif
 
 #if UPF_U_HANDLER_TIMING_LOG
@@ -1411,15 +1411,12 @@ packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm_nf_
     do { \
         const uint64_t t1_cycles = rte_get_tsc_cycles(); \
         const uint64_t dur_cycles = t1_cycles - t0_cycles; \
-        const uint64_t dur_us = upf_u_cycles_to_us(dur_cycles); \
         g_upf_u_timing_sum_cycles += dur_cycles; \
         g_upf_u_timing_count++; \
-        UTLT_Warning("[PKT_HANDLER_TIMING] dur_us=%" PRIu64 " action=%u", dur_us, \
-                     (unsigned)((meta) ? meta->action : 0)); \
         if (g_upf_u_timing_count == 10) { \
             const uint64_t avg_cycles = g_upf_u_timing_sum_cycles / 10u; \
-            const uint64_t avg_us = upf_u_cycles_to_us(avg_cycles); \
-            UTLT_Warning("[PKT_HANDLER_TIMING] avg_over_10 dur_us=%" PRIu64, avg_us); \
+            const double avg_us = (double)avg_cycles * 1e6 / (double)g_upf_u_timing_tsc_hz; \
+            UTLT_Warning("[PKT_HANDLER_TIMING] avg_over_10 dur_us=%.2f", avg_us); \
             g_upf_u_timing_sum_cycles = 0; \
             g_upf_u_timing_count = 0; \
         } \
