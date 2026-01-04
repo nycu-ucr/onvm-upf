@@ -60,6 +60,24 @@
 
 #define NF_TAG "upf_u"
 
+/* Optional instrumentation: log packet_handler() timing (off by default).
+ * Enable with -DUPF_U_HANDLER_TIMING_LOG=1. */
+#ifndef UPF_U_HANDLER_TIMING_LOG
+#define UPF_U_HANDLER_TIMING_LOG 0
+#endif
+
+#if UPF_U_HANDLER_TIMING_LOG
+static uint64_t g_upf_u_timing_tsc_base = 0;
+static uint64_t g_upf_u_timing_tsc_hz = 0;
+static uint64_t g_upf_u_timing_sum_cycles = 0;
+static uint32_t g_upf_u_timing_count = 0;
+
+static inline uint64_t upf_u_cycles_to_us(uint64_t cycles) {
+    if (unlikely(g_upf_u_timing_tsc_hz == 0)) return 0;
+    return (uint64_t)(((__uint128_t)cycles * 1000000u) / g_upf_u_timing_tsc_hz);
+}
+#endif
+
 // #if 0
 // #define SELF_IP RTE_IPV4(10, 100, 200, 3)
 // #else
@@ -1387,6 +1405,29 @@ packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm_nf_
     if (pkt == NULL || meta == NULL) {
             return 0;
     }
+#if UPF_U_HANDLER_TIMING_LOG
+    const uint64_t t0_cycles = rte_get_tsc_cycles();
+#define UPF_U_HANDLER_LOG_AND_RETURN(rc) \
+    do { \
+        const uint64_t t1_cycles = rte_get_tsc_cycles(); \
+        const uint64_t dur_cycles = t1_cycles - t0_cycles; \
+        const uint64_t dur_us = upf_u_cycles_to_us(dur_cycles); \
+        g_upf_u_timing_sum_cycles += dur_cycles; \
+        g_upf_u_timing_count++; \
+        UTLT_Warning("[PKT_HANDLER_TIMING] dur_us=%" PRIu64 " action=%u", dur_us, \
+                     (unsigned)((meta) ? meta->action : 0)); \
+        if (g_upf_u_timing_count == 10) { \
+            const uint64_t avg_cycles = g_upf_u_timing_sum_cycles / 10u; \
+            const uint64_t avg_us = upf_u_cycles_to_us(avg_cycles); \
+            UTLT_Warning("[PKT_HANDLER_TIMING] avg_over_10 dur_us=%" PRIu64, avg_us); \
+            g_upf_u_timing_sum_cycles = 0; \
+            g_upf_u_timing_count = 0; \
+        } \
+        return (rc); \
+    } while (0)
+#else
+#define UPF_U_HANDLER_LOG_AND_RETURN(rc) return (rc)
+#endif
 
     // uint32_t cal_pktlen = 0;
     //printf("Get packet\n");
@@ -1497,7 +1538,7 @@ packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm_nf_
     /* printf("[upf] id=%u m=%p %s len=%u l2=%u l3=%u data_off=%u ref=%u\n",
        pkt_id, (void *)pkt, is_dl ? "DL" : "UL", plen, pkt->l2_len, pkt->l3_len, pkt->data_off, rte_mbuf_refcnt_read(pkt)); */
 
-    return 0;
+    UPF_U_HANDLER_LOG_AND_RETURN(0);
 
 }
 
@@ -1965,6 +2006,14 @@ main(int argc, char *argv[]) {
     UpfSessionPoolInit();
     UeIpToUpfSessionMapInit();
     TeidToUpfSessionMapInit();
+
+#if UPF_U_HANDLER_TIMING_LOG
+    g_upf_u_timing_tsc_hz = rte_get_timer_hz();
+    g_upf_u_timing_tsc_base = rte_get_tsc_cycles();
+    g_upf_u_timing_sum_cycles = 0;
+    g_upf_u_timing_count = 0;
+    UTLT_Warning("[PKT_HANDLER_TIMING] enabled (hz=%" PRIu64 ")", g_upf_u_timing_tsc_hz);
+#endif
 
     onvm_nflib_run(nf_local_ctx);
 
