@@ -98,7 +98,7 @@ static inline uint64_t upf_u_cycles_to_us(uint64_t cycles) {
 #define IP_MASKED(BIGENDIINT, LEN) (BIGENDIINT & (0xFFFFFFFF << (32-LEN)))
 
 /* Temporary helper IP for the RAN side when faking GTP encapsulation */
-#define DEFAULT_ACCESS_NODE_IP RTE_IPV4(10, 60, 0, 1)
+#define DEFAULT_ACCESS_NODE_IP RTE_IPV4(192, 168, 1, 1)
 #define MAX_UE 256 // Max number of UEs
 #define MIN(x, y) (((x) < (y)) ? (x) : (y))
 #define MAX_OF_BUFFER_PACKET_SIZE 30000
@@ -1241,122 +1241,6 @@ do_stats_display(struct rte_mbuf *pkt) {
         printf("\n\n");
 }
 
-// static inline int
-// strip_uplink_gtp(struct rte_mbuf *pkt) {
-//     struct rte_ipv4_hdr *outer4 = rte_pktmbuf_mtod(pkt, struct rte_ipv4_hdr *);
-//     if (!outer4)
-//         return -1;
-
-//     uint16_t ip_hlen = (outer4->version_ihl & 0x0F) * 4;
-//     struct rte_udp_hdr *udp_hdr = rte_pktmbuf_mtod_offset(pkt, struct rte_udp_hdr *, ip_hlen);
-//     if (!udp_hdr || udp_hdr->dst_port != rte_cpu_to_be_16(UDP_PORT_FOR_GTP))
-//         return -1;
-
-//     uint16_t gtp_len = get_gtpu_header_len(pkt);
-//     uint16_t remove_len = ip_hlen + sizeof(struct rte_udp_hdr) + gtp_len;
-
-//     if (rte_pktmbuf_adj(pkt, remove_len) == NULL)
-//         return -1;
-//     return 0;
-// }
-
-// static inline int
-// encap_downlink_gtp(struct rte_mbuf *pkt, uint32_t ran_ip, uint32_t teid) {
-//     const uint16_t outer_len = sizeof(struct rte_ipv4_hdr) + sizeof(struct rte_udp_hdr) + sizeof(gtpv1_t);
-//     const uint16_t inner_len = rte_pktmbuf_pkt_len(pkt);
-
-//     struct rte_ipv4_hdr *outer4 = (struct rte_ipv4_hdr *)rte_pktmbuf_prepend(pkt, outer_len);
-//     if (!outer4)
-//         return -1;
-
-//     struct rte_udp_hdr *udp_hdr = (struct rte_udp_hdr *)((uint8_t *)outer4 + sizeof(struct rte_ipv4_hdr));
-//     gtpv1_t *gtp_hdr = (gtpv1_t *)((uint8_t *)udp_hdr + sizeof(struct rte_udp_hdr));
-//     memset(outer4, 0, outer_len);
-
-//     gtpv1_set_header(gtp_hdr, inner_len, teid);
-//     onvm_pkt_fill_udp(udp_hdr, UDP_PORT_FOR_GTP, UDP_PORT_FOR_GTP, inner_len + sizeof(gtpv1_t));
-
-//     onvm_pkt_fill_ipv4(outer4, SELF_IP, ran_ip, IPPROTO_UDP);
-//     outer4->total_length = rte_cpu_to_be_16(inner_len + outer_len);
-//     outer4->hdr_checksum = rte_ipv4_cksum(outer4);
-
-//     return 0;
-// }
-
-// static int
-// packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm_nf_local_ctx *nf_local_ctx) {
-
-//     struct rte_ether_hdr *eh = rte_pktmbuf_mtod(pkt, struct rte_ether_hdr*);
-//     // onvm_pkt_print_ether(eh);
-
-//     if (pkt == NULL || meta == NULL) {
-//             return 0;
-//     }
-
-//     bool is_dl = false;
-//     // uint32_t cal_pktlen = 0;
-//     //printf("Get packet\n");
-//     // printf("Handle PKT from port: %d\n", pkt->port);
-//     // cal_pktlen = pkt->pkt_len - sizeof(struct rte_ether_hdr) - sizeof(struct rte_ipv4_hdr) - sizeof(struct rte_udp_hdr);
-
-//     meta->action = ONVM_NF_ACTION_DROP;
-//     struct rte_ipv4_hdr *iph = onvm_pkt_ipv4_hdr(pkt);
-
-
-//     if (iph == NULL) {
-//         printf("Not IP packet, ignore it\n");
-//         return 0;
-//     }
-
-//     bool is_uplink = (iph->dst_addr == SELF_IP);
-
-//     // printf("Self IP is: %u\n", SELF_IP);
-
-//     if (rte_pktmbuf_adj(pkt, sizeof(struct rte_ether_hdr)) == NULL) {
-//         UTLT_Error("Failed to remove L2 header");
-//         return 0;
-//     }
-
-//     {
-//         char src_s[16], dst_s[16], line[128];
-//         int n = 0;
-
-//         snprintf(src_s, sizeof(src_s), "%s", convertToIpAddress(iph->src_addr));
-//         snprintf(dst_s, sizeof(dst_s), "%s", convertToIpAddress(iph->dst_addr));
-
-//         n = snprintf(line, sizeof(line), "Src IP is %s | Dst IP is %s\n", src_s, dst_s);
-//         if (n > 0 && n < (int)sizeof(line)) {
-//             (void)write(STDOUT_FILENO, line, (size_t)n);
-//         }
-//     }
-
-//     if (is_uplink) {
-//         if (strip_uplink_gtp(pkt) < 0)
-//             return 0;
-
-//         struct rte_ipv4_hdr *inner4 = rte_pktmbuf_mtod(pkt, struct rte_ipv4_hdr *);
-//         if (!inner4) return 0;
-
-//         meta->destination = g_core_port;
-//         AttachL2Header(pkt, false);   // false → use cn_dn_eth/dn_eth
-//         meta->action = ONVM_NF_ACTION_OUT;
-//         return 0;
-//     } else {
-//         if (encap_downlink_gtp(pkt, DEFAULT_ACCESS_NODE_IP, 0) < 0)
-//             return 0;
-
-//         meta->destination = g_access_port;
-//         AttachL2Header(pkt, true); 
-//         meta->action = ONVM_NF_ACTION_OUT;
-//         return 0;
-//     }
-
-
-//     return 0;
-
-// }
-
-
 
 /* Prepend IPv4/UDP/GTP-U headers around the current payload.
  * ran_ip = outer destination (RAN/gNB IP), teid = TEID to advertise.
@@ -1459,8 +1343,8 @@ packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm_nf_
 
     // printf("Self IP is: %u\n", SELF_IP);
 
- /*    printf("SELF_IP: %u\n", SELF_IP);
-    printf("dst_addr: %u\n", iph->dst_addr); */
+    //printf("SELF_IP: %u\n", SELF_IP);
+    //printf("dst_addr: %u\n", iph->dst_addr);
 
     if (iph->dst_addr == SELF_IP) {
 
@@ -1495,6 +1379,7 @@ packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm_nf_
 
         meta->destination = pkt->port ^ 1;
     } else {
+        //printf("inside downlink");
         is_dl = true;
         rte_pktmbuf_adj(pkt, (uint16_t)sizeof(struct rte_ether_hdr));
         if (encap_downlink_gtp(pkt, DEFAULT_ACCESS_NODE_IP, 1) < 0) {
