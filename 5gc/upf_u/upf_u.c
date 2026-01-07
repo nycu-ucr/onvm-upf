@@ -57,7 +57,7 @@
 /* Optional instrumentation: log packet_handler() timing (off by default).
  * Enable with -DUPF_U_HANDLER_TIMING_LOG=1. */
 #ifndef UPF_U_HANDLER_TIMING_LOG
-#define UPF_U_HANDLER_TIMING_LOG 1
+#define UPF_U_HANDLER_TIMING_LOG 0
 #endif
 
 #if UPF_U_HANDLER_TIMING_LOG
