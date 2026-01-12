@@ -364,8 +364,12 @@ static inline uint16_t get_gtpu_header_len_with_qfi(struct rte_mbuf *pkt, uint8_
 
     uint16_t gtp_len = sizeof(gtpv1_t);
 
-    gtpv1_t *gtpv1 = rte_pktmbuf_mtod_offset(pkt, gtpv1_t *,
-                                             sizeof(struct rte_ipv4_hdr) + sizeof(struct rte_udp_hdr));
+    gtpv1_t *gtpv1 = rte_pktmbuf_mtod_offset(pkt, gtpv1_t *, 
+      sizeof(struct rte_ether_hdr) + 
+      sizeof(struct rte_ipv4_hdr) + 
+      sizeof(struct rte_udp_hdr)
+    );
+
 
     if (gtpv1->flags & GTP1_F_MASK) {
         gtp_len += 4;
@@ -377,17 +381,27 @@ static inline uint16_t get_gtpu_header_len_with_qfi(struct rte_mbuf *pkt, uint8_
         uint8_t next_ehdr_type = 0;
         gtpv1_hdr_opt_t *gtpv1_opt;
 
-        gtpv1_opt = rte_pktmbuf_mtod_offset(pkt, gtpv1_hdr_opt_t *,
-                            sizeof(struct rte_ipv4_hdr) + sizeof(struct rte_udp_hdr) + sizeof(gtpv1_t));
+        gtpv1_opt = rte_pktmbuf_mtod_offset(pkt, gtpv1_hdr_opt_t *, 
+          sizeof(struct rte_ether_hdr) + 
+          sizeof(struct rte_ipv4_hdr) + 
+          sizeof(struct rte_udp_hdr) + 
+          sizeof(gtpv1_t)
+        );
+
         next_ehdr_type = gtpv1_opt->next_ehdr_type;
 
         while (next_ehdr_type) {
             switch (next_ehdr_type) {
             case GTPV1_NEXT_EXT_HDR_TYPE_85: {
-                pdu_sess_container_hdr_t *ehdr_type_85 =
-                    rte_pktmbuf_mtod_offset(pkt, pdu_sess_container_hdr_t *,
-                        sizeof(struct rte_ipv4_hdr) + sizeof(struct rte_udp_hdr) +
-                        sizeof(gtpv1_t) + sizeof(gtpv1_hdr_opt_t));
+    
+                pdu_sess_container_hdr_t *ehdr_type_85 = 
+                rte_pktmbuf_mtod_offset(pkt, pdu_sess_container_hdr_t *, 
+                  sizeof(struct rte_ether_hdr) + 
+                  sizeof(struct rte_ipv4_hdr) + 
+                  sizeof(struct rte_udp_hdr) + 
+                  sizeof(gtpv1_t) + 
+                  sizeof(gtpv1_hdr_opt_t)
+                );
 
                 // Extract QFI (first payload byte after fixed fields)
                 uint8_t *raw = (uint8_t *)ehdr_type_85;
