@@ -52,6 +52,7 @@
 #define FLAG_R "-r"
 #define FLAG_L "-l"
 #define FLAG_DASH "--"
+#define FLAG_A "-a"
 
 /*****************************API************************************/
 

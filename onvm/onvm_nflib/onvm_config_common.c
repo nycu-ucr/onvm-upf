@@ -473,6 +473,9 @@ onvm_config_create_dpdk_args(cJSON* dpdk_config, int* dpdk_argc, char** dpdk_arg
         size_t* arg_size = NULL;
         size_t mem_channels_string_size;
         int i = 0;
+        cJSON* allowlist = NULL;
+        int allow_cnt = 0;
+        int base_argc = 6; // corelist, memory_channels, portmask, proc-type
 
         if (dpdk_config == NULL || dpdk_argc == NULL || dpdk_argv == NULL) {
                 printf("DPDK ARGV: %p\n", dpdk_config);
@@ -480,8 +483,17 @@ onvm_config_create_dpdk_args(cJSON* dpdk_config, int* dpdk_argc, char** dpdk_arg
                 return -1;
         }
 
-        /* DPKD requires 6 args */
-        *dpdk_argc = 6;
+        allowlist = cJSON_GetObjectItem(dpdk_config, "allowlist");
+        if (allowlist != NULL) {
+                if (!cJSON_IsArray(allowlist)) {
+                        printf("allowlist is present but is not an array\n");
+                        return -1;
+                }
+                allow_cnt = cJSON_GetArraySize(allowlist);
+        }
+
+        /* DPKD requires base_argc + 2 * allow_cnt args */
+        *dpdk_argc = base_argc + 2 * allow_cnt;
 
         *dpdk_argv = (char**)malloc(sizeof(char*) * (*dpdk_argc));
         if (*dpdk_argv == NULL) {
@@ -532,7 +544,20 @@ onvm_config_create_dpdk_args(cJSON* dpdk_config, int* dpdk_argc, char** dpdk_arg
         arg_size[2] = strlenn(FLAG_N);
         arg_size[3] = strlenn(mem_channels_string);
         arg_size[4] = strlenn(PROC_TYPE_SECONDARY);
-        arg_size[5] = strlenn(FLAG_DASH);
+        for (i = 0; i < allow_cnt; i++) {
+                cJSON* dev = cJSON_GetArrayItem(allowlist, i);
+                if (dev == NULL || !cJSON_IsString(dev) || dev->valuestring == NULL) {
+                        printf("allowlist[%d] is not a string\n", i);
+                        free(*dpdk_argv);
+                        free(core_string);
+                        free(arg_size);
+                        free(mem_channels_string);
+                        return -1;
+                }
+                arg_size[base_argc - 1 + 2*i] = strlenn(FLAG_A);
+                arg_size[base_argc + 2*i]     = strlenn(dev->valuestring);
+        }
+        arg_size[*dpdk_argc - 1] = strlenn(FLAG_DASH);
 
         for (i = 0; i < *dpdk_argc; ++i) {
                 (*dpdk_argv)[i] = (char*)malloc(arg_size[i]);
@@ -557,7 +582,30 @@ onvm_config_create_dpdk_args(cJSON* dpdk_config, int* dpdk_argc, char** dpdk_arg
         memcpy((*dpdk_argv)[2], FLAG_N, arg_size[2]);
         memcpy((*dpdk_argv)[3], mem_channels_string, arg_size[3]);
         memcpy((*dpdk_argv)[4], PROC_TYPE_SECONDARY, arg_size[4]);
-        memcpy((*dpdk_argv)[5], FLAG_DASH, arg_size[5]);
+        for (i = 0; i < allow_cnt; i++) {
+                cJSON* dev = cJSON_GetArrayItem(allowlist, i);
+                int idx = base_argc - 1 + 2*i;
+                memcpy((*dpdk_argv)[idx],     FLAG_A,           arg_size[idx]);
+                memcpy((*dpdk_argv)[idx + 1], dev->valuestring, arg_size[idx + 1]);
+        }
+        memcpy((*dpdk_argv)[*dpdk_argc - 1], FLAG_DASH, arg_size[*dpdk_argc - 1]);
+
+        /* DEBUG: dump dpdk argc/argv */
+        printf("DPDK argc = %d\n", *dpdk_argc);
+        for (int k = 0; k < *dpdk_argc; k++) {
+                if ((*dpdk_argv)[k] == NULL) {
+                        printf("  argv[%d] = (null)\n", k);
+                } else {
+                        printf("  argv[%d] = \"%s\" (len=%zu)\n",
+                               k, (*dpdk_argv)[k], strlen((*dpdk_argv)[k]));
+                }
+        }
+
+        printf("DPDK cmdline:");
+        for (int k = 0; k < *dpdk_argc; k++) {
+                printf(" %s", (*dpdk_argv)[k] ? (*dpdk_argv)[k] : "(null)");
+        }
+        printf("\n");
 
         free(arg_size);
         free(core_string);

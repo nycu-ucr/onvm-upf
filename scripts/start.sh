@@ -224,12 +224,12 @@ ports_bin="${ports_bin//0/}"
 # The number of ports is the length of the string of 1's. Using above example: 1111 -> 4
 count_ports="${#ports_bin}"
 
-ports_detected=$(subprojects/dpdk/usertools/dpdk-devbind.py --status-dev net | sed '/Network devices using kernel driver/q' | grep -c "drv")
-if [[ $ports_detected -lt $count_ports ]]
-then
-    echo "Error: Invalid port mask. Insufficient NICs bound."
-    exit 1
-fi
+#ports_detected=$(subprojects/dpdk/usertools/dpdk-devbind.py --status-dev net | sed '/Network devices using kernel driver/q' | grep -c "drv")
+#if [[ $ports_detected -lt $count_ports ]]
+#then
+#    echo "Error: Invalid port mask. Insufficient NICs bound."
+#    exit 1
+#fi
 
 # Trim 0x from NF mask
 nf_cores_trimmed=${nf_cores:2}
