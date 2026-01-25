@@ -34,10 +34,6 @@ do
     fi
 done
 
-# Check sudo privileges
-sudo -v 
-
-
 # (1)
 # Disable address space layout randomization (ASLR)
 echo "- Disabling ASLR"
