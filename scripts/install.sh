@@ -61,7 +61,7 @@ echo "- Installing required packages"
 if [ "$install_packages" = true ]; then
     echo "  - installing: $required"
     sudo apt-get update
-    sudo apt-get install $required -y
+    sudo NEEDRESTART_MODE=a apt-get install $required -y
 else
     echo "  - skipping due to --noinstall flag"
 fi
