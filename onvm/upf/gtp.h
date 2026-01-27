@@ -163,6 +163,21 @@ struct gtp_hdr_v2_without_teid {
   uint32_t sequence_number_and_spare;
 };
 
+
+/**
+ * Unified GTP-U header parsing - call ONCE, use everywhere.
+ * Assumes Ethernet header is PRESENT (call before any rte_pktmbuf_adj).
+ */
+
+typedef struct {
+    uint32_t teid;           // Extracted TEID (host byte order)
+    uint8_t  qfi;            // QFI from PDU Session Container (0 if absent)
+    uint16_t gtp_hdr_len;    // Total GTP-U header length (for decap)
+    uint16_t outer_hdr_len;  // IP + UDP + GTP total (for decap)
+    bool     valid;          // true if parsing succeeded
+} gtp_parse_result_t;
+
+
 /*
         Enum for dereferencing void *.
 */
@@ -423,3 +438,75 @@ static inline uint16_t get_gtpu_header_len_with_qfi(struct rte_mbuf *pkt, uint8_
     return gtp_len;
 }
 
+
+static inline int parse_gtpu_once(struct rte_mbuf *pkt, gtp_parse_result_t *result) {
+    memset(result, 0, sizeof(*result));
+    
+    // Check packet length
+    uint16_t data_len = rte_pktmbuf_data_len(pkt);
+    size_t min_len = sizeof(struct rte_ether_hdr) + sizeof(struct rte_ipv4_hdr) + 
+                     sizeof(struct rte_udp_hdr) + sizeof(gtpv1_t);
+    if (data_len < min_len) return -1;
+    
+    // Get outer IPv4 header
+    struct rte_ipv4_hdr *outer_ip = rte_pktmbuf_mtod_offset(pkt, struct rte_ipv4_hdr *,
+        sizeof(struct rte_ether_hdr));
+    uint8_t ip_hdr_len = (outer_ip->version_ihl & 0x0F) * 4;
+    
+    // Get outer UDP header
+    struct rte_udp_hdr *outer_udp = rte_pktmbuf_mtod_offset(pkt, struct rte_udp_hdr *,
+        sizeof(struct rte_ether_hdr) + ip_hdr_len);
+    
+    // Verify GTP-U port
+    if (outer_udp->dst_port != rte_cpu_to_be_16(2152)) return -1;
+    
+    // Get GTP header
+    gtpv1_t *gtp = rte_pktmbuf_mtod_offset(pkt, gtpv1_t *,
+        sizeof(struct rte_ether_hdr) + ip_hdr_len + sizeof(struct rte_udp_hdr));
+    
+    // Extract TEID
+    result->teid = rte_be_to_cpu_32(gtp->teid);
+    result->gtp_hdr_len = sizeof(gtpv1_t);
+    result->qfi = 0;
+    
+    // Check for optional fields (seq, npdu, ext)
+    if (gtp->flags & GTP1_F_MASK) {
+        result->gtp_hdr_len += 4;  // seq(2) + npdu(1) + next_ext(1)
+        
+        // Check for extension headers
+        if (gtp->flags & GTP1_F_EXTHDR) {
+            gtpv1_hdr_opt_t *opt = rte_pktmbuf_mtod_offset(pkt, gtpv1_hdr_opt_t *,
+                sizeof(struct rte_ether_hdr) + ip_hdr_len + 
+                sizeof(struct rte_udp_hdr) + sizeof(gtpv1_t));
+            
+            uint8_t next_type = opt->next_ehdr_type;
+            size_t ext_offset = sizeof(struct rte_ether_hdr) + ip_hdr_len + 
+                                sizeof(struct rte_udp_hdr) + sizeof(gtpv1_t) + 
+                                sizeof(gtpv1_hdr_opt_t);
+            
+            while (next_type) {
+                if (next_type == GTPV1_NEXT_EXT_HDR_TYPE_85) {
+                    // PDU Session Container - extract QFI
+                    pdu_sess_container_hdr_t *psc = rte_pktmbuf_mtod_offset(pkt,
+                        pdu_sess_container_hdr_t *, ext_offset);
+                    
+                    uint8_t *raw = (uint8_t *)psc;
+                    result->qfi = raw[2] & 0x3F;
+                    
+                    result->gtp_hdr_len += (psc->length * 4);
+                    next_type = psc->next_hdr;
+                    ext_offset += (psc->length * 4);
+                } else {
+                    // Unknown extension - stop parsing (don't printf!)
+                    next_type = 0;
+                }
+            }
+        }
+    }
+    
+    // Calculate total outer header length (for decap)
+    result->outer_hdr_len = ip_hdr_len + sizeof(struct rte_udp_hdr) + result->gtp_hdr_len;
+    result->valid = true;
+    
+    return 0;
+}
