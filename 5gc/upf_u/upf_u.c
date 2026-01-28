@@ -296,7 +296,64 @@ ConfigureQerFlows(UpfSession *session,
                   uint8_t port,
                   bool is_uplink)
 {
-    if (!session || !pdr || !session->qer_list) return;
+    if (!pdr) return;
+
+    UPDK_QER *qer_to_use = pdr->qer;
+    
+    // If pdr->qer is set, skip the session/list checks entirely
+    if (qer_to_use) {
+        uint32_t mbr = is_uplink ? qer_to_use->maximumBitrate.ul : qer_to_use->maximumBitrate.dl;
+        if (mbr == 0) return;
+        
+        // Use pre-parsed PDI fields instead of string parsing
+        uint32_t base = SourceInterfaceToPort(pdr->pdi.sourceInterface);
+        uint32_t fd_target = 0;
+        bool has_fd = false;
+
+        // Use ueIpAddress from PDI if available (already parsed!)
+        if (pdr->pdi.flags.ueIpAddress && pdr->pdi.ueIpAddress.flags.v4) {
+            fd_target = pdr->pdi.ueIpAddress.ipv4.s_addr;  // Already in network byte order
+            has_fd = true;
+        }
+        // Fallback: check SDF filter ID as a key differentiator
+        else if (pdr->pdi.flags.sdfFilter && pdr->pdi.sdfFilter.flags.bid) {
+            fd_target = pdr->pdi.sdfFilter.sdfFilterId;
+            has_fd = true;
+        }
+        
+        uint32_t key = has_fd ? (base + fd_target) : base;
+
+        if (ftSearch(key) >= 0) return;  // Already configured
+        
+        // Configure the meter (one-time)
+        struct rte_meter_trtcm_params trtcm_params = app_trtcm_params;
+        trtcm_params.pir = mbr * 1000 / 8;
+
+        uint32_t gbr = is_uplink ? qer_to_use->guaranteedBitrate.ul : qer_to_use->guaranteedBitrate.dl;
+        trtcm_params.cir = gbr > 0 ? (gbr * 1000 / 8) : (is_uplink ? 0 : 1);
+
+        if (!ftAddEntry(key, trTCMidx)) {
+            UTLT_Warning("FT add failed for key=%u", key);
+            return;
+        }
+        
+        UTLT_Info("ConfigureQerFlows: key=%u idx=%u MBR=%u GBR=%u (no string parsing)", 
+                  key, trTCMidx, mbr, gbr);
+
+        if (!is_uplink && has_fd) {
+            rte_meter_trtcm_profile_config(&app_flow_trtcm_profile, &trtcm_params);
+            rte_meter_trtcm_config(&app_flows[trTCMidx], &app_flow_trtcm_profile);
+        } else {
+            rte_meter_trtcm_profile_config(&app_trtcm_profile, &trtcm_params);
+            rte_meter_trtcm_config(&app_flows[trTCMidx], &app_trtcm_profile);
+        }
+        trTCMidx++;
+        return;
+    }
+
+    // Fallback: old logic using session->qer_list (for backward compatibility)
+    if (!session || !session->qer_list) return;
+
 
     int prefix_len = 0;
     uint32_t fd_target = 0;
@@ -737,10 +794,17 @@ GetPdrByUeIpAddress(struct rte_mbuf *pkt, uint32_t ue_ip)
         return NULL;
     }
 
-    UpfSession *session = UpfSessionFindByUeIP(ue_ip);
-    if (session) {
-        ConfigureQerFlows(session, pdr, pkt->port, false);
+    if (!pdr->qer) {
+        UpfSession *session = UpfSessionFindByUeIP(ue_ip);
+        if (session) {
+            ConfigureQerFlows(session, pdr, pkt->port, true);
+        }
+    } else {
+        // pdr->qer is set, no session needed
+        ConfigureQerFlows(NULL, pdr, pkt->port, false);
     }
+
+
     return pdr;
 }
 
@@ -791,11 +855,16 @@ UPDK_PDR *GetPdrByTeid(struct rte_mbuf *pkt, const gtp_parse_result_t *gtp_info)
     
     const UPDK_PDR *pdr = UpfClassifyGetPdrPtr(&key);
     if (!pdr) return NULL;
-    
-    UpfSession *session = UpfSessionFindByTeid(gtp_info->teid);
-    if (session) {
-        ConfigureQerFlows(session, pdr, pkt->port, true);
+    if (!pdr->qer) {
+        UpfSession *session = UpfSessionFindByTeid(gtp_info->teid);
+        if (session) {
+            ConfigureQerFlows(session, pdr, pkt->port, true);
+        }
+    } else {
+        // pdr->qer is set, no session needed
+        ConfigureQerFlows(NULL, pdr, pkt->port, false);
     }
+    
     
     return pdr;
 }
@@ -1075,24 +1144,39 @@ packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm_nf_
     if (meta->action == ONVM_NF_ACTION_OUT && is_dl) {
         uint32_t ue_ip_key = rte_cpu_to_be_32(iph->dst_addr);
         
-        // Get or create UE table entry directly from pdr->qer
+        // Check if QER has actual rate values
+        bool has_qer_rates = pdr->qer && 
+                            (pdr->qer->maximumBitrate.dl > 0 || pdr->qer->maximumBitrate.ul > 0);
+        
+        if (!has_qer_rates) {
+            // No rate limiting configured - just forward as best effort
+            UTLT_Debug("No QER rates for %s, forwarding without rate limit", 
+                    convertToIpAddress(iph->dst_addr));
+            return status;  // meta->action is already ONVM_NF_ACTION_OUT
+        }
+        
+        // From here: QER has rates, apply rate limiting
         int index = findIndexByUeIpAddress(ue_ip_key);
         if (index == -1) {
-            if (pdr->qer && pdr->qer->flags.maximumBitrate) {
-                uint32_t ambr = pdr->qer->maximumBitrate.dl;
-                uint32_t gbr  = pdr->qer->flags.guaranteedBitrate ? pdr->qer->guaranteedBitrate.dl : 0;
-                uint32_t mbr  = pdr->qer->maximumBitrate.dl;
-                index = addEntrybyUeIp(ue_ip_key, ambr, gbr, mbr);
-            }
+            // Create UE table entry
+            uint32_t ambr = pdr->qer->maximumBitrate.dl;
+            uint32_t gbr  = pdr->qer->guaranteedBitrate.dl;  // Will be 0 if not set
+            uint32_t mbr  = pdr->qer->maximumBitrate.dl;
+            index = addEntrybyUeIp(ue_ip_key, ambr, gbr, mbr);
+            
             if (index == -1) {
-                UTLT_Error("No UE table slot available for %s", convertToIpAddress(iph->dst_addr));
-                return status;
+                UTLT_Error("UE table full, cannot add %s - forwarding without rate limit", 
+                        convertToIpAddress(iph->dst_addr));
+                return status;  // Forward anyway, can't rate limit
             }
+            UTLT_Info("Added UE %s to table: AMBR=%u GBR=%u MBR=%u", 
+                    convertToIpAddress(iph->dst_addr), ambr, gbr, mbr);
         }
+        
         updateTokenbyIndex(index);
-
-        // Determine QoS vs non-QoS from pdr->qer (no string parsing)
-        bool isQos = pdr->qer && pdr->qer->flags.guaranteedBitrate;
+        
+        // Determine QoS vs non-QoS (check actual value, not flag)
+        bool isQos = pdr->qer->guaranteedBitrate.dl > 0;
         
         if (isQos) {
             // QoS flow: apply trTCM + QoS token bucket
