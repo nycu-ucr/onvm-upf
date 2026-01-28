@@ -292,7 +292,7 @@ static inline int SourceInterfaceToPort(source_interface_t srcIf) {
 
 static inline void
 ConfigureQerFlows(UpfSession *session,
-                  const UPDK_PDR *pdr,
+                  UPDK_PDR *pdr,
                   uint8_t port,
                   bool is_uplink)
 {
@@ -323,31 +323,42 @@ ConfigureQerFlows(UpfSession *session,
         
         uint32_t key = has_fd ? (base + fd_target) : base;
 
-        if (ftSearch(key) >= 0) return;  // Already configured
+        // Step 1: Check if already configured
+        int slot = ftSearch(key);
+        if (slot >= 0) {
+            pdr->meter_idx = iPFlows[slot].flow_idx;
+            return; // already configured
+        }
+
+        // Step 2: Not found - add new entry
+        if (!ftAddEntry(key, trTCMidx)) {
+            UTLT_Warning("FT add failed for key=%u", key);
+            return;
+        }
         
-        // Configure the meter (one-time)
+        // Step 3: Save meter index and increment counter
+        uint16_t my_idx = trTCMidx++;
+        
+        // Step 4: Configure the meter parameters
         struct rte_meter_trtcm_params trtcm_params = app_trtcm_params;
         trtcm_params.pir = mbr * 1000 / 8;
 
         uint32_t gbr = is_uplink ? qer_to_use->guaranteedBitrate.ul : qer_to_use->guaranteedBitrate.dl;
         trtcm_params.cir = gbr > 0 ? (gbr * 1000 / 8) : (is_uplink ? 0 : 1);
 
-        if (!ftAddEntry(key, trTCMidx)) {
-            UTLT_Warning("FT add failed for key=%u", key);
-            return;
-        }
-        
-        UTLT_Info("ConfigureQerFlows: key=%u idx=%u MBR=%u GBR=%u (no string parsing)", 
-                  key, trTCMidx, mbr, gbr);
-
         if (!is_uplink && has_fd) {
             rte_meter_trtcm_profile_config(&app_flow_trtcm_profile, &trtcm_params);
-            rte_meter_trtcm_config(&app_flows[trTCMidx], &app_flow_trtcm_profile);
+            rte_meter_trtcm_config(&app_flows[my_idx], &app_flow_trtcm_profile);
         } else {
             rte_meter_trtcm_profile_config(&app_trtcm_profile, &trtcm_params);
-            rte_meter_trtcm_config(&app_flows[trTCMidx], &app_trtcm_profile);
+            rte_meter_trtcm_config(&app_flows[my_idx], &app_trtcm_profile);
         }
-        trTCMidx++;
+
+        // Step 5: Save meter index to PDR
+        pdr->meter_idx = my_idx;
+        
+        UTLT_Info("ConfigureQerFlows: key=%u idx=%u MBR=%u GBR=%u", key, my_idx, mbr, gbr);
+        
         return;
     }
 
@@ -797,7 +808,7 @@ GetPdrByUeIpAddress(struct rte_mbuf *pkt, uint32_t ue_ip)
     if (!pdr->qer) {
         UpfSession *session = UpfSessionFindByUeIP(ue_ip);
         if (session) {
-            ConfigureQerFlows(session, pdr, pkt->port, true);
+            ConfigureQerFlows(session, pdr, pkt->port, false);
         }
     } else {
         // pdr->qer is set, no session needed
@@ -862,7 +873,7 @@ UPDK_PDR *GetPdrByTeid(struct rte_mbuf *pkt, const gtp_parse_result_t *gtp_info)
         }
     } else {
         // pdr->qer is set, no session needed
-        ConfigureQerFlows(NULL, pdr, pkt->port, false);
+        ConfigureQerFlows(NULL, pdr, pkt->port, true);
     }
     
     
@@ -1173,15 +1184,13 @@ packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm_nf_
                     convertToIpAddress(iph->dst_addr), ambr, gbr, mbr);
         }
         
-        updateTokenbyIndex(index);
-        
         // Determine QoS vs non-QoS (check actual value, not flag)
         bool isQos = pdr->qer->guaranteedBitrate.dl > 0;
         
         if (isQos) {
             // QoS flow: apply trTCM + QoS token bucket
             uint64_t curr_time = rte_get_tsc_cycles();
-            int meter_idx = pdr->qerId[0] % APP_FLOWS_MAX;
+            int meter_idx = pdr->meter_idx;
             
             color_result = trtcmColorHandle(cal_pktlen, curr_time, meter_idx, &app_flow_trtcm_profile);
             trtcmPolicer(meta, color_result);
@@ -1192,22 +1201,22 @@ packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm_nf_
                 ue_table[index].ue_qos_tb_params.tb_tokens -= cal_pktlen;
                 meta->action = ONVM_NF_ACTION_OUT;
             } else if (meta->flags == RTE_COLOR_YELLOW) {
-                // Drop instead of blocking with usleep()
-                if (ue_table[index].ue_qos_tb_params.tb_tokens >= cal_pktlen) {
-                    ue_table[index].ue_qos_tb_params.tb_tokens -= cal_pktlen;
-                    meta->action = ONVM_NF_ACTION_OUT;
-                } else {
-                    meta->action = ONVM_NF_ACTION_DROP;
+                updateTokenbyIndex(index); 
+                while (ue_table[index].ue_qos_tb_params.tb_tokens < cal_pktlen) {
+                    usleep(1);
+                    updateTokenbyIndex(index);
                 }
+                ue_table[index].ue_qos_tb_params.tb_tokens -= cal_pktlen;
+                meta->action = ONVM_NF_ACTION_OUT;
             }
         } else {
-            // Non-QoS flow: just token bucket (drop if insufficient tokens)
-            if (ue_table[index].ue_nqos_tb_params.tb_tokens >= cal_pktlen) {
-                ue_table[index].ue_nqos_tb_params.tb_tokens -= cal_pktlen;
-                meta->action = ONVM_NF_ACTION_OUT;
-            } else {
-                meta->action = ONVM_NF_ACTION_DROP;
+            updateTokenbyIndex(index);
+            while (ue_table[index].ue_nqos_tb_params.tb_tokens < cal_pktlen) {
+                usleep(1);
+                updateTokenbyIndex(index);
             }
+            ue_table[index].ue_nqos_tb_params.tb_tokens -= cal_pktlen;
+            meta->action = ONVM_NF_ACTION_OUT;
         }
     }
     return status;

@@ -458,7 +458,7 @@ static inline int parse_gtpu_once(struct rte_mbuf *pkt, gtp_parse_result_t *resu
         sizeof(struct rte_ether_hdr) + ip_hdr_len);
     
     // Verify GTP-U port
-    if (outer_udp->dst_port != rte_cpu_to_be_16(2152)) return -1;
+    if (outer_udp->dst_port != rte_cpu_to_be_16(UDP_PORT_FOR_GTP)) return -1;
     
     // Get GTP header
     gtpv1_t *gtp = rte_pktmbuf_mtod_offset(pkt, gtpv1_t *,
@@ -487,20 +487,32 @@ static inline int parse_gtpu_once(struct rte_mbuf *pkt, gtp_parse_result_t *resu
             while (next_type) {
                 if (next_type == GTPV1_NEXT_EXT_HDR_TYPE_85) {
                     // PDU Session Container - extract QFI
+                    if (ext_offset + sizeof(pdu_sess_container_hdr_t) > data_len) return -1;
                     pdu_sess_container_hdr_t *psc = rte_pktmbuf_mtod_offset(pkt,
                         pdu_sess_container_hdr_t *, ext_offset);
-                    
+
+                    size_t ext_len = (size_t)psc->length * 4;
+                    if (ext_len == 0 || ext_offset + ext_len > data_len) return -1;
+
                     uint8_t *raw = (uint8_t *)psc;
                     result->qfi = raw[2] & 0x3F;
-                    
-                    result->gtp_hdr_len += (psc->length * 4);
+
+                    result->gtp_hdr_len += ext_len;
                     next_type = psc->next_hdr;
-                    ext_offset += (psc->length * 4);
+                    ext_offset += ext_len;
                 } else {
-                    // Unknown extension - stop parsing (don't printf!)
-                    next_type = 0;
+                    // Unknown extension - skip by length
+                    if (ext_offset + 1 > data_len) return -1;
+                    uint8_t *ext = rte_pktmbuf_mtod_offset(pkt, uint8_t *, ext_offset);
+                    uint8_t len_units = ext[0];
+                    size_t ext_len = (size_t)len_units * 4;
+                    if (ext_len == 0 || ext_offset + ext_len > data_len) return -1;
+
+                    result->gtp_hdr_len += ext_len;
+                    next_type = ext[ext_len - 1];
+                    ext_offset += ext_len;
                 }
-            }
+          }
         }
     }
     

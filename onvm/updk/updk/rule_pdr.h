@@ -266,6 +266,8 @@ typedef struct {
     // handle multiple QERs
     uint32_t qerId[2];
 
+    uint16_t meter_idx;   // trTCM flow index to use in fast path
+
     // TODO: Need to handle multiple ActivatePredefinedRules, dynamic alloc?
     char     activatePredefinedRules[0x40];
 
