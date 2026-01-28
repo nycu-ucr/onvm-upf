@@ -220,7 +220,7 @@ static inline uint16_t UpfClassifyGetPdrId(const ps_packet_t *key) {
     return (uint16_t)pdrId;
 }
 
-static inline const UPDK_PDR *UpfClassifyGetPdrPtr(const ps_packet_t *key) {
+static inline UPDK_PDR *UpfClassifyGetPdrPtr(const ps_packet_t *key) {
     const cls_handle_t *snap = (const cls_handle_t *)g_cls_local.ptr;
     if (unlikely(!snap)) {
         UTLT_Warning("CLS classify: no snapshot yet (ver=%u) — dropping", g_cls_local.ver);
@@ -230,7 +230,7 @@ static inline const UPDK_PDR *UpfClassifyGetPdrPtr(const ps_packet_t *key) {
     uintptr_t descriptor     = 0;
     int hit = cls_classify_packet((cls_handle_t *)snap, key, &precedence, &descriptor);
     if (hit != 1 || descriptor == 0) return NULL;
-    return (const UPDK_PDR *)descriptor;
+    return (UPDK_PDR *)descriptor;
 }
 
 
@@ -305,20 +305,42 @@ ConfigureQerFlows(UpfSession *session,
         uint32_t mbr = is_uplink ? qer_to_use->maximumBitrate.ul : qer_to_use->maximumBitrate.dl;
         if (mbr == 0) return;
         
-        // Use pre-parsed PDI fields instead of string parsing
+        // Opensource-consistent: derive has_fd/fd_target from flowDescription
         uint32_t base = SourceInterfaceToPort(pdr->pdi.sourceInterface);
         uint32_t fd_target = 0;
         bool has_fd = false;
 
-        // Use ueIpAddress from PDI if available (already parsed!)
-        if (pdr->pdi.flags.ueIpAddress && pdr->pdi.ueIpAddress.flags.v4) {
-            fd_target = pdr->pdi.ueIpAddress.ipv4.s_addr;  // Already in network byte order
-            has_fd = true;
-        }
-        // Fallback: check SDF filter ID as a key differentiator
-        else if (pdr->pdi.flags.sdfFilter && pdr->pdi.sdfFilter.flags.bid) {
-            fd_target = pdr->pdi.sdfFilter.sdfFilterId;
-            has_fd = true;
+        if (pdr->pdi.flags.sdfFilter && pdr->pdi.sdfFilter.flags.fd) {
+            // Safe copy: don't mutate pdr->pdi.sdfFilter.flowDescription
+            char desc[sizeof(pdr->pdi.sdfFilter.flowDescription) + 1];
+            size_t n = (size_t)pdr->pdi.sdfFilter.lenOfFlowDescription;
+            if (n > sizeof(pdr->pdi.sdfFilter.flowDescription)) 
+                n = sizeof(pdr->pdi.sdfFilter.flowDescription);
+            memcpy(desc, pdr->pdi.sdfFilter.flowDescription, n);
+            desc[n] = '\0';
+
+            const char *pos = strstr(desc, "from ");
+            if (pos) {
+                pos += 5;
+                char tok[32];
+                size_t i = 0;
+                while (pos[i] && !isspace((unsigned char)pos[i]) && i + 1 < sizeof(tok)) {
+                    tok[i] = pos[i];
+                    i++;
+                }
+                tok[i] = '\0';
+
+                if (i && strcmp(tok, "any") != 0) {
+                    has_fd = true;
+                    if (strcmp(tok, "assigned") == 0 &&
+                        pdr->pdi.flags.ueIpAddress && pdr->pdi.ueIpAddress.flags.v4) {
+                        fd_target = pdr->pdi.ueIpAddress.ipv4.s_addr;  // UE IP for "from assigned"
+                    } else {
+                        int prefix_len = 32;
+                        fd_target = charStr2MaskedIP(tok, (uint32_t *)&prefix_len);  // from-token IP/prefix
+                    }
+                }
+            }
         }
         
         uint32_t key = has_fd ? (base + fd_target) : base;
@@ -358,7 +380,7 @@ ConfigureQerFlows(UpfSession *session,
         pdr->meter_idx = my_idx;
         
         UTLT_Info("ConfigureQerFlows: key=%u idx=%u MBR=%u GBR=%u", key, my_idx, mbr, gbr);
-        
+
         return;
     }
 
@@ -504,6 +526,35 @@ static inline source_interface_t PortToSourceInterface(uint8_t port) {
     UTLT_Warning("PortToSourceInterface: unknown port %u (ACCESS=%d CORE=%d SGI=%d) — defaulting to ACCESS",
                  port, g_access_port, g_core_port, g_sgi_port);
     return SRC_IF_ACCESS;
+}
+
+/* Opensource-consistent QoS detection:
+ * QoS == "SDF flowDescription has 'from <token>' and <token> != 'any'" */
+static inline bool pdr_dl_is_qos_opensource(const UPDK_PDR *pdr) {
+    if (!pdr) return false;
+    if (!pdr->pdi.flags.sdfFilter) return false;
+    if (!pdr->pdi.sdfFilter.flags.fd) return false;
+
+    char desc[sizeof(pdr->pdi.sdfFilter.flowDescription) + 1];
+    size_t n = (size_t)pdr->pdi.sdfFilter.lenOfFlowDescription;
+    if (n > sizeof(pdr->pdi.sdfFilter.flowDescription)) 
+        n = sizeof(pdr->pdi.sdfFilter.flowDescription);
+    memcpy(desc, pdr->pdi.sdfFilter.flowDescription, n);
+    desc[n] = '\0';
+
+    const char *pos = strstr(desc, "from ");
+    if (!pos) return false;
+    pos += 5;
+
+    char tok[32];
+    size_t i = 0;
+    while (pos[i] && !isspace((unsigned char)pos[i]) && i + 1 < sizeof(tok)) {
+        tok[i] = pos[i];
+        i++;
+    }
+    tok[i] = '\0';
+
+    return (i > 0) && (strcmp(tok, "any") != 0);
 }
 
 static int
@@ -799,7 +850,7 @@ GetPdrByUeIpAddress(struct rte_mbuf *pkt, uint32_t ue_ip)
         return NULL;
     } */
 
-    const UPDK_PDR *pdr = UpfClassifyGetPdrPtr(&key);
+    UPDK_PDR *pdr = UpfClassifyGetPdrPtr(&key);
     if (!pdr) {
         UTLT_Error("Couldn't classify the packet to a PDR");
         return NULL;
@@ -864,7 +915,7 @@ UPDK_PDR *GetPdrByTeid(struct rte_mbuf *pkt, const gtp_parse_result_t *gtp_info)
     key.source_if = SRC_IF_ACCESS;
     key.is_uplink = true;
     
-    const UPDK_PDR *pdr = UpfClassifyGetPdrPtr(&key);
+    UPDK_PDR *pdr = UpfClassifyGetPdrPtr(&key);
     if (!pdr) return NULL;
     if (!pdr->qer) {
         UpfSession *session = UpfSessionFindByTeid(gtp_info->teid);
@@ -1184,8 +1235,8 @@ packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm_nf_
                     convertToIpAddress(iph->dst_addr), ambr, gbr, mbr);
         }
         
-        // Determine QoS vs non-QoS (check actual value, not flag)
-        bool isQos = pdr->qer->guaranteedBitrate.dl > 0;
+        // Determine QoS vs non-QoS (opensource-consistent: SDF 'from <token>' where token != 'any')
+        bool isQos = pdr_dl_is_qos_opensource(pdr);
         
         if (isQos) {
             // QoS flow: apply trTCM + QoS token bucket
