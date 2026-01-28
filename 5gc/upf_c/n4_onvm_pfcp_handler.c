@@ -1072,6 +1072,11 @@ Status UpfN4HandleUpdatePdr(UpfSession *session, UpdatePDR *updatePdr) {
         UTLT_Assert(upfPdr->far, return STATUS_ERROR, "FAR ID[%u] does NOT exist in UPF Context", upfPdr->farId);
     }
 
+    if (upfPdr->flags.qerId) {
+        upfPdr->qer = UpfQERFindByID(session, upfPdr->qerId[0]);
+        UTLT_Assert(upfPdr->qer, return STATUS_ERROR, "QER ID[%u] does NOT exist in UPF Context", upfPdr->qerId[0]);
+    }
+
 #ifdef CHECK
     // Register PDR to Session
     UTLT_Assert(UpfPDRRegisterToSession(session, &upfPdr),
