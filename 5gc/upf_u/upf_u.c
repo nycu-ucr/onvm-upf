@@ -1192,12 +1192,7 @@ AttachL2Header(struct rte_mbuf *pkt, bool is_dl) {
     // next hop's mac address
     if (is_dl == true) {
         rte_ether_addr_copy(&cn_ue_eth, &eth_hdr->src_addr);
-        eth_hdr->dst_addr.addr_bytes[0] = AnMac[0];
-        eth_hdr->dst_addr.addr_bytes[1] = AnMac[1];
-        eth_hdr->dst_addr.addr_bytes[2] = AnMac[2];
-        eth_hdr->dst_addr.addr_bytes[3] = AnMac[3];
-        eth_hdr->dst_addr.addr_bytes[4] = AnMac[4];
-        eth_hdr->dst_addr.addr_bytes[5] = AnMac[5];
+        rte_ether_addr_copy(&an_eth, &eth_hdr->dst_addr);
 
     } else {
         rte_ether_addr_copy(&cn_dn_eth, &eth_hdr->src_addr);
@@ -1262,7 +1257,11 @@ encap_downlink_gtp(struct rte_mbuf *pkt, uint32_t ran_ip, uint32_t teid) {
         (struct rte_udp_hdr *)((uint8_t *)outer4 + sizeof(struct rte_ipv4_hdr));
     gtpv1_t *gtp_hdr =
         (gtpv1_t *)((uint8_t *)udp_hdr + sizeof(struct rte_udp_hdr));
-    memset(outer4, 0, outer_len);
+
+    /* Zero only fields that onvm_pkt_fill_ipv4() does not set */
+    outer4->type_of_service = 0;
+    outer4->packet_id       = 0;
+    outer4->fragment_offset = 0;
 
     gtpv1_set_header(gtp_hdr, inner_len, teid);
     onvm_pkt_fill_udp(udp_hdr, UDP_PORT_FOR_GTP, UDP_PORT_FOR_GTP,
@@ -1860,12 +1859,8 @@ main(int argc, char *argv[]) {
           g_access_port, g_core_port, g_sgi_port);
 
     // 8c:dc:d4:ac:6c:7d
-    dn_eth.addr_bytes[0] = DnMac[0];
-    dn_eth.addr_bytes[1] = DnMac[1];
-    dn_eth.addr_bytes[2] = DnMac[2];
-    dn_eth.addr_bytes[3] = DnMac[3];
-    dn_eth.addr_bytes[4] = DnMac[4];
-    dn_eth.addr_bytes[5] = DnMac[5];
+    memcpy(dn_eth.addr_bytes, DnMac, RTE_ETHER_ADDR_LEN);
+    memcpy(an_eth.addr_bytes, AnMac, RTE_ETHER_ADDR_LEN);
 
 
     printf("dn_eth: %02X:%02X:%02X:%02X:%02X:%02X\n",
