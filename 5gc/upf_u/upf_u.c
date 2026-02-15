@@ -121,7 +121,9 @@ enum {
     LAT_PARSE_IP = 0,     /* IPv4 header lookup + direction check */
     LAT_CLS_FLIP,         /* UpfClsMaybeFlipAndAck */
     LAT_GTP_PARSE,        /* parse_gtpu_once (UL) */
-    LAT_CLASSIFY,         /* GetPdrByTeid / GetPdrByUeIpAddress */
+    LAT_CLS_KEY_BUILD,    /* build ps_packet_t key */
+    LAT_CLS_CLASSIFY,     /* cls_classify_packet */
+    LAT_CLS_QER_FLOWS,    /* ConfigureQerFlows */
     LAT_UE_QOS_LOOKUP,    /* findIndexByUeIpAddress + GetQerByUEIpAddressFromPdr */
     LAT_STRIP_L2,         /* rte_pktmbuf_adj (outer Eth) */
     LAT_DECAP,            /* outer header removal (GTP decap) */
@@ -135,6 +137,7 @@ static uint64_t lat_acc[LAT_NUM_STEPS];   /* accumulated cycles */
 static uint64_t lat_cnt;                  /* packets profiled  */
 static double   tsc_to_ns;                /* cycles → ns factor */
 static int      lat_init_done;
+static uint64_t g_cls_flip_count;         /* EVT_CLS_GC_REQ count */
 
 /* trTCM */
 struct rte_meter_trtcm_params app_trtcm_params = {
@@ -681,6 +684,7 @@ uint16_t pdrId = 0;
 UPDK_PDR *
 GetPdrByUeIpAddress(struct rte_mbuf *pkt, uint32_t ue_ip)
 {
+    uint64_t _t0 = rte_rdtsc(), _t1;
     /* ── 1) Build classifier key ─────────────────────────────── */
     ps_packet_t key = {0};
     uint8_t *pkt_data = rte_pktmbuf_mtod(pkt, uint8_t *);
@@ -727,6 +731,10 @@ GetPdrByUeIpAddress(struct rte_mbuf *pkt, uint32_t ue_ip)
     key.source_if = SRC_IF_CORE;
     key.is_uplink = false;
 
+    _t1 = rte_rdtsc();
+    lat_acc[LAT_CLS_KEY_BUILD] += _t1 - _t0;
+    _t0 = _t1;
+
     // printf("DBG2: srcIf=%u (port=%u)\n", key.source_if, pkt->port);
 
     /* UTLT_Debug("DL key → teid=%u UE_IP=%s/%u sport=%u dport=%u proto=%u "
@@ -749,12 +757,19 @@ GetPdrByUeIpAddress(struct rte_mbuf *pkt, uint32_t ue_ip)
     } */
 
     const UPDK_PDR *pdr = UpfClassifyGetPdrPtr(&key);
+    _t1 = rte_rdtsc();
+    lat_acc[LAT_CLS_CLASSIFY] += _t1 - _t0;
+
     if (!pdr) {
         UTLT_Error("Couldn't classify the packet to a PDR");
         return NULL;
     }
 
+    _t0 = _t1;
     ConfigureQerFlows(pdr, false);
+    _t1 = rte_rdtsc();
+    lat_acc[LAT_CLS_QER_FLOWS] += _t1 - _t0;
+
     return pdr;
 }
 
@@ -774,6 +789,7 @@ static void dump_gtpu(const uint8_t *start, size_t len, size_t gtp_off) {
 }
 
 UPDK_PDR *GetPdrByTeid(struct rte_mbuf *pkt, const gtp_parse_result_t *gtp_info) {
+    uint64_t _t0 = rte_rdtsc(), _t1;
         // Locate inner IP header using pre-computed offset
     size_t inner_offset = sizeof(struct rte_ether_hdr) + gtp_info->outer_hdr_len;
 
@@ -802,6 +818,10 @@ UPDK_PDR *GetPdrByTeid(struct rte_mbuf *pkt, const gtp_parse_result_t *gtp_info)
     key.tos_tc    = inner4->type_of_service;
     key.source_if = SRC_IF_ACCESS;
     key.is_uplink = true;
+
+    _t1 = rte_rdtsc();
+    lat_acc[LAT_CLS_KEY_BUILD] += _t1 - _t0;
+    _t0 = _t1;
 
     //  printf(
     // "DBG→Classifier Key:\n"
@@ -844,12 +864,18 @@ UPDK_PDR *GetPdrByTeid(struct rte_mbuf *pkt, const gtp_parse_result_t *gtp_info)
     // printf("PDR ID from Classifier = %" PRIu16 "\n", pdr_id);
 
     const UPDK_PDR *pdr = UpfClassifyGetPdrPtr(&key);
+    _t1 = rte_rdtsc();
+    lat_acc[LAT_CLS_CLASSIFY] += _t1 - _t0;
+
     if (!pdr) {
         UTLT_Error("Couldn't classify the packet to a PDR");
         return NULL;
     }
 
+    _t0 = _t1;
     ConfigureQerFlows(pdr, true);
+    _t1 = rte_rdtsc();
+    lat_acc[LAT_CLS_QER_FLOWS] += _t1 - _t0;
 
     return pdr;
 }
@@ -1128,19 +1154,15 @@ packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm_nf_
         t1 = rte_rdtsc();
         lat_acc[LAT_GTP_PARSE] += t1 - t0;   /* ── GTP-U parse (UL only) ── */
 
-        t0 = t1;
         pdr = GetPdrByTeid(pkt, &gtp_info);
-        t1 = rte_rdtsc();
-        lat_acc[LAT_CLASSIFY] += t1 - t0;     /* ── classify (UL) ── */
+        /* sub-steps timed inside GetPdrByTeid */
 
     } else {
         /* DL — no GTP parse needed */
         lat_acc[LAT_GTP_PARSE] += 0;          /* zero for DL */
 
-        t0 = rte_rdtsc();
         pdr = GetPdrByUeIpAddress(pkt, rte_cpu_to_be_32(iph->dst_addr));
-        t1 = rte_rdtsc();
-        lat_acc[LAT_CLASSIFY] += t1 - t0;     /* ── classify (DL) ── */
+        /* sub-steps timed inside GetPdrByUeIpAddress */
         is_dl = true;
     }
 
@@ -1288,6 +1310,7 @@ msg_handler(void *msg_data, struct onvm_nf_local_ctx *nf_local_ctx) {
     if (e && (uint32_t)e->type == EVT_CLS_GC_REQ) {
         g_cls_local.pending_ver = (uint32_t)e->arg0;
         g_cls_local.flip_pending = 1;      // The actual flip happens at burst boundary
+        g_cls_flip_count++;
 
         // logging block
 
@@ -1369,7 +1392,9 @@ callback_handler(struct onvm_nf_local_ctx *nf_local_ctx) {
                 "parse_ip      ",
                 "cls_flip      ",
                 "gtp_parse(UL) ",
-                "classify      ",
+                "cls_key_build ",
+                "cls_classify  ",
+                "cls_qer_flows ",
                 "ue_qos_lookup ",
                 "strip_l2      ",
                 "decap(UL)     ",
@@ -1378,9 +1403,9 @@ callback_handler(struct onvm_nf_local_ctx *nf_local_ctx) {
                 "qos_meter     ",
                 "TOTAL         ",
             };
-            printf("\n=== UPF-U Latency Profile (%" PRIu64 " pkts) ==="
+            printf("\n=== UPF-U Latency Profile (%" PRIu64 " pkts, flips=%" PRIu64 ") ==="
                    "\n%-18s %10s %10s\n",
-                   lat_cnt, "Step", "avg(ns)", "avg(cyc)");
+                   lat_cnt, g_cls_flip_count, "Step", "avg(ns)", "avg(cyc)");
             for (int i = 0; i < LAT_NUM_STEPS; i++) {
                 double avg_cyc = (double)lat_acc[i] / lat_cnt;
                 double avg_ns  = avg_cyc * tsc_to_ns;
@@ -1390,6 +1415,7 @@ callback_handler(struct onvm_nf_local_ctx *nf_local_ctx) {
             /* reset counters */
             memset(lat_acc, 0, sizeof(lat_acc));
             lat_cnt = 0;
+            g_cls_flip_count = 0;
         }
     }
 
@@ -1409,7 +1435,7 @@ main(int argc, char *argv[]) {
     nf_function_table = onvm_nflib_init_nf_function_table();
     nf_function_table->pkt_handler = &packet_handler;
     nf_function_table->msg_handler = &msg_handler;
-    // nf_function_table->user_actions = &callback_handler;
+    nf_function_table->user_actions = &callback_handler;
 
     if ((arg_offset = onvm_nflib_init(argc, argv, NF_TAG, nf_local_ctx, nf_function_table)) < 0) {
         onvm_nflib_stop(nf_local_ctx);
