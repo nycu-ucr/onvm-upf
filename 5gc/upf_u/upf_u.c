@@ -116,6 +116,26 @@ struct rte_meter_trtcm app_flows[APP_FLOWS_MAX];
 struct rte_mbuf *buffer[MAX_OF_BUFFER_PACKET_SIZE];
 uint32_t buffer_length = 0;
 
+/* ── Per-step latency profiling ── */
+enum {
+    LAT_PARSE_IP = 0,     /* IPv4 header lookup + direction check */
+    LAT_CLS_FLIP,         /* UpfClsMaybeFlipAndAck */
+    LAT_GTP_PARSE,        /* parse_gtpu_once (UL) */
+    LAT_CLASSIFY,         /* GetPdrByTeid / GetPdrByUeIpAddress */
+    LAT_UE_QOS_LOOKUP,    /* findIndexByUeIpAddress + GetQerByUEIpAddressFromPdr */
+    LAT_STRIP_L2,         /* rte_pktmbuf_adj (outer Eth) */
+    LAT_DECAP,            /* outer header removal (GTP decap) */
+    LAT_FAR_ENCAP,        /* HandlePacketWithFar (includes Encap for DL) */
+    LAT_ATTACH_L2,        /* AttachL2Header */
+    LAT_QOS_METER,        /* trTCM + token bucket */
+    LAT_TOTAL,            /* full packet_handler */
+    LAT_NUM_STEPS
+};
+static uint64_t lat_acc[LAT_NUM_STEPS];   /* accumulated cycles */
+static uint64_t lat_cnt;                  /* packets profiled  */
+static double   tsc_to_ns;                /* cycles → ns factor */
+static int      lat_init_done;
+
 /* trTCM */
 struct rte_meter_trtcm_params app_trtcm_params = {
 	.cir = 125000,    // bytes per secs
@@ -1063,6 +1083,10 @@ packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm_nf_
     if (pkt == NULL || meta == NULL) {
         return 0;
     }
+
+    uint64_t t0, t1, t_start;
+    t_start = rte_rdtsc();   /* ── T-start ── */
+
     uint32_t cal_pktlen = 0;
     UTLT_Trace("Get packet\n");
     UTLT_Info("Handle PKT from port: %d [len: %d]", pkt->port, pkt->pkt_len);
@@ -1076,20 +1100,21 @@ packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm_nf_
         UTLT_Info("Not IP packet, ignore it\n");
         return 0;
     }
+    t1 = rte_rdtsc();
+    lat_acc[LAT_PARSE_IP] += t1 - t_start;   /* ── IPv4 parse + direction ── */
 
     // Flip to a newly published snapshot if a REQ was received
+    t0 = t1;
     UpfClsMaybeFlipAndAck();
+    t1 = rte_rdtsc();
+    lat_acc[LAT_CLS_FLIP] += t1 - t0;        /* ── classifier flip ── */
 
     UPDK_PDR *pdr = NULL;
     gtp_parse_result_t gtp_info = {0};
     int ue_idx = -1;
 
-    /* char *src_address = convertToIpAddress(iph->src_addr);
-    UTLT_Info("Src IP is %s\n", src_address);
-    char *dst_address = convertToIpAddress(iph->dst_addr);
-    UTLT_Info("Dst IP is %s\n", dst_address); */
-
-    if (iph->dst_addr == SELF_IP) {  //
+    t0 = t1;
+    if (iph->dst_addr == SELF_IP) {
         UTLT_Info("It is uplink\n");
 
         struct rte_udp_hdr *udp_header = onvm_pkt_udp_hdr(pkt);
@@ -1100,21 +1125,33 @@ packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm_nf_
         if (parse_gtpu_once(pkt, &gtp_info) < 0 || !gtp_info.valid) {
             return 0;
         }
+        t1 = rte_rdtsc();
+        lat_acc[LAT_GTP_PARSE] += t1 - t0;   /* ── GTP-U parse (UL only) ── */
+
+        t0 = t1;
         pdr = GetPdrByTeid(pkt, &gtp_info);
+        t1 = rte_rdtsc();
+        lat_acc[LAT_CLASSIFY] += t1 - t0;     /* ── classify (UL) ── */
 
     } else {
-        // UTLT_Info("It is downlink, dst is %s\n", convertToIpAddress(iph->dst_addr));
+        /* DL — no GTP parse needed */
+        lat_acc[LAT_GTP_PARSE] += 0;          /* zero for DL */
+
+        t0 = rte_rdtsc();
         pdr = GetPdrByUeIpAddress(pkt, rte_cpu_to_be_32(iph->dst_addr));
+        t1 = rte_rdtsc();
+        lat_acc[LAT_CLASSIFY] += t1 - t0;     /* ── classify (DL) ── */
         is_dl = true;
     }
 
     if (!pdr) {
         UTLT_Error("no PDR found for %s, skip\n", convertToIpAddress(iph->dst_addr));
-        // TODO(vivek): what to do?
         return 0;
     }
     UTLT_Info("Got PDR ID is %u\n", pdr->pdrId);
 
+    /* ── UE QoS table lookup (DL only) ── */
+    t0 = rte_rdtsc();
     if (is_dl) {
         uint32_t ue_key = rte_cpu_to_be_32(iph->dst_addr);
         ue_idx = (int)findIndexByUeIpAddress(ue_key);
@@ -1122,8 +1159,14 @@ packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm_nf_
             ue_idx = GetQerByUEIpAddressFromPdr(ue_key, pdr, convertToIpAddress(iph->dst_addr));
         }
     }
+    t1 = rte_rdtsc();
+    lat_acc[LAT_UE_QOS_LOOKUP] += t1 - t0;
 
+    /* ── Strip outer L2 ── */
+    t0 = t1;
     rte_pktmbuf_adj(pkt, sizeof(struct rte_ether_hdr));
+    t1 = rte_rdtsc();
+    lat_acc[LAT_STRIP_L2] += t1 - t0;
 
     UPDK_FAR *far;
     far = pdr->far;
@@ -1133,6 +1176,8 @@ packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm_nf_
         return 0;
     }
 
+    /* ── Outer header removal (GTP decap, UL) ── */
+    t0 = rte_rdtsc();
     if (pdr->flags.outerHeaderRemoval) {
         switch (pdr->outerHeaderRemoval) {
             case OUTER_HEADER_REMOVAL_GTP_IP4: {
@@ -1150,9 +1195,16 @@ packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm_nf_
                 printf("unknown or not implement\n");
         }
     }
+    t1 = rte_rdtsc();
+    lat_acc[LAT_DECAP] += t1 - t0;
 
+    /* ── FAR action + Encap (DL) ── */
     int status = 0, color_result = 0;
+    t0 = t1;
     status = HandlePacketWithFar(pkt, far, pdr->qer, meta);
+    t1 = rte_rdtsc();
+    lat_acc[LAT_FAR_ENCAP] += t1 - t0;
+
     if (meta->action == ONVM_NF_ACTION_DROP) {
         UTLT_Info("Action is drop\n");
     } else if (meta->action == ONVM_NF_ACTION_OUT) {
@@ -1160,7 +1212,15 @@ packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm_nf_
     } else {
         UTLT_Trace("Action is unknown\n");
     }
+
+    /* ── Attach L2 header ── */
+    t0 = rte_rdtsc();
     AttachL2Header(pkt, is_dl);
+    t1 = rte_rdtsc();
+    lat_acc[LAT_ATTACH_L2] += t1 - t0;
+
+    /* ── QoS metering + token bucket (DL only) ── */
+    t0 = t1;
     if (meta->action == ONVM_NF_ACTION_OUT && is_dl) {
 
         if (ue_idx < 0) {
@@ -1210,6 +1270,12 @@ packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm_nf_
             meta->action = ONVM_NF_ACTION_OUT;
         }
     }
+    t1 = rte_rdtsc();
+    lat_acc[LAT_QOS_METER] += t1 - t0;
+
+    lat_acc[LAT_TOTAL] += t1 - t_start;
+    lat_cnt++;
+
     return status;
 }
 
@@ -1292,6 +1358,39 @@ callback_handler(struct onvm_nf_local_ctx *nf_local_ctx) {
         UTLT_Debug("Stats perform: ");
         UTLT_Debug("act out: %d", nf->stats.act_out);
         UTLT_Debug("buffered: %d", nf->stats.tx_buffer);
+
+        /* ── Latency profiling summary (every ~1 s) ── */
+        if (lat_cnt > 0) {
+            if (!lat_init_done) {
+                tsc_to_ns = 1e9 / (double)rte_get_timer_hz();
+                lat_init_done = 1;
+            }
+            static const char *lat_names[LAT_NUM_STEPS] = {
+                "parse_ip      ",
+                "cls_flip      ",
+                "gtp_parse(UL) ",
+                "classify      ",
+                "ue_qos_lookup ",
+                "strip_l2      ",
+                "decap(UL)     ",
+                "far+encap(DL) ",
+                "attach_l2     ",
+                "qos_meter     ",
+                "TOTAL         ",
+            };
+            printf("\n=== UPF-U Latency Profile (%" PRIu64 " pkts) ==="
+                   "\n%-18s %10s %10s\n",
+                   lat_cnt, "Step", "avg(ns)", "avg(cyc)");
+            for (int i = 0; i < LAT_NUM_STEPS; i++) {
+                double avg_cyc = (double)lat_acc[i] / lat_cnt;
+                double avg_ns  = avg_cyc * tsc_to_ns;
+                printf("  %s %10.1f %10.1f\n", lat_names[i], avg_ns, avg_cyc);
+            }
+            printf("==========================================\n");
+            /* reset counters */
+            memset(lat_acc, 0, sizeof(lat_acc));
+            lat_cnt = 0;
+        }
     }
 
     return 0;
