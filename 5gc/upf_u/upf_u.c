@@ -125,6 +125,7 @@ static inline int UpfSendEvt1(uint16_t dest_sid, uint32_t type, uintptr_t a0) {
 }
 
 static struct rte_ether_addr dn_eth;
+static struct rte_ether_addr an_eth;
 static struct rte_ether_addr cn_dn_eth;
 static struct rte_ether_addr cn_ue_eth;
 
