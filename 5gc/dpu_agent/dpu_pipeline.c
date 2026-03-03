@@ -266,8 +266,9 @@ build_color_gate_pipe(dpu_pipeline_ctx_t *ctx,
 
 /* ── UL_MATCH pipes (4 priority buckets) ──────────────────────────── */
 /*
- * Each pipe matches: GTP TEID + QFI + inner src_ip + inner dst_ip + proto.
- * Per-entry match_mask wildcards SDF fields (dst_ip, proto) when no SDF.
+ * Each pipe matches: GTP TEID + QFI + inner 5-tuple (src_ip, dst_ip,
+ * proto, src_port, dst_port).  Per-entry match_mask wildcards unused
+ * SDF fields for catch-all PDRs.
  * Actions: GTP decap + L2 inject + pkt_meta + shared meter.
  * Chain: P0.miss → P1 → P2 → P3.miss → TO_HOST.
  */
@@ -289,15 +290,17 @@ build_ul_match_pipes(dpu_pipeline_ctx_t *ctx)
         doca_flow_pipe_cfg_set_is_root(pipe_cfg, false);
         doca_flow_pipe_cfg_set_nr_entries(pipe_cfg, 2048);
 
-        /* Match: GTP tunnel + inner IPs + protocol (all CHANGEABLE) */
+        /* Match: GTP tunnel + inner 5-tuple (all CHANGEABLE) */
         struct doca_flow_match match = {};
         match.tun.type = DOCA_FLOW_TUN_GTPU;
         match.tun.gtp_teid = UINT32_MAX;
         match.tun.gtp_ext_psc_qfi = UINT8_MAX;
         match.inner.l3_type = DOCA_FLOW_L3_TYPE_IP4;
-        match.inner.ip4.src_ip = UINT32_MAX;      /* UE IP */
-        match.inner.ip4.dst_ip = UINT32_MAX;      /* SDF remote IP */
-        match.inner.ip4.next_proto = UINT8_MAX;   /* SDF protocol */
+        match.inner.ip4.src_ip = UINT32_MAX;                 /* UE IP */
+        match.inner.ip4.dst_ip = UINT32_MAX;                 /* SDF remote IP */
+        match.inner.ip4.next_proto = UINT8_MAX;              /* SDF protocol */
+        match.inner.tcp.l4_port.src_port = UINT16_MAX;       /* SDF src port */
+        match.inner.tcp.l4_port.dst_port = UINT16_MAX;       /* SDF dst port */
 
         struct doca_flow_match mask = {};
         mask.tun.type = DOCA_FLOW_TUN_GTPU;
@@ -307,6 +310,8 @@ build_ul_match_pipes(dpu_pipeline_ctx_t *ctx)
         mask.inner.ip4.src_ip = UINT32_MAX;
         mask.inner.ip4.dst_ip = UINT32_MAX;
         mask.inner.ip4.next_proto = UINT8_MAX;
+        mask.inner.tcp.l4_port.src_port = UINT16_MAX;
+        mask.inner.tcp.l4_port.dst_port = UINT16_MAX;
 
         doca_flow_pipe_cfg_set_match(pipe_cfg, &match, &mask);
 
@@ -369,8 +374,8 @@ build_ul_match_pipes(dpu_pipeline_ctx_t *ctx)
 
 /* ── DL_MATCH pipes (4 priority buckets) ──────────────────────────── */
 /*
- * Each pipe matches: outer dst_ip (UE IP) + outer src_ip + proto.
- * Per-entry match_mask wildcards SDF fields when no SDF.
+ * Each pipe matches: outer 5-tuple (UE IP, remote IP, proto, src_port,
+ * dst_port).  Per-entry match_mask wildcards unused SDF fields.
  * Actions: pkt_meta + shared meter.
  * Chain: P0.miss → P1 → P2 → P3.miss → TO_HOST.
  */
@@ -391,18 +396,22 @@ build_dl_match_pipes(dpu_pipeline_ctx_t *ctx)
         doca_flow_pipe_cfg_set_is_root(pipe_cfg, false);
         doca_flow_pipe_cfg_set_nr_entries(pipe_cfg, 2048);
 
-        /* Match: outer IPs + protocol (all CHANGEABLE) */
+        /* Match: outer 5-tuple (all CHANGEABLE) */
         struct doca_flow_match match = {};
         match.outer.l3_type = DOCA_FLOW_L3_TYPE_IP4;
-        match.outer.ip4.dst_ip = UINT32_MAX;      /* UE IP */
-        match.outer.ip4.src_ip = UINT32_MAX;      /* SDF remote IP (reversed) */
-        match.outer.ip4.next_proto = UINT8_MAX;   /* SDF protocol */
+        match.outer.ip4.dst_ip = UINT32_MAX;                 /* UE IP */
+        match.outer.ip4.src_ip = UINT32_MAX;                 /* SDF remote IP (reversed) */
+        match.outer.ip4.next_proto = UINT8_MAX;              /* SDF protocol */
+        match.outer.tcp.l4_port.src_port = UINT16_MAX;       /* SDF src port */
+        match.outer.tcp.l4_port.dst_port = UINT16_MAX;       /* SDF dst port */
 
         struct doca_flow_match mask = {};
         mask.outer.l3_type = DOCA_FLOW_L3_TYPE_IP4;
         mask.outer.ip4.dst_ip = UINT32_MAX;
         mask.outer.ip4.src_ip = UINT32_MAX;
         mask.outer.ip4.next_proto = UINT8_MAX;
+        mask.outer.tcp.l4_port.src_port = UINT16_MAX;
+        mask.outer.tcp.l4_port.dst_port = UINT16_MAX;
 
         doca_flow_pipe_cfg_set_match(pipe_cfg, &match, &mask);
 
@@ -798,13 +807,17 @@ dpu_pipeline_insert_rule(dpu_pipeline_ctx_t *ctx, const hw_offload_msg_t *msg)
         match.inner.l3_type = DOCA_FLOW_L3_TYPE_IP4;
         match.inner.ip4.src_ip = msg->ue_ipv4.s_addr;  /* NBO */
 
-        /* SDF fields (UL direction: sdf_dst = inner dst, reversed for DL).
+        /* SDF fields (UL direction: sdf_dst = inner dst, sdf_src = inner src).
          * SDF is defined in UL direction per 3GPP TS 29.244. */
         if (msg->has_sdf) {
             if (msg->sdf_dst_ip != 0)
                 match.inner.ip4.dst_ip = htonl(msg->sdf_dst_ip);
             if (msg->sdf_proto != 0)
                 match.inner.ip4.next_proto = msg->sdf_proto;
+            if (msg->sdf_src_port != 0)
+                match.inner.tcp.l4_port.src_port = htons(msg->sdf_src_port);
+            if (msg->sdf_dst_port != 0)
+                match.inner.tcp.l4_port.dst_port = htons(msg->sdf_dst_port);
         }
 
         /* Per-entry match_mask: wildcard fields not present in SDF */
@@ -820,6 +833,11 @@ dpu_pipeline_insert_rule(dpu_pipeline_ctx_t *ctx, const hw_offload_msg_t *msg)
         /* SDF proto: full mask if present */
         if (msg->has_sdf && msg->sdf_proto > 0)
             match_mask.inner.ip4.next_proto = UINT8_MAX;
+        /* SDF L4 ports: full mask if present */
+        if (msg->has_sdf && msg->sdf_src_port > 0)
+            match_mask.inner.tcp.l4_port.src_port = UINT16_MAX;
+        if (msg->has_sdf && msg->sdf_dst_port > 0)
+            match_mask.inner.tcp.l4_port.dst_port = UINT16_MAX;
 
         /* Actions: pkt_meta (decap + L2 inject from pipe template) */
         struct doca_flow_actions actions = {};
@@ -866,12 +884,17 @@ dpu_pipeline_insert_rule(dpu_pipeline_ctx_t *ctx, const hw_offload_msg_t *msg)
         dl_match.outer.l3_type = DOCA_FLOW_L3_TYPE_IP4;
         dl_match.outer.ip4.dst_ip = msg->ue_ipv4.s_addr;  /* NBO */
 
-        /* SDF: in DL, SDF dst (UL perspective) = DL outer src */
+        /* SDF: in DL, SDF direction is reversed (UL perspective).
+         * SDF dst_ip → DL outer src_ip, SDF dst_port → DL outer src_port */
         if (msg->has_sdf) {
             if (msg->sdf_dst_ip != 0)
                 dl_match.outer.ip4.src_ip = htonl(msg->sdf_dst_ip);
             if (msg->sdf_proto != 0)
                 dl_match.outer.ip4.next_proto = msg->sdf_proto;
+            if (msg->sdf_dst_port != 0)
+                dl_match.outer.tcp.l4_port.src_port = htons(msg->sdf_dst_port);
+            if (msg->sdf_src_port != 0)
+                dl_match.outer.tcp.l4_port.dst_port = htons(msg->sdf_src_port);
         }
 
         /* Per-entry match_mask */
@@ -882,6 +905,10 @@ dpu_pipeline_insert_rule(dpu_pipeline_ctx_t *ctx, const hw_offload_msg_t *msg)
             dl_mask.outer.ip4.src_ip = prefix_to_netmask(msg->sdf_dst_pref);
         if (msg->has_sdf && msg->sdf_proto > 0)
             dl_mask.outer.ip4.next_proto = UINT8_MAX;
+        if (msg->has_sdf && msg->sdf_dst_port > 0)
+            dl_mask.outer.tcp.l4_port.src_port = UINT16_MAX;
+        if (msg->has_sdf && msg->sdf_src_port > 0)
+            dl_mask.outer.tcp.l4_port.dst_port = UINT16_MAX;
 
         struct doca_flow_actions dl_actions = {};
         dl_actions.meta.pkt_meta = htonl(msg->hw_rule_id);
