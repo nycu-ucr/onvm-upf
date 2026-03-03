@@ -26,6 +26,8 @@
 #include <unistd.h>
 #include <arpa/inet.h>
 
+#include <rte_eal.h>
+
 #include <doca_comch.h>
 #include <doca_dev.h>
 #include <doca_error.h>
@@ -54,6 +56,16 @@ static uint64_t g_rules_failed;
 /* ── CLI defaults ───────────────────────────────────────────────────── */
 static char g_pci_addr[32]    = "03:00.0";
 static char g_server_name[64] = "dpu_agent";
+
+/* PCI addresses for DOCA Flow ports */
+static char g_n3_pci[32]  = "03:00.0";   /* N3 physical port (PF0) */
+static char g_n6_pci[32]  = "03:00.1";   /* N6 physical port (PF1) */
+static char g_vf_pci[32]  = "";          /* Host VF (optional, probed if empty) */
+
+/* Opened DOCA devices for Flow ports */
+static struct doca_dev *g_n3_dev;
+static struct doca_dev *g_n6_dev;
+static struct doca_dev *g_vf_dev;
 
 /* Port IDs (explicitly assigned via doca_flow_port_cfg_set_port_id) */
 static uint16_t g_n3_port_id      = 0;
@@ -317,10 +329,13 @@ parse_mac(const char *str, uint8_t mac[6])
 static void
 usage(const char *progname)
 {
-    printf("Usage: %s [options]\n\n", progname);
+    printf("Usage: %s [EAL options] -- [options]\n\n", progname);
     printf("Options:\n");
-    printf("  -d <PCI>          BF3 PCI address         (default: %s)\n", g_pci_addr);
+    printf("  -d <PCI>          BF3 PCI address (Comch)  (default: %s)\n", g_pci_addr);
     printf("  -s <name>         Comch server name        (default: %s)\n", g_server_name);
+    printf("  --n3-pci <PCI>    N3 port PCI address      (default: %s)\n", g_n3_pci);
+    printf("  --n6-pci <PCI>    N6 port PCI address      (default: %s)\n", g_n6_pci);
+    printf("  --vf-pci <PCI>    Host VF PCI address      (probed if empty)\n");
     printf("  --n3-port <id>    N3 physical port ID      (default: %u)\n", g_n3_port_id);
     printf("  --n6-port <id>    N6 physical port ID      (default: %u)\n", g_n6_port_id);
     printf("  --vf-port <id>    Host VF representor ID   (default: %u)\n", g_host_vf_port_id);
@@ -336,6 +351,9 @@ static int
 parse_args(int argc, char *argv[])
 {
     static struct option long_opts[] = {
+        {"n3-pci",      required_argument, NULL, 0},
+        {"n6-pci",      required_argument, NULL, 0},
+        {"vf-pci",      required_argument, NULL, 0},
         {"n3-port",     required_argument, NULL, 0},
         {"n6-port",     required_argument, NULL, 0},
         {"vf-port",     required_argument, NULL, 0},
@@ -351,7 +369,13 @@ parse_args(int argc, char *argv[])
     while ((c = getopt_long(argc, argv, "d:s:h", long_opts, &opt_idx)) != -1) {
         if (c == 0) {
             const char *name = long_opts[opt_idx].name;
-            if (strcmp(name, "n3-port") == 0)
+            if (strcmp(name, "n3-pci") == 0)
+                snprintf(g_n3_pci, sizeof(g_n3_pci), "%s", optarg);
+            else if (strcmp(name, "n6-pci") == 0)
+                snprintf(g_n6_pci, sizeof(g_n6_pci), "%s", optarg);
+            else if (strcmp(name, "vf-pci") == 0)
+                snprintf(g_vf_pci, sizeof(g_vf_pci), "%s", optarg);
+            else if (strcmp(name, "n3-port") == 0)
                 g_n3_port_id = (uint16_t)atoi(optarg);
             else if (strcmp(name, "n6-port") == 0)
                 g_n6_port_id = (uint16_t)atoi(optarg);
@@ -407,8 +431,45 @@ main(int argc, char *argv[])
     signal(SIGINT,  signal_handler);
     signal(SIGTERM, signal_handler);
 
+    /* ── DPDK EAL init ─────────────────────────────────────────────── */
+    /* EAL consumes args before "--"; our options come after.
+     * Devargs (dv_flow_en=2,...) are passed via -a flags to EAL. */
+    int eal_ret = rte_eal_init(argc, argv);
+    if (eal_ret < 0) {
+        DOCA_LOG_ERR("EAL init failed");
+        return EXIT_FAILURE;
+    }
+    argc -= eal_ret;
+    argv += eal_ret;
+
     if (parse_args(argc, argv) < 0)
         return EXIT_FAILURE;
+
+    /* ── Open DOCA devices for Flow ports ──────────────────────────── */
+    doca_error_t dev_result;
+    dev_result = open_doca_device_by_pci(g_n3_pci, &g_n3_dev);
+    if (dev_result != DOCA_SUCCESS) {
+        DOCA_LOG_ERR("Cannot open N3 device %s: %s",
+                     g_n3_pci, doca_error_get_descr(dev_result));
+        return EXIT_FAILURE;
+    }
+    dev_result = open_doca_device_by_pci(g_n6_pci, &g_n6_dev);
+    if (dev_result != DOCA_SUCCESS) {
+        DOCA_LOG_ERR("Cannot open N6 device %s: %s",
+                     g_n6_pci, doca_error_get_descr(dev_result));
+        return EXIT_FAILURE;
+    }
+    /* VF device: open by PCI if specified, else use N3 device */
+    if (g_vf_pci[0] != '\0') {
+        dev_result = open_doca_device_by_pci(g_vf_pci, &g_vf_dev);
+        if (dev_result != DOCA_SUCCESS) {
+            DOCA_LOG_ERR("Cannot open VF device %s: %s",
+                         g_vf_pci, doca_error_get_descr(dev_result));
+            return EXIT_FAILURE;
+        }
+    } else {
+        g_vf_dev = g_n3_dev;  /* fallback: same device as N3 */
+    }
 
     /* ── Comch server ──────────────────────────────────────────────── */
     if (comch_server_init() < 0) {
@@ -421,6 +482,10 @@ main(int argc, char *argv[])
     port_cfg.n3_port_id      = g_n3_port_id;
     port_cfg.n6_port_id      = g_n6_port_id;
     port_cfg.host_vf_port_id = g_host_vf_port_id;
+    port_cfg.n3_dev          = g_n3_dev;
+    port_cfg.n6_dev          = g_n6_dev;
+    port_cfg.host_vf_dev     = g_vf_dev;
+    port_cfg.host_vf_rep     = NULL;  /* set by caller if probing representors */
     port_cfg.upf_n3_ip       = g_upf_n3_ip;
     memcpy(port_cfg.upf_n6_mac, g_upf_n6_mac, 6);
     memcpy(port_cfg.dn_gw_mac,  g_dn_gw_mac,  6);
@@ -445,6 +510,16 @@ main(int argc, char *argv[])
     /* ── Cleanup ───────────────────────────────────────────────────── */
     dpu_pipeline_destroy(&g_pipeline);
     comch_server_destroy();
+
+    /* Close port devices (VF may alias N3, only close if distinct) */
+    if (g_vf_dev && g_vf_dev != g_n3_dev)
+        doca_dev_close(g_vf_dev);
+    if (g_n6_dev)
+        doca_dev_close(g_n6_dev);
+    if (g_n3_dev)
+        doca_dev_close(g_n3_dev);
+
+    rte_eal_cleanup();
 
     DOCA_LOG_INFO("DPU Agent exiting: recv=%lu inserted=%lu failed=%lu",
                   g_msgs_received, g_rules_inserted, g_rules_failed);

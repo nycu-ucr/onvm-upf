@@ -1,19 +1,24 @@
 /*
  * dpu_pipeline.h — DOCA Flow pipeline for DPU Agent (switch,hws mode)
  *
- * 7-pipe hierarchy on BlueField-3:
- *   ROOT           → control pipe (is_root=true), steers by port+protocol
- *   UL_MATCH       → basic pipe: TEID + QFI + inner_src_ip (rest IGNORED)
- *                     inline GTP decap + L2 inject + set pkt_meta + meter
- *   DL_MATCH       → basic pipe: outer_dst_ip = UE IP (rest IGNORED)
- *                     set pkt_meta + meter
- *   UL_COLOR_GATE  → basic pipe: GREEN|YELLOW → FWD out N6, RED → DROP
- *   DL_COLOR_GATE  → basic pipe: GREEN|YELLOW → FWD out N3, RED → DROP
- *   DL_ENCAP       → basic pipe (EGRESS root, is_root=true): match pkt_meta → GTP encap
- *   TO_HOST        → basic pipe: catch-all → FWD to Host VF representor
+ * 13-pipe hierarchy on BlueField-3 with priority-bucketed matching:
+ *   ROOT               → control pipe (is_root=true), steers by port_id+protocol
+ *   UL_MATCH[0..3]     → basic pipes: TEID + QFI + inner 5-tuple (IPs + proto)
+ *                         chained by precedence, decap + L2 inject + meter
+ *   DL_MATCH[0..3]     → basic pipes: outer 5-tuple (UE IP + SDF IPs + proto)
+ *                         chained by precedence, set pkt_meta + meter
+ *   UL_COLOR_GATE      → basic pipe: GREEN|YELLOW → FWD out N6, RED → DROP
+ *   DL_COLOR_GATE      → basic pipe: GREEN|YELLOW → FWD out N3, RED → DROP
+ *   DL_ENCAP           → basic pipe (EGRESS root): match pkt_meta → GTP encap + PSC
+ *   TO_HOST            → basic pipe: catch-all → FWD to Host VF representor
  *
- * Build order: TO_HOST → UL_COLOR_GATE → DL_COLOR_GATE →
- *              UL_MATCH → DL_MATCH → DL_ENCAP → ROOT
+ * Precedence: 3GPP precedence mapped to 4 priority buckets (lower = higher prio).
+ *   UL_MATCH[0].miss → UL_MATCH[1] → ... → UL_MATCH[3].miss → TO_HOST
+ *   Same for DL_MATCH.
+ *
+ * Per-entry match_mask wildcards unused SDF fields for catch-all PDRs.
+ *
+ * Build order: TO_HOST → COLOR_GATEs → MATCH[3..0] → DL_ENCAP → ROOT
  *
  * SPDX-License-Identifier: Apache-2.0
  */
@@ -34,12 +39,20 @@ extern "C" {
 #endif
 
 /* ── Port configuration ─────────────────────────────────────────────── */
-#define DPU_MAX_PORTS  8
+#define DPU_MAX_PORTS       8
+#define NUM_PRIO_BUCKETS    4      /* priority-bucketed match pipes          */
+#define PRIO_BUCKET_RANGE   64     /* 3GPP precedence per bucket             */
 
 typedef struct {
     uint16_t  n3_port_id;       /* physical port facing gNBs (uplink)     */
     uint16_t  n6_port_id;       /* physical port facing DN   (downlink)   */
     uint16_t  host_vf_port_id;  /* host VF representor for SW fallback    */
+
+    /* DOCA devices — required by doca_flow_port_cfg_set_dev() */
+    struct doca_dev     *n3_dev;       /* device for N3 port                */
+    struct doca_dev     *n6_dev;       /* device for N6 port                */
+    struct doca_dev     *host_vf_dev;  /* device for Host VF port           */
+    struct doca_dev_rep *host_vf_rep;  /* VF representor (NULL if PF-based) */
 
     /* MAC addresses for L2 injection during UL decap */
     uint8_t   upf_n6_mac[6];   /* UPF's N6 interface MAC (src in decap)  */
@@ -62,8 +75,8 @@ typedef struct {
 
     /* Pipe handles */
     struct doca_flow_pipe *root_pipe;
-    struct doca_flow_pipe *ul_match_pipe;
-    struct doca_flow_pipe *dl_match_pipe;
+    struct doca_flow_pipe *ul_match_pipes[NUM_PRIO_BUCKETS];
+    struct doca_flow_pipe *dl_match_pipes[NUM_PRIO_BUCKETS];
     struct doca_flow_pipe *ul_color_gate_pipe;
     struct doca_flow_pipe *dl_color_gate_pipe;
     struct doca_flow_pipe *dl_encap_pipe;
