@@ -558,12 +558,13 @@ build_root_pipe(dpu_pipeline_ctx_t *ctx)
 /**
  * Create a shared trTCM meter with CIR=GBR, PIR=MBR (both in kbps).
  * Uses port-level shared resource APIs matching upf_doca_pipeline pattern.
- * RFC 2697 (srTCM): CIR = MBR (rate limit), CBS = burst.
+ * RFC 2698 (trTCM): CIR=GBR (committed/guaranteed), PIR=MBR (peak/max).
+ * PIR must be >= CIR.  Packets exceeding PIR → RED, between CIR..PIR → YELLOW.
  *
  * @param port      DOCA Flow port
  * @param meter_id  [out] Allocated shared meter ID
- * @param gbr_kbps  Guaranteed Bit Rate (kbps) — unused in srTCM (reserved)
- * @param mbr_kbps  Maximum Bit Rate (kbps) — maps to CIR
+ * @param gbr_kbps  Guaranteed Bit Rate (kbps) — maps to CIR
+ * @param mbr_kbps  Maximum Bit Rate (kbps) — maps to PIR (must be >= gbr)
  * @return          DOCA_SUCCESS on success
  */
 static doca_error_t
@@ -573,22 +574,29 @@ create_trtcm_meter(struct doca_flow_port *port,
                    uint64_t mbr_kbps)
 {
     doca_error_t result;
-    (void)gbr_kbps;   /* reserved for future RFC 2698 if HW supports it */
 
     /* Convert kbps to bytes/sec for DOCA Flow */
-    uint64_t cir_bps = mbr_kbps * 1000 / 8;   /* CIR in bytes/sec */
+    uint64_t cir_bps = gbr_kbps * 1000 / 8;   /* CIR = GBR in bytes/sec */
+    uint64_t pir_bps = mbr_kbps * 1000 / 8;   /* PIR = MBR in bytes/sec */
 
-    /* If MBR is 0, create a permissive meter */
-    if (cir_bps == 0)
-        cir_bps = 1;  /* minimal rate — effectively unmetered */
+    /* PIR must be >= CIR per RFC 2698 */
+    if (pir_bps < cir_bps)
+        pir_bps = cir_bps;
+
+    /* If both are 0, create a permissive meter (minimal rate) */
+    if (pir_bps == 0) {
+        pir_bps = 1;
+        cir_bps = 1;
+    }
 
     struct doca_flow_shared_resource_cfg cfg = {};
     cfg.meter_cfg.limit_type = DOCA_FLOW_METER_LIMIT_TYPE_BYTES;
     cfg.meter_cfg.color_mode = DOCA_FLOW_METER_COLOR_MODE_BLIND;
-    cfg.meter_cfg.alg = DOCA_FLOW_METER_ALGORITHM_TYPE_RFC2697;
+    cfg.meter_cfg.alg = DOCA_FLOW_METER_ALGORITHM_TYPE_RFC2698;
     cfg.meter_cfg.cir = cir_bps;
     cfg.meter_cfg.cbs = (cir_bps / 100 > 4096) ? cir_bps / 100 : 4096;
-    cfg.meter_cfg.rfc2697.ebs = 0;
+    cfg.meter_cfg.pir = pir_bps;
+    cfg.meter_cfg.pbs = (pir_bps / 100 > 4096) ? pir_bps / 100 : 4096;
 
     /* Allocate a meter ID from the port */
     result = doca_flow_port_shared_resource_get(port,
@@ -699,7 +707,7 @@ dpu_pipeline_insert_rule(dpu_pipeline_ctx_t *ctx, const hw_offload_msg_t *msg)
     if (msg->direction == HW_DIR_UPLINK) {
         /* ── UPLINK: TEID + QFI + inner_src_ip ───────────────────────── */
 
-        /* Create srTCM meter: CIR=MBR_UL */
+        /* Create trTCM meter: CIR=GBR_UL, PIR=MBR_UL */
         uint32_t meter_id;
         result = create_trtcm_meter(ctx->ports[0], &meter_id,
                                      msg->gbr_ul, msg->mbr_ul);
@@ -743,7 +751,7 @@ dpu_pipeline_insert_rule(dpu_pipeline_ctx_t *ctx, const hw_offload_msg_t *msg)
     } else {
         /* ── DOWNLINK: outer_dst_ip (= UE IP) ───────────────────────── */
 
-        /* Create srTCM meter: CIR=MBR_DL */
+        /* Create trTCM meter: CIR=GBR_DL, PIR=MBR_DL */
         uint32_t meter_id;
         result = create_trtcm_meter(ctx->ports[0], &meter_id,
                                      msg->gbr_dl, msg->mbr_dl);
