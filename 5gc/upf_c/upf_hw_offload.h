@@ -148,8 +148,11 @@ upf_build_and_send_hw_offload(const UPDK_PDR *pdr)
     }
 
     /* ── QER: bit-rates ────────────────────────────────────────────── */
-    if (pdr->qer_count > 0 && pdr->qers[0]) {
-        const UPDK_QER *qer = pdr->qers[0];
+    /* Use pdr->qer (resolved by UpfPdrSelectQfiQer): the per-flow QER
+     * that carries qosFlowIdentifier, with fallback to qers[0].
+     * This is the same QER used for encap_qfi above. */
+    if (pdr->qer) {
+        const UPDK_QER *qer = pdr->qer;
         if (qer->flags.maximumBitrate) {
             msg->mbr_ul = qer->maximumBitrate.ul;
             msg->mbr_dl = qer->maximumBitrate.dl;
