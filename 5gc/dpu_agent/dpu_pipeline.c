@@ -9,6 +9,9 @@
  *   - pkt_meta-based GTP encap for downlink
  *   - Batched entry insertion (DOCA_FLOW_WAIT_FOR_BATCH)
  *
+ * All pipes are created on the switch manager port
+ * (doca_flow_port_switch_get) per switch,hws mode requirements.
+ *
  * Devargs: dv_flow_en=2,fdb_def_rule_en=0,vport_match=1,
  *          repr_matching_en=0,dv_xmeta_en=4
  *
@@ -119,7 +122,7 @@ build_to_host_pipe(dpu_pipeline_ctx_t *ctx)
     doca_error_t result;
     struct doca_flow_pipe_cfg *pipe_cfg;
 
-    result = doca_flow_pipe_cfg_create(&pipe_cfg, ctx->ports[0]);
+    result = doca_flow_pipe_cfg_create(&pipe_cfg, ctx->switch_port);
     if (result != DOCA_SUCCESS) return result;
 
     doca_flow_pipe_cfg_set_name(pipe_cfg, "TO_HOST");
@@ -154,7 +157,7 @@ build_to_host_pipe(dpu_pipeline_ctx_t *ctx)
     if (result != DOCA_SUCCESS)
         DOCA_LOG_ERR("TO_HOST entry insert failed");
 
-    doca_flow_entries_process(ctx->ports[0], 0, 0, 0);
+    doca_flow_entries_process(ctx->switch_port, 0, 0, 0);
     return result;
 }
 
@@ -169,7 +172,7 @@ build_color_gate_pipe(dpu_pipeline_ctx_t *ctx,
     doca_error_t result;
     struct doca_flow_pipe_cfg *pipe_cfg;
 
-    result = doca_flow_pipe_cfg_create(&pipe_cfg, ctx->ports[0]);
+    result = doca_flow_pipe_cfg_create(&pipe_cfg, ctx->switch_port);
     if (result != DOCA_SUCCESS) return result;
 
     doca_flow_pipe_cfg_set_name(pipe_cfg, name);
@@ -229,7 +232,7 @@ build_color_gate_pipe(dpu_pipeline_ctx_t *ctx,
         return result;
     }
 
-    doca_flow_entries_process(ctx->ports[0], 0, 0, 0);
+    doca_flow_entries_process(ctx->switch_port, 0, 0, 0);
 
     DOCA_LOG_INFO("%s: GREEN+YELLOW→fwd, RED→drop", name);
     return DOCA_SUCCESS;
@@ -243,7 +246,7 @@ build_ul_match_pipe(dpu_pipeline_ctx_t *ctx)
     doca_error_t result;
     struct doca_flow_pipe_cfg *pipe_cfg;
 
-    result = doca_flow_pipe_cfg_create(&pipe_cfg, ctx->ports[0]);
+    result = doca_flow_pipe_cfg_create(&pipe_cfg, ctx->switch_port);
     if (result != DOCA_SUCCESS) return result;
 
     doca_flow_pipe_cfg_set_name(pipe_cfg, "UL_MATCH");
@@ -329,7 +332,7 @@ build_dl_match_pipe(dpu_pipeline_ctx_t *ctx)
     doca_error_t result;
     struct doca_flow_pipe_cfg *pipe_cfg;
 
-    result = doca_flow_pipe_cfg_create(&pipe_cfg, ctx->ports[0]);
+    result = doca_flow_pipe_cfg_create(&pipe_cfg, ctx->switch_port);
     if (result != DOCA_SUCCESS) return result;
 
     doca_flow_pipe_cfg_set_name(pipe_cfg, "DL_MATCH");
@@ -394,12 +397,12 @@ build_dl_encap_pipe(dpu_pipeline_ctx_t *ctx)
     doca_error_t result;
     struct doca_flow_pipe_cfg *pipe_cfg;
 
-    result = doca_flow_pipe_cfg_create(&pipe_cfg, ctx->ports[0]);
+    result = doca_flow_pipe_cfg_create(&pipe_cfg, ctx->switch_port);
     if (result != DOCA_SUCCESS) return result;
 
     doca_flow_pipe_cfg_set_name(pipe_cfg, "DL_ENCAP");
     doca_flow_pipe_cfg_set_type(pipe_cfg, DOCA_FLOW_PIPE_BASIC);
-    doca_flow_pipe_cfg_set_is_root(pipe_cfg, false);
+    doca_flow_pipe_cfg_set_is_root(pipe_cfg, true);  /* root of EGRESS domain */
     doca_flow_pipe_cfg_set_domain(pipe_cfg, DOCA_FLOW_PIPE_DOMAIN_EGRESS);
     doca_flow_pipe_cfg_set_nr_entries(pipe_cfg, 2048);
 
@@ -450,10 +453,10 @@ build_dl_encap_pipe(dpu_pipeline_ctx_t *ctx)
         .port_id = ctx->port_cfg.n3_port_id,
     };
 
-    /* Miss → TO_HOST (shouldn't happen if pkt_meta is set correctly) */
+    /* Miss → DROP (egress domain cannot forward to default domain;
+     * unmatched pkt_meta means the packet was not tagged by DL_MATCH) */
     struct doca_flow_fwd fwd_miss = {
-        .type = DOCA_FLOW_FWD_PIPE,
-        .next_pipe = ctx->to_host_pipe,
+        .type = DOCA_FLOW_FWD_DROP,
     };
 
     result = doca_flow_pipe_create(pipe_cfg, &fwd, &fwd_miss,
@@ -474,7 +477,7 @@ build_root_pipe(dpu_pipeline_ctx_t *ctx)
     doca_error_t result;
     struct doca_flow_pipe_cfg *pipe_cfg;
 
-    result = doca_flow_pipe_cfg_create(&pipe_cfg, ctx->ports[0]);
+    result = doca_flow_pipe_cfg_create(&pipe_cfg, ctx->switch_port);
     if (result != DOCA_SUCCESS) return result;
 
     doca_flow_pipe_cfg_set_name(pipe_cfg, "ROOT");
@@ -544,7 +547,7 @@ build_root_pipe(dpu_pipeline_ctx_t *ctx)
         }
     }
 
-    doca_flow_entries_process(ctx->ports[0], 0, 0, 0);
+    doca_flow_entries_process(ctx->switch_port, 0, 0, 0);
 
     DOCA_LOG_INFO("ROOT pipe: prio0→UL_MATCH, prio1→DL_MATCH, miss→TO_HOST");
     return DOCA_SUCCESS;
@@ -650,6 +653,13 @@ dpu_pipeline_init(dpu_pipeline_ctx_t *ctx, const dpu_port_cfg_t *port_cfg)
 
     ctx->nb_ports = 3;
 
+    /* In switch,hws mode, all pipes must be created on the switch manager port */
+    ctx->switch_port = doca_flow_port_switch_get(ctx->ports[0]);
+    if (!ctx->switch_port) {
+        DOCA_LOG_ERR("Failed to get switch manager port");
+        return DOCA_ERROR_INITIALIZATION;
+    }
+
     /* Pair N3 and N6 ports for hairpin */
     result = doca_flow_port_pair(ctx->ports[0], ctx->ports[1]);
     if (result != DOCA_SUCCESS) {
@@ -709,7 +719,7 @@ dpu_pipeline_insert_rule(dpu_pipeline_ctx_t *ctx, const hw_offload_msg_t *msg)
 
         /* Create trTCM meter: CIR=GBR_UL, PIR=MBR_UL */
         uint32_t meter_id;
-        result = create_trtcm_meter(ctx->ports[0], &meter_id,
+        result = create_trtcm_meter(ctx->switch_port, &meter_id,
                                      msg->gbr_ul, msg->mbr_ul);
         if (result != DOCA_SUCCESS) return result;
 
@@ -743,7 +753,7 @@ dpu_pipeline_insert_rule(dpu_pipeline_ctx_t *ctx, const hw_offload_msg_t *msg)
             return result;
         }
 
-        doca_flow_entries_process(ctx->ports[0], 0, 0, 0);
+        doca_flow_entries_process(ctx->switch_port, 0, 0, 0);
 
         DOCA_LOG_INFO("UL rule inserted: hw_rule_id=%u teid=0x%x qfi=%u",
                       msg->hw_rule_id, msg->teid, msg->qfi);
@@ -753,7 +763,7 @@ dpu_pipeline_insert_rule(dpu_pipeline_ctx_t *ctx, const hw_offload_msg_t *msg)
 
         /* Create trTCM meter: CIR=GBR_DL, PIR=MBR_DL */
         uint32_t meter_id;
-        result = create_trtcm_meter(ctx->ports[0], &meter_id,
+        result = create_trtcm_meter(ctx->switch_port, &meter_id,
                                      msg->gbr_dl, msg->mbr_dl);
         if (result != DOCA_SUCCESS) return result;
 
@@ -822,7 +832,7 @@ dpu_pipeline_insert_rule(dpu_pipeline_ctx_t *ctx, const hw_offload_msg_t *msg)
             }
         }
 
-        doca_flow_entries_process(ctx->ports[0], 0, 0, 0);
+        doca_flow_entries_process(ctx->switch_port, 0, 0, 0);
 
         DOCA_LOG_INFO("DL rule inserted: hw_rule_id=%u ue_ip=%08x "
                       "ohc_teid=0x%x",

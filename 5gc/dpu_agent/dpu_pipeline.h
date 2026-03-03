@@ -9,7 +9,7 @@
  *                     set pkt_meta + meter
  *   UL_COLOR_GATE  → basic pipe: GREEN|YELLOW → FWD out N6, RED → DROP
  *   DL_COLOR_GATE  → basic pipe: GREEN|YELLOW → FWD out N3, RED → DROP
- *   DL_ENCAP       → basic pipe (EGRESS on N3): match pkt_meta → GTP encap
+ *   DL_ENCAP       → basic pipe (EGRESS root, is_root=true): match pkt_meta → GTP encap
  *   TO_HOST        → basic pipe: catch-all → FWD to Host VF representor
  *
  * Build order: TO_HOST → UL_COLOR_GATE → DL_COLOR_GATE →
@@ -57,6 +57,7 @@ typedef struct {
 typedef struct {
     /* DOCA Flow ports */
     struct doca_flow_port *ports[DPU_MAX_PORTS];
+    struct doca_flow_port *switch_port;  /* switch manager port (switch,hws) */
     uint16_t              nb_ports;
 
     /* Pipe handles */
