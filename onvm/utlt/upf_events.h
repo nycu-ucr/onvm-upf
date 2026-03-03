@@ -9,6 +9,11 @@
 #define UPF_C_SERVICE_ID  2
 #endif
 
+// Host Offload Agent — bridges UPF-C hw_offload_msg to DPU via DOCA Comch
+#ifndef HOST_AGENT_SERVICE_ID
+#define HOST_AGENT_SERVICE_ID  3
+#endif
+
 
 enum {
         UPF_EVENT_SET_BUFFER       = 0xA0,

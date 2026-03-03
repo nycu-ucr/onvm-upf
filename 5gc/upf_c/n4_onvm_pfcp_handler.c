@@ -47,6 +47,8 @@
 
 #include "pdr_hash_bypass.h"
 
+#include "upf_hw_offload.h"
+
 
 // for logging
 /* #include <inttypes.h>
@@ -748,6 +750,12 @@ Status UpfN4HandleCreatePdr(UpfSession *session, CreatePDR *createPdr) {
         rte_free(upfPdr);
         return STATUS_ERROR;
     }
+
+    /* Proactively push the PDR to DPU silicon via Host Agent.
+     * Non-fatal: if the Host Agent is not running or the DPU is
+     * unavailable, the software fallback (UPF-U) handles the traffic. */
+    upf_build_and_send_hw_offload(upfPdr);
+
     return STATUS_OK;
 }
 

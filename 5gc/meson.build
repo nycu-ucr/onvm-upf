@@ -4,10 +4,14 @@ subdir('classifiers')
 l25gc_nfs = [
     'upf_u',
     'upf_c',
-    'dn_app'
+    'dn_app',
+    'host_agent'
 ]
 
 rt_dep = cc.find_library('rt', required: false)
+
+# Optional: DOCA dependency for Host Agent (Comch client)
+doca_dep = dependency('doca', required: false)
 
 foreach nf : l25gc_nfs
     name = 'l25gc_' + nf
@@ -21,6 +25,14 @@ foreach nf : l25gc_nfs
 
     if nf == 'upf_u'
         deps += upf_u_link_deps
+    endif
+
+    if nf == 'host_agent' and doca_dep.found()
+        deps += host_agent_link_deps
+    elif nf == 'host_agent' and not doca_dep.found()
+        # Skip host_agent if DOCA SDK is not available on this host
+        warning('DOCA SDK not found — skipping host_agent build')
+        continue
     endif
 
     executable(
