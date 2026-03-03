@@ -752,10 +752,14 @@ phb_parse_flow_description(pdr->pdi.sdfFilter.flowDescription, &tmp);
 
 The `phb_parse_flow_description()` function (from `pdr_hash_bypass.h`) parses IPFilterRule syntax (e.g., `permit out ip from 10.0.0.0/8 to 192.168.1.1 80`) into a `phb_candidate_t` struct with separate IP/prefix/port/proto fields.
 
-### QER Extraction
+### QER Selection and Extraction
+
+A PDR can reference up to two QERs — one is a session-AMBR QER, the other is the per-flow QER that carries `qosFlowIdentifier` (and the MBR/GBR rates relevant to our meter). The UPF-C's `UpfPdrSelectQfiQer()` resolves the correct one into `pdr->qer` by scanning `pdr->qers[]` for the QFI-bearing entry, with fallback to `qers[0]`.
 
 ```c
-if (pdr->qer_count > 0 && pdr->qers[0]) {
+/* Use pdr->qer — the QFI-resolved QER (same one used for encap_qfi) */
+if (pdr->qer) {
+    const UPDK_QER *qer = pdr->qer;
     msg->mbr_ul = qer->maximumBitrate.ul;  // kbps
     msg->mbr_dl = qer->maximumBitrate.dl;
     msg->gbr_ul = qer->guaranteedBitrate.ul;
@@ -763,7 +767,7 @@ if (pdr->qer_count > 0 && pdr->qers[0]) {
 }
 ```
 
-The first QER associated with the PDR is used. Multiple QERs per PDR are not yet supported (would require chained meters).
+Both the `encap_qfi` (for PSC extension) and the MBR/GBR bit-rates are extracted from the same resolved `pdr->qer`, ensuring consistency.
 
 ### Failure Path
 
@@ -864,7 +868,7 @@ Currently, `doca_flow_entries_process()` is called after each rule insertion (no
 | **VF representor probing** | Deployment | `host_vf_rep = NULL` — needs `doca_dev_rep` probing for host VF |
 | **4G / no-PSC** | Scoped out | Only 5G SA with PSC extension is supported. 4G would require dual action templates |
 | **IPv6** | Not implemented | Pipe templates only match IPv4 headers |
-| **Multiple QERs per PDR** | Not implemented | Only first QER is used. Chained meters would be needed |
+| **Multiple QERs per PDR** | Partial | The per-flow QER (with `qosFlowIdentifier`) is selected via `UpfPdrSelectQfiQer()`; session-AMBR QER is not applied as a second meter |
 | **Comch buffer lifetime** | Likely safe | `rte_free()` after Comch submit — DOCA likely copies the buffer, but moving free to completion callback would be safest |
 | **Counter statistics** | Not implemented | Shared counters could be attached alongside meters for reporting |
 | **DROP/BUFF actions** | Not offloaded | Only FORWARD rules are offloaded; DROP/BUFF remain software-handled |
@@ -882,6 +886,8 @@ Currently, `doca_flow_entries_process()` is called after each rule insertion (no
 | `482e537` | fix(dpu_pipeline): 3 API bugs from DOCA SDK API reference docs |
 | `90c7de7` | feat(dpu_pipeline): SDF matching, precedence buckets, port binding, encap PSC, no-QER meter skip |
 | `d264d21` | fix(dpu_pipeline): add L4 port matching for full SDF 5-tuple enforcement |
+| `06d2da3` | refactor(dpu_pipeline): use protocol-agnostic .transport accessor for SDF L4 ports |
+| `13e6075` | fix(upf_hw_offload): use pdr->qer (QFI-resolved) for MBR/GBR instead of qers[0] |
 
 ---
 
