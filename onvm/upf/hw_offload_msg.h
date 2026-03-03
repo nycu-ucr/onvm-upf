@@ -78,14 +78,15 @@ typedef struct __attribute__((packed)) hw_offload_msg {
     struct in_addr ue_ipv4;    /* NBO — UE IP address                     */
 
     /* ── Match: QoS Flow Identifier ──────────────────────────────────── */
-    uint8_t   qfi;             /* 0 = wildcard                            */
+    uint8_t   qfi;             /* PDI match QFI (UL pipe), 0 = wildcard   */
+    uint8_t   encap_qfi;       /* QER QFI for GTP ext hdr (DL encap)      */
 
     /* ── Match: SDF 5-tuple (from flowDescription parsing) ───────────── */
     uint8_t   has_sdf;         /* 1 if SDF filter present                 */
     uint8_t   sdf_proto;       /* IP protocol (0 = any)                   */
     uint8_t   sdf_src_pref;    /* source prefix len (0 = wildcard)        */
     uint8_t   sdf_dst_pref;    /* dest prefix len   (0 = wildcard)        */
-    uint8_t   _pad1[3];        /* alignment padding                       */
+    uint8_t   _pad1[2];        /* alignment padding                       */
     uint32_t  sdf_src_ip;      /* HOST order                              */
     uint32_t  sdf_dst_ip;      /* HOST order                              */
     uint16_t  sdf_src_port;    /* HOST order (0 = wildcard)               */
@@ -101,6 +102,8 @@ typedef struct __attribute__((packed)) hw_offload_msg {
     uint8_t   _pad2;
     uint32_t  ohc_teid;        /* HOST order                              */
     struct in_addr ohc_ipv4;   /* NBO — remote gNB F-TEID IPv4            */
+
+    uint8_t   _pad3[4];        /* align uint64_t block to 8-byte boundary */
 
     /* ── QER: bit-rate enforcement (trTCM RFC 2698) ──────────────────── */
     uint64_t  mbr_ul;          /* Maximum Bit Rate uplink   (kbps)        */

@@ -164,15 +164,15 @@ comch_recv_cb(struct doca_comch_event_msg_recv *event,
     }
 }
 
-/* Comch send completion (for ACK messages back to host) */
+/* Comch send task completion callback (task-based model) */
 static void
-comch_send_complete_cb(struct doca_comch_event_msg_send *event,
-                       struct doca_comch_connection *conn,
-                       doca_error_t status)
+comch_send_complete_cb(struct doca_comch_task_send *task,
+                       union doca_data task_user_data,
+                       union doca_data ctx_user_data)
 {
-    (void)event;
-    (void)conn;
-    (void)status;
+    (void)task;
+    (void)task_user_data;
+    (void)ctx_user_data;
 }
 
 
@@ -222,10 +222,22 @@ comch_server_init(void)
     result = doca_pe_create(&g_comch_pe);
     if (result != DOCA_SUCCESS) return -1;
 
+    /* Server create: (dev, rep_dev, server_name, &server)
+     * rep_dev = NULL — DPU runs natively, no representor needed */
     result = doca_comch_server_create(g_comch_dev, NULL, g_server_name,
-                                      g_comch_pe, &g_comch_server);
+                                      &g_comch_server);
     if (result != DOCA_SUCCESS) {
         DOCA_LOG_ERR("Comch server create failed: %s",
+                     doca_error_get_descr(result));
+        return -1;
+    }
+
+    struct doca_ctx *ctx = doca_comch_server_as_ctx(g_comch_server);
+
+    /* Connect PE to server context */
+    result = doca_pe_connect_ctx(g_comch_pe, ctx);
+    if (result != DOCA_SUCCESS) {
+        DOCA_LOG_ERR("Failed to connect PE to server ctx: %s",
                      doca_error_get_descr(result));
         return -1;
     }
@@ -235,22 +247,28 @@ comch_server_init(void)
                                                  sizeof(hw_offload_msg_t) + 64);
     if (result != DOCA_SUCCESS) return -1;
 
-    /* Register callbacks */
+    /* Configure send task callbacks (required for task-based send) */
+    result = doca_comch_server_task_send_set_conf(g_comch_server,
+                                                   comch_send_complete_cb,
+                                                   comch_send_complete_cb,
+                                                   8);
+    if (result != DOCA_SUCCESS) return -1;
+
+    /* Register recv event callback */
     result = doca_comch_server_event_msg_recv_register(g_comch_server,
                                                         comch_recv_cb);
     if (result != DOCA_SUCCESS) return -1;
 
-    result = doca_comch_server_event_send_completion_register(g_comch_server,
-                                                               comch_send_complete_cb);
-    if (result != DOCA_SUCCESS) return -1;
-
+    /* Register connection + disconnection callbacks (both in one call) */
     result = doca_comch_server_event_connection_status_changed_register(
-                g_comch_server, comch_server_connection_cb);
+                g_comch_server,
+                comch_server_connection_cb,
+                comch_server_disconnect_cb);
     if (result != DOCA_SUCCESS) return -1;
 
-    /* Start the server */
-    result = doca_ctx_start(doca_comch_server_as_ctx(g_comch_server));
-    if (result != DOCA_SUCCESS) {
+    /* Start the server context */
+    result = doca_ctx_start(ctx);
+    if (result != DOCA_SUCCESS && result != DOCA_ERROR_IN_PROGRESS) {
         DOCA_LOG_ERR("Comch server start failed: %s",
                      doca_error_get_descr(result));
         return -1;

@@ -105,6 +105,10 @@ upf_build_and_send_hw_offload(const UPDK_PDR *pdr)
     if (pdr->pdi.flags.qfi)
         msg->qfi = pdr->pdi.qfi;
 
+    /* ── Encap QFI (from QER, for GTP extension header in DL encap) ── */
+    if (pdr->qer && pdr->qer->flags.qosFlowIdentifier)
+        msg->encap_qfi = pdr->qer->qosFlowIdentifier & 0x3F;
+
     /* ── Match: SDF 5-tuple ────────────────────────────────────────── */
     if (pdr->pdi.flags.sdfFilter && pdr->pdi.sdfFilter.flags.fd) {
         phb_candidate_t tmp;

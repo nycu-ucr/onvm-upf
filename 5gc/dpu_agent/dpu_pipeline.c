@@ -91,9 +91,16 @@ create_port(uint16_t port_id, struct doca_flow_port **port)
     if (result != DOCA_SUCCESS) return result;
 
     doca_flow_port_cfg_set_port_id(port_cfg, port_id);
-    doca_flow_port_cfg_set_devargs(port_cfg,
-        "dv_flow_en=2,fdb_def_rule_en=0,vport_match=1,"
-        "repr_matching_en=0,dv_xmeta_en=4");
+
+    /* devargs (dv_flow_en=2,...) are passed via EAL -a flag, not here */
+
+    /* Per-port resource allocation for meters */
+    result = doca_flow_port_cfg_set_nr_resources(port_cfg,
+        DOCA_FLOW_RESOURCE_METER, 4096);
+    if (result != DOCA_SUCCESS) {
+        doca_flow_port_cfg_destroy(port_cfg);
+        return result;
+    }
 
     result = doca_flow_port_start(port_cfg, port);
     doca_flow_port_cfg_destroy(port_cfg);
@@ -129,8 +136,7 @@ build_to_host_pipe(dpu_pipeline_ctx_t *ctx)
         .port_id = ctx->port_cfg.host_vf_port_id,
     };
 
-    struct doca_flow_match *matches[] = { &match };
-    doca_flow_pipe_cfg_set_match(pipe_cfg, matches, NULL, 1);
+    doca_flow_pipe_cfg_set_match(pipe_cfg, &match, NULL);
 
     struct doca_flow_actions actions = {};
     struct doca_flow_actions *actions_arr[] = { &actions };
@@ -143,7 +149,7 @@ build_to_host_pipe(dpu_pipeline_ctx_t *ctx)
     /* Insert the single catch-all entry */
     struct doca_flow_pipe_entry *entry;
     result = doca_flow_pipe_add_entry(0, ctx->to_host_pipe,
-                                       &match, &actions, NULL, &fwd,
+                                       &match, 0, &actions, NULL, &fwd,
                                        0, NULL, &entry);
     if (result != DOCA_SUCCESS)
         DOCA_LOG_ERR("TO_HOST entry insert failed");
@@ -178,9 +184,7 @@ build_color_gate_pipe(dpu_pipeline_ctx_t *ctx,
     struct doca_flow_match mask = {};
     mask.parser_meta.meter_color = UINT32_MAX;
 
-    struct doca_flow_match *matches[] = { &match };
-    struct doca_flow_match *masks[] = { &mask };
-    doca_flow_pipe_cfg_set_match(pipe_cfg, matches, masks, 1);
+    doca_flow_pipe_cfg_set_match(pipe_cfg, &match, &mask);
 
     struct doca_flow_actions actions = {};
     struct doca_flow_actions *actions_arr[] = { &actions };
@@ -207,7 +211,7 @@ build_color_gate_pipe(dpu_pipeline_ctx_t *ctx,
     green_match.parser_meta.meter_color = DOCA_FLOW_METER_COLOR_GREEN;
 
     result = doca_flow_pipe_add_entry(0, *pipe_out,
-                                       &green_match, &actions, NULL, &fwd,
+                                       &green_match, 0, &actions, NULL, &fwd,
                                        0, NULL, &entry);
     if (result != DOCA_SUCCESS) {
         DOCA_LOG_ERR("%s: GREEN entry failed", name);
@@ -218,7 +222,7 @@ build_color_gate_pipe(dpu_pipeline_ctx_t *ctx,
     yellow_match.parser_meta.meter_color = DOCA_FLOW_METER_COLOR_YELLOW;
 
     result = doca_flow_pipe_add_entry(0, *pipe_out,
-                                       &yellow_match, &actions, NULL, &fwd,
+                                       &yellow_match, 0, &actions, NULL, &fwd,
                                        0, NULL, &entry);
     if (result != DOCA_SUCCESS) {
         DOCA_LOG_ERR("%s: YELLOW entry failed", name);
@@ -251,23 +255,21 @@ build_ul_match_pipe(dpu_pipeline_ctx_t *ctx)
      *   CHANGEABLE: GTP TEID, GTP-ext QFI, inner IPv4 src
      *   IGNORED:    inner dst_ip, proto, ports (pipe mask = 0) */
     struct doca_flow_match match = {};
-    match.tun.type = DOCA_FLOW_TUN_GTP;
-    match.tun.gtp.teid = UINT32_MAX;        /* changeable sentinel */
-    match.tun.gtp_ext_psc.qfi = UINT8_MAX;  /* changeable */
+    match.tun.type = DOCA_FLOW_TUN_GTPU;
+    match.tun.gtp_teid = UINT32_MAX;        /* changeable sentinel */
+    match.tun.gtp_ext_psc_qfi = UINT8_MAX;  /* changeable */
     match.inner.l3_type = DOCA_FLOW_L3_TYPE_IP4;
     match.inner.ip4.src_ip = UINT32_MAX;     /* changeable */
     /* inner.ip4.dst_ip = 0, inner proto = 0, ports = 0 → IGNORED */
 
     struct doca_flow_match mask = {};
-    mask.tun.type = DOCA_FLOW_TUN_GTP;
-    mask.tun.gtp.teid = UINT32_MAX;
-    mask.tun.gtp_ext_psc.qfi = UINT8_MAX;
+    mask.tun.type = DOCA_FLOW_TUN_GTPU;
+    mask.tun.gtp_teid = UINT32_MAX;
+    mask.tun.gtp_ext_psc_qfi = UINT8_MAX;
     mask.inner.l3_type = DOCA_FLOW_L3_TYPE_IP4;
     mask.inner.ip4.src_ip = UINT32_MAX;
 
-    struct doca_flow_match *matches[] = { &match };
-    struct doca_flow_match *masks[] = { &mask };
-    doca_flow_pipe_cfg_set_match(pipe_cfg, matches, masks, 1);
+    doca_flow_pipe_cfg_set_match(pipe_cfg, &match, &mask);
 
     /* Action template:
      *   - Decap GTP tunnel (inline)
@@ -295,8 +297,7 @@ build_ul_match_pipe(dpu_pipeline_ctx_t *ctx)
     struct doca_flow_monitor monitor = {};
     monitor.meter_type = DOCA_FLOW_RESOURCE_TYPE_SHARED;
 
-    struct doca_flow_monitor *monitors[] = { &monitor };
-    doca_flow_pipe_cfg_set_monitor(pipe_cfg, monitors, 1);
+    doca_flow_pipe_cfg_set_monitor(pipe_cfg, &monitor);
 
     /* Hit → UL_COLOR_GATE */
     struct doca_flow_fwd fwd = {
@@ -348,9 +349,7 @@ build_dl_match_pipe(dpu_pipeline_ctx_t *ctx)
     mask.outer.l3_type = DOCA_FLOW_L3_TYPE_IP4;
     mask.outer.ip4.dst_ip = UINT32_MAX;
 
-    struct doca_flow_match *matches[] = { &match };
-    struct doca_flow_match *masks[] = { &mask };
-    doca_flow_pipe_cfg_set_match(pipe_cfg, matches, masks, 1);
+    doca_flow_pipe_cfg_set_match(pipe_cfg, &match, &mask);
 
     /* Action: set pkt_meta = hw_rule_id (changeable) */
     struct doca_flow_actions actions = {};
@@ -363,8 +362,7 @@ build_dl_match_pipe(dpu_pipeline_ctx_t *ctx)
     struct doca_flow_monitor monitor = {};
     monitor.meter_type = DOCA_FLOW_RESOURCE_TYPE_SHARED;
 
-    struct doca_flow_monitor *monitors[] = { &monitor };
-    doca_flow_pipe_cfg_set_monitor(pipe_cfg, monitors, 1);
+    doca_flow_pipe_cfg_set_monitor(pipe_cfg, &monitor);
 
     /* Hit → DL_COLOR_GATE */
     struct doca_flow_fwd fwd = {
@@ -402,7 +400,7 @@ build_dl_encap_pipe(dpu_pipeline_ctx_t *ctx)
     doca_flow_pipe_cfg_set_name(pipe_cfg, "DL_ENCAP");
     doca_flow_pipe_cfg_set_type(pipe_cfg, DOCA_FLOW_PIPE_BASIC);
     doca_flow_pipe_cfg_set_is_root(pipe_cfg, false);
-    doca_flow_pipe_cfg_set_dir(pipe_cfg, DOCA_FLOW_DIRECTION_NETWORK_TO_HOST);
+    doca_flow_pipe_cfg_set_domain(pipe_cfg, DOCA_FLOW_PIPE_DOMAIN_EGRESS);
     doca_flow_pipe_cfg_set_nr_entries(pipe_cfg, 2048);
 
     /* Match: pkt_meta = hw_rule_id (changeable) */
@@ -412,9 +410,7 @@ build_dl_encap_pipe(dpu_pipeline_ctx_t *ctx)
     struct doca_flow_match mask = {};
     mask.meta.pkt_meta = UINT32_MAX;
 
-    struct doca_flow_match *matches[] = { &match };
-    struct doca_flow_match *masks[] = { &mask };
-    doca_flow_pipe_cfg_set_match(pipe_cfg, matches, masks, 1);
+    doca_flow_pipe_cfg_set_match(pipe_cfg, &match, &mask);
 
     /* Action: GTP-U encapsulation
      * Template with changeable outer dest-IP and TEID.
@@ -441,9 +437,9 @@ build_dl_encap_pipe(dpu_pipeline_ctx_t *ctx)
     actions.encap_cfg.encap.outer.udp.l4_port.dst_port = RTE_BE16(GTP_UDP_PORT);
 
     /* GTP-U tunnel */
-    actions.encap_cfg.encap.tun.type = DOCA_FLOW_TUN_GTP;
-    actions.encap_cfg.encap.tun.gtp.teid = UINT32_MAX;      /* changeable */
-    actions.encap_cfg.encap.tun.gtp_ext_psc.qfi = UINT8_MAX; /* changeable */
+    actions.encap_cfg.encap.tun.type = DOCA_FLOW_TUN_GTPU;
+    actions.encap_cfg.encap.tun.gtp_teid = UINT32_MAX;      /* changeable */
+    actions.encap_cfg.encap.tun.gtp_ext_psc_qfi = UINT8_MAX; /* changeable */
 
     struct doca_flow_actions *actions_arr[] = { &actions };
     doca_flow_pipe_cfg_set_actions(pipe_cfg, actions_arr, NULL, NULL, 1);
@@ -561,57 +557,55 @@ build_root_pipe(dpu_pipeline_ctx_t *ctx)
 
 /**
  * Create a shared trTCM meter with CIR=GBR, PIR=MBR (both in kbps).
- * CBS and PBS are set to reasonable burst sizes (10ms worth of data).
+ * Uses port-level shared resource APIs matching upf_doca_pipeline pattern.
+ * RFC 2697 (srTCM): CIR = MBR (rate limit), CBS = burst.
  *
  * @param port      DOCA Flow port
- * @param meter_id  Shared meter ID to bind
- * @param gbr_kbps  Guaranteed Bit Rate (kbps) — maps to CIR
- * @param mbr_kbps  Maximum Bit Rate (kbps) — maps to PIR
+ * @param meter_id  [out] Allocated shared meter ID
+ * @param gbr_kbps  Guaranteed Bit Rate (kbps) — unused in srTCM (reserved)
+ * @param mbr_kbps  Maximum Bit Rate (kbps) — maps to CIR
  * @return          DOCA_SUCCESS on success
  */
 static doca_error_t
 create_trtcm_meter(struct doca_flow_port *port,
-                   uint32_t meter_id,
+                   uint32_t *meter_id,
                    uint64_t gbr_kbps,
                    uint64_t mbr_kbps)
 {
-    struct doca_flow_shared_resource_cfg cfg = {};
-    cfg.meter_cfg.type = DOCA_FLOW_METER_TYPE_RFC2698;
+    doca_error_t result;
+    (void)gbr_kbps;   /* reserved for future RFC 2698 if HW supports it */
 
     /* Convert kbps to bytes/sec for DOCA Flow */
-    uint64_t cir_bps = gbr_kbps * 1000 / 8;   /* CIR in bytes/sec */
-    uint64_t pir_bps = mbr_kbps * 1000 / 8;   /* PIR in bytes/sec */
+    uint64_t cir_bps = mbr_kbps * 1000 / 8;   /* CIR in bytes/sec */
 
-    /* If GBR is 0, set CIR to PIR (no guaranteed minimum) */
+    /* If MBR is 0, create a permissive meter */
     if (cir_bps == 0)
-        cir_bps = pir_bps;
+        cir_bps = 1;  /* minimal rate — effectively unmetered */
 
-    /* If both are 0, create a permissive meter (100 Gbps) */
-    if (pir_bps == 0) {
-        pir_bps = (uint64_t)100e9 / 8;   /* 100 Gbps */
-        cir_bps = pir_bps;
-    }
-
+    struct doca_flow_shared_resource_cfg cfg = {};
+    cfg.meter_cfg.limit_type = DOCA_FLOW_METER_LIMIT_TYPE_BYTES;
+    cfg.meter_cfg.color_mode = DOCA_FLOW_METER_COLOR_MODE_BLIND;
+    cfg.meter_cfg.alg = DOCA_FLOW_METER_ALGORITHM_TYPE_RFC2697;
     cfg.meter_cfg.cir = cir_bps;
-    cfg.meter_cfg.pir = pir_bps;
-
-    /* Burst sizes: 10ms worth of data, minimum 4 KB */
     cfg.meter_cfg.cbs = (cir_bps / 100 > 4096) ? cir_bps / 100 : 4096;
-    cfg.meter_cfg.pbs = (pir_bps / 100 > 4096) ? pir_bps / 100 : 4096;
+    cfg.meter_cfg.rfc2697.ebs = 0;
 
-    doca_error_t result = doca_flow_shared_resource_set_cfg(
-        DOCA_FLOW_SHARED_RESOURCE_METER, meter_id, &cfg);
+    /* Allocate a meter ID from the port */
+    result = doca_flow_port_shared_resource_get(port,
+                                                 DOCA_FLOW_SHARED_RESOURCE_METER,
+                                                 meter_id);
     if (result != DOCA_SUCCESS) {
-        DOCA_LOG_ERR("Meter %u config failed: %s",
-                     meter_id, doca_error_get_descr(result));
+        DOCA_LOG_ERR("Meter alloc failed: %s", doca_error_get_descr(result));
         return result;
     }
 
-    result = doca_flow_shared_resources_bind(
-        DOCA_FLOW_SHARED_RESOURCE_METER, &meter_id, 1, port);
+    /* Configure the allocated meter */
+    result = doca_flow_port_shared_resource_set_cfg(port,
+                                                     DOCA_FLOW_SHARED_RESOURCE_METER,
+                                                     *meter_id, &cfg);
     if (result != DOCA_SUCCESS) {
-        DOCA_LOG_ERR("Meter %u bind failed: %s",
-                     meter_id, doca_error_get_descr(result));
+        DOCA_LOG_ERR("Meter %u config failed: %s",
+                     *meter_id, doca_error_get_descr(result));
     }
     return result;
 }
@@ -702,22 +696,20 @@ dpu_pipeline_insert_rule(dpu_pipeline_ctx_t *ctx, const hw_offload_msg_t *msg)
         return DOCA_ERROR_INVALID_VALUE;
     }
 
-    /* Use hw_rule_id as shared meter ID (1:1 mapping per PDR) */
-    uint32_t meter_id = msg->hw_rule_id;
-
     if (msg->direction == HW_DIR_UPLINK) {
         /* ── UPLINK: TEID + QFI + inner_src_ip ───────────────────────── */
 
-        /* Create trTCM meter: CIR=GBR_UL, PIR=MBR_UL */
-        result = create_trtcm_meter(ctx->ports[0], meter_id,
+        /* Create srTCM meter: CIR=MBR_UL */
+        uint32_t meter_id;
+        result = create_trtcm_meter(ctx->ports[0], &meter_id,
                                      msg->gbr_ul, msg->mbr_ul);
         if (result != DOCA_SUCCESS) return result;
 
         /* Build entry match — convert HOST order to NBO for DOCA Flow */
         struct doca_flow_match match = {};
-        match.tun.type = DOCA_FLOW_TUN_GTP;
-        match.tun.gtp.teid = htonl(msg->teid);            /* HOST → NBO */
-        match.tun.gtp_ext_psc.qfi = msg->qfi;
+        match.tun.type = DOCA_FLOW_TUN_GTPU;
+        match.tun.gtp_teid = htonl(msg->teid);            /* HOST → NBO */
+        match.tun.gtp_ext_psc_qfi = msg->qfi;
         match.inner.l3_type = DOCA_FLOW_L3_TYPE_IP4;
         /* inner.ip4.src_ip: UE IP is NBO in the msg (struct in_addr) */
         match.inner.ip4.src_ip = msg->ue_ipv4.s_addr;     /* already NBO */
@@ -734,7 +726,7 @@ dpu_pipeline_insert_rule(dpu_pipeline_ctx_t *ctx, const hw_offload_msg_t *msg)
 
         struct doca_flow_pipe_entry *entry;
         result = doca_flow_pipe_add_entry(0, ctx->ul_match_pipe,
-                                           &match, &actions,
+                                           &match, 0, &actions,
                                            &monitor, NULL,
                                            0, NULL, &entry);
         if (result != DOCA_SUCCESS) {
@@ -751,8 +743,9 @@ dpu_pipeline_insert_rule(dpu_pipeline_ctx_t *ctx, const hw_offload_msg_t *msg)
     } else {
         /* ── DOWNLINK: outer_dst_ip (= UE IP) ───────────────────────── */
 
-        /* Create trTCM meter: CIR=GBR_DL, PIR=MBR_DL */
-        result = create_trtcm_meter(ctx->ports[0], meter_id,
+        /* Create srTCM meter: CIR=MBR_DL */
+        uint32_t meter_id;
+        result = create_trtcm_meter(ctx->ports[0], &meter_id,
                                      msg->gbr_dl, msg->mbr_dl);
         if (result != DOCA_SUCCESS) return result;
 
@@ -770,7 +763,7 @@ dpu_pipeline_insert_rule(dpu_pipeline_ctx_t *ctx, const hw_offload_msg_t *msg)
 
         struct doca_flow_pipe_entry *dl_entry;
         result = doca_flow_pipe_add_entry(0, ctx->dl_match_pipe,
-                                           &dl_match, &dl_actions,
+                                           &dl_match, 0, &dl_actions,
                                            &dl_monitor, NULL,
                                            0, NULL, &dl_entry);
         if (result != DOCA_SUCCESS) {
@@ -802,16 +795,16 @@ dpu_pipeline_insert_rule(dpu_pipeline_ctx_t *ctx, const hw_offload_msg_t *msg)
             encap_actions.encap_cfg.encap.outer.udp.l4_port.dst_port =
                 RTE_BE16(GTP_UDP_PORT);
 
-            encap_actions.encap_cfg.encap.tun.type = DOCA_FLOW_TUN_GTP;
-            encap_actions.encap_cfg.encap.tun.gtp.teid =
+            encap_actions.encap_cfg.encap.tun.type = DOCA_FLOW_TUN_GTPU;
+            encap_actions.encap_cfg.encap.tun.gtp_teid =
                 htonl(msg->ohc_teid);                       /* HOST → NBO */
 
-            /* QFI in GTP extension — use the QFI from the msg */
-            encap_actions.encap_cfg.encap.tun.gtp_ext_psc.qfi = msg->qfi;
+            /* QFI in GTP extension — from QER, not PDI match QFI */
+            encap_actions.encap_cfg.encap.tun.gtp_ext_psc_qfi = msg->encap_qfi;
 
             struct doca_flow_pipe_entry *encap_entry;
             result = doca_flow_pipe_add_entry(0, ctx->dl_encap_pipe,
-                                               &encap_match, &encap_actions,
+                                               &encap_match, 0, &encap_actions,
                                                NULL, NULL,
                                                0, NULL, &encap_entry);
             if (result != DOCA_SUCCESS) {

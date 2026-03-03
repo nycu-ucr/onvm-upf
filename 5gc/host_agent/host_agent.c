@@ -22,6 +22,7 @@
 #include <getopt.h>
 #include <inttypes.h>
 #include <signal.h>
+#include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -50,9 +51,11 @@ DOCA_LOG_REGISTER(HOST_AGENT);
 #define NF_TAG "host_agent"
 
 /* ── Comch state ────────────────────────────────────────────────────── */
-static struct doca_dev         *comch_dev;
+static struct doca_dev          *comch_dev;
 static struct doca_comch_client *comch_client;
-static struct doca_pe          *comch_pe;
+static struct doca_pe           *comch_pe;
+static struct doca_comch_connection *comch_conn;  /* cached connection */
+static volatile bool             comch_connected;
 
 /* Counters */
 static uint64_t g_msgs_received;
@@ -67,18 +70,29 @@ static char g_server_name[64] = "dpu_agent"; /* Comch server name       */
  *  DOCA Comch helpers
  * ═══════════════════════════════════════════════════════════════════════ */
 
-/* Callback invoked when the Comch connection is established */
+/* Callback invoked when the Comch client context state changes.
+ * Client uses doca_ctx_set_state_changed_cb, not a Comch-specific event. */
 static void
-comch_connection_cb(struct doca_comch_event_connection_status_changed *event,
-                    struct doca_comch_connection *conn,
-                    uint8_t change_successful)
+comch_ctx_state_changed_cb(const union doca_data user_data,
+                           struct doca_ctx *ctx,
+                           enum doca_ctx_states prev_state,
+                           enum doca_ctx_states next_state)
 {
-    if (change_successful)
-        DOCA_LOG_INFO("Comch connection established to DPU Agent");
-    else
-        DOCA_LOG_ERR("Comch connection failed");
-    (void)event;
-    (void)conn;
+    (void)user_data;
+    (void)ctx;
+    (void)prev_state;
+
+    if (next_state == DOCA_CTX_STATE_RUNNING) {
+        DOCA_LOG_INFO("Comch client connected to DPU Agent");
+        /* Cache the connection handle */
+        doca_error_t result = doca_comch_client_get_connection(comch_client, &comch_conn);
+        if (result == DOCA_SUCCESS)
+            comch_connected = true;
+    } else if (next_state == DOCA_CTX_STATE_IDLE) {
+        DOCA_LOG_WARN("Comch client disconnected or idle");
+        comch_connected = false;
+        comch_conn = NULL;
+    }
 }
 
 /* Callback invoked when a message is received from DPU (ACKs, etc.) */
@@ -94,18 +108,29 @@ comch_recv_cb(struct doca_comch_event_msg_recv *event,
     (void)conn;
 }
 
-/* Callback for Comch send completion */
+/* Callback for Comch send task completion (task-based model) */
 static void
-comch_send_complete_cb(struct doca_comch_event_msg_send *event,
-                       struct doca_comch_connection *conn,
-                       doca_error_t status)
+comch_send_task_comp_cb(struct doca_comch_task_send *task,
+                        union doca_data task_user_data,
+                        union doca_data ctx_user_data)
 {
-    if (status != DOCA_SUCCESS) {
-        DOCA_LOG_ERR("Comch send failed: %s", doca_error_get_descr(status));
-        __atomic_fetch_add(&g_msgs_failed, 1, __ATOMIC_RELAXED);
-    }
-    (void)event;
-    (void)conn;
+    (void)task_user_data;
+    (void)ctx_user_data;
+    __atomic_fetch_add(&g_msgs_sent, 1, __ATOMIC_RELAXED);
+    doca_task_free(doca_comch_task_send_as_task(task));
+}
+
+/* Callback for Comch send task error */
+static void
+comch_send_task_err_cb(struct doca_comch_task_send *task,
+                       union doca_data task_user_data,
+                       union doca_data ctx_user_data)
+{
+    (void)task_user_data;
+    (void)ctx_user_data;
+    DOCA_LOG_ERR("Comch send task failed");
+    __atomic_fetch_add(&g_msgs_failed, 1, __ATOMIC_RELAXED);
+    doca_task_free(doca_comch_task_send_as_task(task));
 }
 
 /* Open device by PCI address */
@@ -161,14 +186,47 @@ comch_init(void)
         return -1;
     }
 
-    /* Create Comch client */
-    result = doca_comch_client_create(comch_dev, g_server_name,
-                                      comch_pe, &comch_client);
+    /* Create Comch client: (dev, server_name, &client) — no PE arg */
+    result = doca_comch_client_create(comch_dev, g_server_name, &comch_client);
     if (result != DOCA_SUCCESS) {
         DOCA_LOG_ERR("Failed to create Comch client: %s",
                      doca_error_get_descr(result));
         return -1;
     }
+
+    struct doca_ctx *ctx = doca_comch_client_as_ctx(comch_client);
+
+    /* Connect PE to client context */
+    result = doca_pe_connect_ctx(comch_pe, ctx);
+    if (result != DOCA_SUCCESS) {
+        DOCA_LOG_ERR("Failed to connect PE to client ctx: %s",
+                     doca_error_get_descr(result));
+        return -1;
+    }
+
+    /* Track connection state via generic ctx state change callback */
+    result = doca_ctx_set_state_changed_cb(ctx, comch_ctx_state_changed_cb);
+    if (result != DOCA_SUCCESS) {
+        DOCA_LOG_ERR("Failed to set state changed cb: %s",
+                     doca_error_get_descr(result));
+        return -1;
+    }
+
+    /* Configure task-based send (required before ctx start) */
+    result = doca_comch_client_task_send_set_conf(comch_client,
+                                                   comch_send_task_comp_cb,
+                                                   comch_send_task_err_cb,
+                                                   16);
+    if (result != DOCA_SUCCESS) {
+        DOCA_LOG_ERR("Failed to set send task conf: %s",
+                     doca_error_get_descr(result));
+        return -1;
+    }
+
+    /* Register recv event callback */
+    result = doca_comch_client_event_msg_recv_register(comch_client,
+                                                        comch_recv_cb);
+    if (result != DOCA_SUCCESS) return -1;
 
     /* Set max message size to accommodate hw_offload_msg_t */
     result = doca_comch_client_set_max_msg_size(comch_client,
@@ -179,38 +237,26 @@ comch_init(void)
         return -1;
     }
 
-    /* Register event callbacks */
-    result = doca_comch_client_event_msg_recv_register(comch_client,
-                                                        comch_recv_cb);
-    if (result != DOCA_SUCCESS)
-        return -1;
-
-    result = doca_comch_client_event_send_completion_register(comch_client,
-                                                               comch_send_complete_cb);
-    if (result != DOCA_SUCCESS)
-        return -1;
-
-    result = doca_comch_client_event_connection_status_changed_register(
-                comch_client, comch_connection_cb);
-    if (result != DOCA_SUCCESS)
-        return -1;
-
     /* Start the client context (initiates connection handshake) */
-    result = doca_ctx_start(doca_comch_client_as_ctx(comch_client));
-    if (result != DOCA_SUCCESS) {
+    result = doca_ctx_start(ctx);
+    if (result != DOCA_SUCCESS && result != DOCA_ERROR_IN_PROGRESS) {
         DOCA_LOG_ERR("Failed to start Comch client: %s",
                      doca_error_get_descr(result));
         return -1;
     }
 
     /* Drive progress engine until connection is established */
-    for (int i = 0; i < 100; i++) {
+    for (int i = 0; i < 100 && !comch_connected; i++) {
         doca_pe_progress(comch_pe);
         usleep(10000);   /* 10 ms */
     }
 
-    DOCA_LOG_INFO("Comch client initialised — server=%s dev=%s",
-                  g_server_name, g_pci_addr);
+    if (comch_connected)
+        DOCA_LOG_INFO("Comch client connected — server=%s dev=%s",
+                      g_server_name, g_pci_addr);
+    else
+        DOCA_LOG_WARN("Comch client not yet connected (will retry in background)");
+
     return 0;
 }
 
@@ -257,31 +303,32 @@ msg_handler(void *msg_data,
                   msg->direction == HW_DIR_UPLINK ? "UL" : "DL",
                   msg->pdr_id, msg->hw_rule_id, msg->teid);
 
-    /* Transmit over DOCA Comch to the DPU Agent */
-    if (comch_client) {
-        struct doca_comch_connection *conn = NULL;
+    /* Transmit over DOCA Comch to the DPU Agent via task-based send */
+    if (comch_client && comch_connected && comch_conn) {
         doca_error_t result;
+        struct doca_comch_task_send *task;
 
-        /* Get the first (only) connection */
-        result = doca_comch_client_get_connection(comch_client, &conn);
-        if (result != DOCA_SUCCESS || !conn) {
-            DOCA_LOG_ERR("No active Comch connection — dropping msg "
-                         "hw_rule_id=%u", msg->hw_rule_id);
+        /* Allocate and init a send task */
+        result = doca_comch_client_task_send_alloc_init(comch_client,
+                                                         comch_conn,
+                                                         (const uint8_t *)msg,
+                                                         sizeof(hw_offload_msg_t),
+                                                         &task);
+        if (result != DOCA_SUCCESS) {
+            DOCA_LOG_ERR("Send task alloc failed for hw_rule_id=%u: %s",
+                         msg->hw_rule_id, doca_error_get_descr(result));
             __atomic_fetch_add(&g_msgs_failed, 1, __ATOMIC_RELAXED);
             rte_free(msg);
             return;
         }
 
-        /* Send the flat struct as-is — DPU Agent has the same header */
-        result = doca_comch_connection_send_msg(conn,
-                                                 (const uint8_t *)msg,
-                                                 sizeof(hw_offload_msg_t));
-        if (result == DOCA_SUCCESS) {
-            __atomic_fetch_add(&g_msgs_sent, 1, __ATOMIC_RELAXED);
-        } else {
-            DOCA_LOG_ERR("Comch send failed for hw_rule_id=%u: %s",
+        /* Submit the task — completion handled by comch_send_task_comp_cb */
+        result = doca_task_submit(doca_comch_task_send_as_task(task));
+        if (result != DOCA_SUCCESS) {
+            DOCA_LOG_ERR("Send task submit failed for hw_rule_id=%u: %s",
                          msg->hw_rule_id, doca_error_get_descr(result));
             __atomic_fetch_add(&g_msgs_failed, 1, __ATOMIC_RELAXED);
+            doca_task_free(doca_comch_task_send_as_task(task));
         }
     } else {
         DOCA_LOG_WARN("Comch not connected — dropping hw_rule_id=%u",

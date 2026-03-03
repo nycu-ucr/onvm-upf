@@ -1,0 +1,285 @@
+# L<sup>2</sup>5GC<sup>+</sup> `onvm-upf` — Context Reference
+
+This document summarizes the relevant context for the `onvm-upf` codebase so it can be handed off alongside the source tree. It captures repository layout, build/runtime expectations, and the behaviour of major components (UPF-C, UPF-U, classifier, QoS, PFCP control path, etc.).
+
+---
+
+## 1. High-Level Overview
+
+- **Purpose**: A disaggregated 5G User Plane Function (UPF) built on [OpenNetVM](https://github.com/sdnfv/openNetVM) + [DPDK], split into a control-plane NF (UPF-C) and a user-plane NF (UPF-U).
+- **Execution Model**: Both NFs run as OpenNetVM services within the same `onvm-manager`. They exchange messages via ONVM’s shared memory and lightweight event queue (`UpfSendEvt*`). PDRs, FARs, QERs and session state live in shared memzones.
+- **Classifier Snapshots**: UPF-C manages rule compilation and publishes immutable classifier snapshots via `onvm/upf/upf_cls_ctrl.h`. UPF-U consumes these snapshots with seqlock semantics (`UpfClsMaybeFlipAndAck`).
+- **Release Branches**: `next` (experimental), `opensource` (stable). Current tree targets DPDK `24.07.0`.
+
+---
+
+## 2. Repository Layout (Top Level)
+
+| Path | Description |
+| ---- | ----------- |
+| `5gc/` | 5G core components packaged as ONVM NFs: UPF-C (`upf_c_complete`), UPF-U (`upf_u_complete`), SMF, UE/RAN mockup, DN app, classifier backends. |
+| `onvm/` | Forked OpenNetVM core plus UPF-specific extensions (`upf_context`, PFCP helpers, shared classifier control). |
+| `docs/` | Sphinx docs, architecture diagrams (`docs/images/upf-arch.png`), tutorials (CloudLab, Wireshark, load balancer, etc.). |
+| `scripts/` | Install/build/runtime helpers (Meson bootstrap, NIC binding, ONVM manager launcher, CSV analysis). |
+| `examples/` | Standard OpenNetVM sample NFs (bridges, load balancer, AES encrypt, etc.) kept for testing. |
+| `tools/`, `style/`, `subprojects/` | Tooling, formatting configs, bundled Meson subprojects (eg. DPDK). |
+| `README.md`, `MANUAL_INSTALL.md` | Project introduction and manual setup references. |
+
+---
+
+## 3. Build & Environment
+
+- **Dependencies**: DPDK 24.11, Meson ≥0.58 (recommend 0.61+), Ninja, Python 3, libyaml. Scripts handle fetching (`scripts/install.sh`) and runtime setup (`scripts/setup_runtime.sh`).
+- **Hugepages & NIC binding**: See `scripts/setup_runtime.sh`; uses `dpdk-devbind.py` to map ports to `igb_uio`/`vfio`. Ensure hugepages sized to cover all mbufs (mbuf exhaustion triggers `rx_nombuf`).
+- **Compilation**: `./scripts/build.sh` wraps Meson configure + Ninja build + install of ONVM libs. Run `ldconfig` afterwards.
+- **Running Manager**: `./scripts/start.sh` abstracts `onvm_mgr`. Supply `-k PORTMASK` for port bitmap and `-n` NF core mask.
+- **NF Launch**: Each NF (UPF-C, UPF-U, dn_app, ue-ran) ships with `go.sh` wrappers or can be started via `./build/onvm-nf <binary> -l CORE -n ...`.
+
+---
+
+## 4. Runtime Topology & Workflow
+
+1. **onvm-manager** initialises shared memory, RX/TX rings, and service IDs for NFs.
+2. **UPF-C (`NF_TAG="upf_c"`; `5gc/upf_c_complete/upf.c`)**
+   - Parses config (`config/upfcfg.yaml`).
+   - Brings up PFCP server sockets (`pfcp_port`, IPv4/IPv6 lists), event queues, GTP socket state.
+   - Accepts PFCP Session Establishment/Modification/Deletion via `n4_onvm_pfcp_path.c` → `n4_onvm_pfcp_handler.c`.
+   - Converts PFCP IE payloads into UPDK structures, attaches them to sessions, pushes rules into shared classifier.
+   - Publishes classifier snapshots on each PDR install/update, sends `EVT_CLS_GC_REQ` to UPF-U to flip.
+3. **UPF-U (`NF_TAG="upf_u"`; legacy `5gc/upf_u_complete/upf_u.c`)**
+   - Parses dataplane config (`config/upf_u.yaml`) to learn DN/AN MACs, `SELF_IP`, and port→interface mapping.
+   - Pulls classifier pointer via `UpfClsMaybeFlipAndAck` before each burst.
+   - RX pipeline:
+     1. Pull packet metadata (`struct onvm_pkt_meta`), detect IPv4 via `onvm_pkt_ipv4_hdr`.
+     2. Direction check (dst IP vs self, plus port heuristics).
+     3. Build `ps_packet_t` key; for UL use TEID (inner IP/UDP), for DL use UE IP + 5-tuple.
+     4. Lookup PDR via `UpfClassifyGetPdrPtr`, load FAR/QER pointers.
+     5. Apply outer header removal, FAR action dispatch (`DROP`, `FORW`, `BUFF`).
+     6. For forwarding, add GTP-U encapsulation (`Encap`) as needed, re-fill IPv4/UDP headers, attach L2 header (different path for DL vs UL).
+     7. QoS metering: trTCM and per-UE token buckets (`ue_table`).
+     8. Update stats/logs into ONVM meta, send to egress core (`meta->destination = port ^ 1` for two-port setups).
+   - Tracks mbuf buffers for `UPDK_FAR_APPLY_ACTION_BUFF`; flushes using `msg_handler`.
+4. **Shared State**
+   - `onvm/upf/upf_context.c` owns session pools, TEID and UE IP hash maps, PDR/FAR/QER lists.
+   - `list_t` (in `onvm/list/`) used for dynamic rule lists.
+   - `upf_cls_ctrl_t` memzone ensures atomic classifier pointer hand-off between C and U components with seqlock version numbers.
+
+---
+
+## 5. Control Plane (UPF-C) Internals
+
+- **Initialisation Sequencing**: `UpfOpsList` in `5gc/upf_c_complete/upf_init.c` orchestrates library pools (buffer, timer, socket), context, configuration, PFCP server, thread subsystem, and packet receiver thread.
+- **Configuration Parsing**: `upf_config.c` ingests YAML via libyaml; populates `UpfContext` with PFCP, GTP, DNS, DNN ranges, and NAT hints.
+- **PFCP Handling**:
+  - `n4_onvm_pfcp_path.c`: entry point for N4 messages within ONVM NF.
+  - `n4_onvm_pfcp_handler.c`: handles Create/Update/Delete Session procedures; constructs UPDK rule structs; maintains `g_all_pdr_list`.
+  - Uses `PfcpXact` timers (T3 response/holding) integrated into `Self()->timerServiceList`.
+- **Classifier Publication**:
+  - Builds snapshot with `cls_create()` (PartitionSort backend by default).
+  - Converts PFCP PDRs via `upf_cls_adapter.cpp` (`updk_pdr_to_cls_rule`).
+  - Publishes pointer via `upf_cls_publish`, increments even version, defers freeing old snapshots until UPF-U ACKs via `EVT_CLS_GC_ACK`.
+- **Session State**:
+  - `UpfSessionAdd` (in `onvm/upf/upf_context.c`) populates session lists, maps TEID/UE IP, handles QER lookups.
+  - Sessions hold PDR, FAR, QER lists (`list_t`), SEID mapping, PDN info, RAN list membership.
+- **Eventing**: Sends ONVM messages through `onvm_nflib_send_msg_to_nf` to coordinate with UPF-U (classifier flips, session reports).
+
+---
+
+## 6. User Plane (UPF-U) Internals
+
+- **Configuration**: YAML loader (`UpfU_LoadAndParseConfig` in `upf_u_config.c`) sets:
+  - `DnMac`, `AnMac`: L2 addresses for SGi and AN sides.
+  - `SELF_IP`: stored host-order (`parseIpv4Address`) but re-used in network order via `rte_cpu_to_be_32`.
+  - `g_access_port`, `g_core_port` (SGi follows core).
+- **Packet Handler** (`packet_handler`):
+  - Logs source/destination IP address strings (`convertToIpAddress`) and verifies direction (recent log addition prints raw hex + host/network conversions).
+  - For UL: extracts TEID from GTP-U header (helpers in `onvm/upf/gtp.h`), fetches PDR via `GetPdrByTeid`.
+  - For DL: uses `GetPdrByUeIpAddress` (builds classifier key with host-order addresses, converts to BE for lookups).
+  - Handles FAR actions (encapsulation, duplication unsupported, buffering queue).
+  - QoS: TRTCM via `rte_meter_trtcm_*`, per-UE token buckets for GBR/non-GBR flows (`ue_table`).
+  - Token bucket updates rely on `rte_get_tsc_cycles` and `rte_get_tsc_hz`; blocking `usleep(1)` when insufficient tokens.
+- **Encapsulation**: `Encap` constructs GTP-U outer headers, attaches optional PDU session container when QER present.
+- **Direction-to-port mapping**: `PortToSourceInterface` converts ONVM port to PFCP Source Interface (Access/Core/SGi).
+- **Classifier Integration**: `UpfClsMaybeFlipAndAck` ensures pointer swap only when seqlock version stable; sends ACK event to UPF-C (`EVT_CLS_GC_ACK`).
+- **Buffer Handling**: `buffer[]` stores temporarily held packets when FAR requests buffering; drained in `msg_handler`.
+- **Stats & Logging**: `UTLT_*` macros used extensively; default log level set to `warning` to reduce jitter (change via config).
+
+---
+
+## 7. Classifier Subsystem (`5gc/classifiers`)
+
+- `classifier_wrapper.[ch]`: Uniform interface exposing `cls_create`, `cls_insert_rule`, `cls_classify_packet` with backend-agnostic `ps_packet_t`.
+- Backends:
+  - `PartitionSort/` (default): rule classification via partition sorts.
+  - `TupleSpaceSearch/`, `PriorityTupleSpaceSearch/`: alternative engines (compile-time selectable via `CLS_SELECTED_BACKEND_ID`).
+- `upf_cls_adapter.[ch]`: Translates UPDK PDRs into classifier-specific `pdr_t` structures; handles FlowDescription parsing, SourceInterface fallback, network instance hashing (FNV-1a).
+- `cls_heap_dpdk_shim.cpp`: ensures classifier allocations land in DPDK hugepages via custom new/delete.
+- Snapshots stored as opaque `cls_handle_t*` stashed in ONVM memzones by UPF-C, read-only within UPF-U.
+
+---
+
+## 8. Shared Libraries (`onvm/` tree)
+
+- `onvm/upf/upf_context.[ch]`: Session management, PFCP socket state, global PDR list, memzone initialisation (`UpfClsCtrlInit`).
+- `onvm/pfcp/`: PFCP message parsing, type definitions, converters (eg. `pfcp_convert.c` handles TEID, UE IP, F-SEID encoding).
+- `onvm/updk/`: UPDK data structures (rules, env params).
+- `onvm/utlt/`: Utility library (logging, networking, timers, hash, thread abstraction).
+- `onvm/onvm_nflib/`: Core NF helper library (metadata, packet helpers, logger).
+- `onvm/list/`: Lightweight linked-list implementation used across CP/DP.
+
+---
+
+## 9. Configuration Files
+
+### UPF-C (`5gc/upf_c_complete/config/upfcfg.yaml`)
+
+- `configuration.debugLevel`, `ReportCaller`: runtime logging controls.
+- `pfcp`: array of PFCP listen addresses (IPv4/IPv6).
+- `gtpu`: GTP-U bind addresses + optional alias.
+- `dnn_list`: DNN entries with CIDR pools, optional NAT interface names.
+- Additional example configs: `upfcfg.example.yaml`, `upfcfg.test.example.yaml`, `upfcfg.ulcl.example.yaml`.
+
+### UPF-U (`5gc/upf_u_complete/config/upf_u.yaml`)
+
+- `dataplane.dn_mac` / `an_mac`: next-hop MACs for CN↔DN and CN↔Access.
+- `dataplane.upf_ip`: user-plane GTP IPv4 address (string parsed into `SELF_IP`).
+- `dataplane.ports.access` / `core`: ONVM port IDs; SGi port mirrors `core`.
+- Legacy text config retained as `upf_u.txt` for reference.
+
+---
+
+## 10. Supporting NFs & Examples
+
+- `5gc/ue-ran`: Mock RAN NF generating uplink traffic for validation.
+- `5gc/dn_app`: Simplified DN-side consumer NF.
+- `5gc/smf`: Control-plane stub to pair with UPF-C (PFCP messaging).
+- `examples/`: Standard ONVM NFs helpful for performance validation or reproducing scenarios (e.g., `simple_forward`, `nf_router`, `firewall`).
+- `onvm_web/`: Web dashboard to visualise manager/NF stats (optional).
+
+---
+
+## 11. Operational Guidance
+
+- **Typical 3-node deployment**:
+  1. Access Node runs UE/RAN traffic generator.
+  2. Core Node hosts onvm-manager + UPF-C/UPF-U (plus optional dn_app).
+  3. Data Network Node terminates downlink flows.
+- **Service IDs (L25GC-plus)**: Managed via ONVM manager configuration (`-r NUM-SERVICES`). In the current split design, UPF ingress runs as service ID `1` (`UPF_INGRESS_SERVICE_ID`, also aliased as `UPF_U_SERVICE_ID`), UPF egress runs as service ID `14` (`UPF_EGRESS_SERVICE_ID`), and UPF-C runs as service ID `2` by default. These map to macros in `onvm/utlt/upf_events.h` and are used by PFCP handlers and classifier GC to route NF→NF events.
+- **Resource Tuning**:
+  - Adjust `DEFAULT_TB_RATE/DEPTH/TOKENS` and `MAX_OF_BUFFER_PACKET_SIZE` in `upf_u.c` for desired QoS behaviour.
+  - Increase mbuf pools/hugepages if `rx_nombuf` spikes (metrics logged via `acc{...}`).
+  - Consider leveraging port-based direction detection instead of only `SELF_IP` comparison on multi-service topologies.
+  - **Core Allocation**: Pin UPF-U to dedicated cores with isolated L1 cache to reduce jitter (set via `onvm-nf` launch core mask).
+
+
+---
+
+## 12. UPF-U Ingress/Egress Split (L25GC-plus)
+
+- **Motivation**: Replace the single run-to-completion UPF-U NF with two roles:
+  - Ingress: UL handled inline; DL packets enqueued into per-session FIFOs.
+  - Egress: busy-poll scheduler that round-robins sessions and drains their DL FIFOs to empty, applying DL actions and QoS before transmit.
+- **Processes & Binaries**:
+  - Source directory: `5gc/upf_u/`.
+  - Ingress NF: `NF_TAG="upf_ingress"`; main in `5gc/upf_u/upf_ingress.c`; built/installed as `l25gc_upf_ingress` under `onvm_output_dir/nf/upf_u`.
+  - Egress NF: `NF_TAG="upf_egress"`; main in `5gc/upf_u/upf_egress.c`; built/installed as `l25gc_upf_egress` under the same directory.
+  - Launch helpers:
+    - `cd 5gc/upf_u && ./go.sh ingress 1 ...` → starts ingress (`upf_u_ingress`) with service ID 1.
+    - `cd 5gc/upf_u && ./go.sh egress 13 ...` → starts egress (`upf_u_egress`) with service ID 13.
+- **Shared Session State**:
+  - `onvm/upf/upf_context.[ch]` now extends `UpfSession` with:
+    - `sess_id` (32-bit, process-agnostic identifier; derived from SEID).
+    - `dl_ring` (pointer to a per-session DL `rte_ring`).
+    - `buffering` (`rte_atomic32_t` flag; `0=live`, `1=paused`).
+  - Session pool, TEID→session, and UE-IP→session maps remain in hugepages as before and are shared across UPF-C, ingress, and egress.
+- **Per-session DL Rings**:
+  - Helper: `onvm/upf/upf_session_dl.{h,c}`:
+    - `UpfSessionEnsureDlRing(UpfSession *s)` lazily creates/looks up a `rte_ring` named `upf_dl_<sess_id>` with `MP_ENQ | SC_DEQ` semantics.
+    - The `dl_ring` pointer is published into `UpfSession` with a release barrier; consumers read it with acquire semantics.
+  - Elements: `struct rte_mbuf*` (no header stripping on enqueue); per-session FIFO order is preserved by single-consumer dequeue.
+- **Fast-path Behaviour**:
+  - **Ingress (UL + DL enqueue)**:
+    - UL path:
+      - Recognises UL by `dst_ip == SELF_IP` (GTP-U towards UPF).
+      - Extracts TEID (`get_teid_gtp_packet`), derives classifier key for UL, and looks up UL PDR via `GetPdrByTeid`.
+      - Applies outer-header removal and FAR/QER actions inline (`HandlePacketWithFar`), then attaches L2 and transmits via ONVM as in the legacy UPF-U.
+    - DL path:
+      - Recognises DL by `dst_ip != SELF_IP`.
+      - Looks up PDR via `GetPdrByUeIpAddress` and associates QERs for QoS bookkeeping (`GetQerByUEIpAddress`).
+      - Finds the `UpfSession` from UE IPv4; on first DL, `UpfSessionEnsureDlRing` creates/publishes the per-session DL ring.
+      - Enqueues the mbuf with `rte_ring_mp_enqueue`; on success, ingress does not free or transmit the packet (ownership moves to egress). On enqueue failure (e.g., ring full), ingress drops and frees.
+  - **Egress (RR drain + DL apply)**:
+    - Keeps a process-local registry of `sess_id` values to visit in round-robin.
+      - REGISTER messages from UPF-C (PFCP path) add a session to the registry.
+      - DELETE messages remove it after the CP has initiated session teardown.
+    - On each tick (`user_actions` callback), egress:
+      - Runs `UpfClsMaybeFlipAndAck(UPF_CLS_CONS_EGRESS)` to adopt new classifier snapshots (see classifier section below).
+      - Iterates the session registry in RR:
+        - If `buffering==1` or `dl_ring==NULL`, the session is skipped.
+        - Otherwise, it repeatedly `sc_dequeue`’s bursts from the per-session ring until empty.
+        - For each dequeued mbuf:
+          - Re-classifies DL by UE-IP and 5-tuple using the shared snapshot (`GetPdrByUeIpAddress`).
+          - Applies FAR/QER (encap, outer header removal) and attaches L2 (`AttachL2Header`).
+          - Applies QoS metering and token bucket logic identical to the legacy UPF-U, before final transmit.
+    - No ready queue or budgets: the scheduler is a pure RR over the registry; each live session is drained to empty on each visit.
+- **Buffering Semantics**:
+  - Shared atomic `buffering` flag in `UpfSession` is the single source of truth:
+    - `1` (paused): ingress continues to enqueue (or drops when the ring is full); egress observes the pause and simply skips this session on each RR pass.
+    - `0` (live): on next visit, egress drains the ring to empty and moves on.
+  - UPF-C drives pause/resume and delete semantics via `UPF_EVENT_SET_BUFFER`, `UPF_EVENT_CLEAR_AND_DRAIN`, and `UPF_EVENT_DELETE_SESSION` events; the behaviour itself is driven by the shared flag + egress RR loop.
+- **Classifier Integration with Two Consumers**:
+  - `onvm/upf/upf_cls_ctrl.h` still defines a single memzone-backed control slot (`MZ_UPF_CLS_CTRL`) with `active` pointer and `version` seqlock.
+  - UPF-C publishes new classifier snapshots using `upf_cls_publish` (now in `5gc/upf_c/n4_onvm_pfcp_handler.c`), which:
+    - Marks the control version as odd while updating (writer-in-progress), swaps the `active` pointer, then publishes an even stable version.
+    - Retains the retired snapshot pointer and a “needed ACK mask” telling GC how many consumers must acknowledge the new version.
+  - Ingress and egress each maintain a process-local `g_cls_local` and call `UpfClsMaybeFlipAndAck` with a consumer ID:
+    - Ingress uses `UPF_CLS_CONS_INGRESS` and ACKs from service ID `1`.
+    - Egress uses `UPF_CLS_CONS_EGRESS` and ACKs from service ID `13`.
+    - ACK messages carry both version and consumer ID; UPF-C frees the retired snapshot only after all required consumers have ACKed that version.
+
+
+---
+
+
+
+---
+
+## 14. Reference Documentation
+
+- `docs/index.rst` entry point; notable sub-sections:
+  - `docs/cloudlabtutorial/`, `docs/threenodetutorial/`: step-by-step deployment on CloudLab / 3-node setups.
+  - `docs/debug/`: ONVM debugging guidelines.
+  - `docs/examples/`: Example NF walkthroughs.
+  - `docs/images/upf-arch.png`: Architectural diagram used in `README.md`.
+- External references: 3GPP TS 29.244 (PFCP), TS 29.281 (GTP-U) — implicit in UPDK structures.
+
+---
+
+## 15. Quick File Reference
+
+| File | Role |
+| ---- | ---- |
+| `5gc/upf_c_complete/upf.c` | UPF-C main entry (initialisation, PFCP server, ONVM loop). |
+| `5gc/upf_c_complete/n4_onvm_pfcp_handler.c` | PFCP message handlers, classifier rebuild/publish logic. |
+| `5gc/upf_u_complete/upf_u.c` | UPF-U dataplane NF; packet handler, FAR/QER application, QoS. |
+| `5gc/upf_u_complete/upf_u_config.c` | YAML config parser for UPF-U (MAC/IP/ports). |
+| `5gc/upf_u/upf_ingress.c` | UPF-U ingress NF; UL inline dataplane, DL enqueue into per-session rings. |
+| `5gc/upf_u/upf_egress.c` | UPF-U egress NF; RR scheduler that drains per-session DL rings, applies DL actions/QoS, transmits. |
+| `onvm/upf/upf_context.c` | Session context, memzone init, session hash maps. |
+| `onvm/upf/upf_session_dl.c` | Per-session DL ring helper (`UpfSessionEnsureDlRing`, ring naming, publish semantics). |
+| `onvm/upf/gtp.h` | GTP-U header helpers (`get_teid_gtp_packet`, `get_gtpu_header_len_with_qfi`). |
+| `5gc/classifiers/upf_cls_adapter.cpp` | Converts UPDK PDRs to classifier rules. |
+| `5gc/classifiers/classifier_wrapper.cpp` | Backend-agnostic classifier API (PartitionSort default). |
+| `scripts/build.sh` / `scripts/start.sh` | Build, launch helper scripts. |
+| `docs/images/upf-arch.png` | High-level architecture diagram. |
+
+---
+
+### Maintainer Notes
+
+- Ensure `onvm-manager` and both UPF NFs agree on service IDs and memzones before rolling updates.
+- When transferring this context file, include any environment-specific overrides (e.g. `upfcfg.yaml`, `upf_u.yaml`, `scripts/start.sh` arguments) to reproduce deployments.
+
+---
+
+*Last updated: synchronised with repository state inspected via Codex agent.* 
