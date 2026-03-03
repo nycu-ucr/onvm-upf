@@ -70,9 +70,8 @@ init_doca_flow(void)
     doca_flow_cfg_set_nr_meters(cfg, 4096);
     doca_flow_cfg_set_mode_args(cfg, "switch,hws");
     doca_flow_cfg_set_cb_entry_process(cfg, entry_process_cb);
-    doca_flow_cfg_set_nr_shared_resource(cfg,
-                                          DOCA_FLOW_SHARED_RESOURCE_METER,
-                                          4096);
+    doca_flow_cfg_set_nr_shared_resource(cfg, 4096,
+                                          DOCA_FLOW_SHARED_RESOURCE_METER);
 
     result = doca_flow_init(cfg);
     doca_flow_cfg_destroy(cfg);
@@ -280,15 +279,16 @@ build_ul_match_pipe(dpu_pipeline_ctx_t *ctx)
      *   - Set pkt_meta = hw_rule_id */
     struct doca_flow_actions actions = {};
     actions.decap_type = DOCA_FLOW_RESOURCE_TYPE_NON_SHARED;
-    actions.decap_cfg.is_l2 = false;   /* decap GTP, not L2 tunnel */
-    actions.has_encap = true;          /* inject new L2 after decap */
+    actions.decap_cfg.is_l2 = false;   /* L3 decap: strip GTP tunnel */
 
-    /* L2 injection: Ethernet header for post-decap packet */
-    memcpy(actions.encap_cfg.encap.outer.eth.src_mac,
+    /* L2 injection via decap_cfg: new Ethernet header for post-decap packet.
+     * When is_l2=false (L3 tunnel decap), decap_cfg.eth provides the
+     * replacement L2 header — per upf_accel decap pipe pattern. */
+    memcpy(actions.decap_cfg.eth.src_mac,
            ctx->port_cfg.upf_n6_mac, 6);
-    memcpy(actions.encap_cfg.encap.outer.eth.dst_mac,
+    memcpy(actions.decap_cfg.eth.dst_mac,
            ctx->port_cfg.dn_gw_mac, 6);
-    actions.encap_cfg.encap.outer.eth.type = RTE_BE16(0x0800);  /* IPv4 */
+    actions.decap_cfg.eth.type = RTE_BE16(0x0800);  /* IPv4 */
 
     /* pkt_meta = UINT32_MAX → changeable per-entry */
     actions.meta.pkt_meta = UINT32_MAX;
@@ -733,9 +733,10 @@ dpu_pipeline_insert_rule(dpu_pipeline_ctx_t *ctx, const hw_offload_msg_t *msg)
         match.inner.ip4.src_ip = msg->ue_ipv4.s_addr;     /* already NBO */
 
         /* Actions: decap + L2 inject configured at pipe level,
-         * only pkt_meta varies per entry */
+         * only pkt_meta varies per entry.
+         * pkt_meta is doca_be32_t — must convert to NBO. */
         struct doca_flow_actions actions = {};
-        actions.meta.pkt_meta = msg->hw_rule_id;
+        actions.meta.pkt_meta = htonl(msg->hw_rule_id);
 
         /* Monitor: attach shared meter */
         struct doca_flow_monitor monitor = {};
@@ -773,7 +774,7 @@ dpu_pipeline_insert_rule(dpu_pipeline_ctx_t *ctx, const hw_offload_msg_t *msg)
         dl_match.outer.ip4.dst_ip = msg->ue_ipv4.s_addr;  /* NBO */
 
         struct doca_flow_actions dl_actions = {};
-        dl_actions.meta.pkt_meta = msg->hw_rule_id;
+        dl_actions.meta.pkt_meta = htonl(msg->hw_rule_id);
 
         struct doca_flow_monitor dl_monitor = {};
         dl_monitor.meter_type = DOCA_FLOW_RESOURCE_TYPE_SHARED;
@@ -793,10 +794,9 @@ dpu_pipeline_insert_rule(dpu_pipeline_ctx_t *ctx, const hw_offload_msg_t *msg)
         /* DL_ENCAP entry: match pkt_meta → GTP encap */
         if (msg->ohc_desc == HW_OHC_GTPU_UDP_IPV4) {
             struct doca_flow_match encap_match = {};
-            encap_match.meta.pkt_meta = msg->hw_rule_id;
+            encap_match.meta.pkt_meta = htonl(msg->hw_rule_id);
 
             struct doca_flow_actions encap_actions = {};
-            encap_actions.has_encap = true;
             encap_actions.encap_type = DOCA_FLOW_RESOURCE_TYPE_NON_SHARED;
 
             /* Outer: use MACs from port config (set at pipe level),
