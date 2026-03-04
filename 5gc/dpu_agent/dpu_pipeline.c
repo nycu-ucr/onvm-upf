@@ -824,7 +824,9 @@ dpu_pipeline_insert_rule(dpu_pipeline_ctx_t *ctx, const hw_offload_msg_t *msg)
         struct doca_flow_match match_mask = {};
         match_mask.tun.type = DOCA_FLOW_TUN_GTPU;
         match_mask.tun.gtp_teid = UINT32_MAX;
-        match_mask.tun.gtp_ext_psc_qfi = UINT8_MAX;
+        /* QFI: exact match when specified, wildcard (0) when qfi=0 */
+        if (msg->qfi > 0)
+            match_mask.tun.gtp_ext_psc_qfi = UINT8_MAX;
         match_mask.inner.l3_type = DOCA_FLOW_L3_TYPE_IP4;
         match_mask.inner.ip4.src_ip = UINT32_MAX;
         /* SDF dst_ip: use prefix mask if present, else wildcard (0) */

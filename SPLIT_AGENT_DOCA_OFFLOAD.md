@@ -267,6 +267,10 @@ Each `UL_MATCH[p]` pipe (4 instances, one per priority bucket) is a BASIC pipe m
 
 > **Note:** The protocol-agnostic `transport` accessor (`struct doca_flow_header_l4_port`) is used for L4 port matching. In DOCA Flow's relaxed match mode, `tcp`, `udp`, and `transport` are union members sharing the same memory; `transport` avoids protocol-specific ambiguity.
 
+> **Note (TEID-only matching):** The pipe matches `gtp_teid` but not the F-TEID IPv4 address (`fteid_ipv4`). In a single-BF3 5G SA deployment, all UL GTP-U traffic arriving on port N3 is already destined for this UPF's N3 IP — the F-TEID IP is implied by the physical port. The `fteid_ipv4` field is carried in `hw_offload_msg_t` for potential future use in multi-UPF or multi-DPU scenarios.
+
+> **Note (QFI wildcard):** When `qfi=0` in the message, the per-entry mask for `gtp_ext_psc_qfi` is left at 0 (wildcard), matching any QFI value. This handles PDRs that do not specify a QFI in the PDI. When `qfi > 0`, the mask is `UINT8_MAX` (exact match).
+
 ### Actions (set at creation time, some CHANGEABLE)
 
 | Action | Value | Description |
@@ -537,13 +541,22 @@ This means: in the **UL direction**, source=UE subnet, destination=server:80.
 
 For UL pipes, the SDF maps directly to **inner** headers (post-GTP-decap):
 
-| SDF Field | Packet Field |
-|-----------|-------------|
-| `sdf_src_ip` | `inner.ip4.src_ip` |
-| `sdf_dst_ip` | `inner.ip4.dst_ip` |
-| `sdf_proto` | `inner.ip4.next_proto` |
-| `sdf_src_port` | `inner.transport.src_port` |
-| `sdf_dst_port` | `inner.transport.dst_port` |
+| SDF Field | Packet Field | Notes |
+|-----------|-------------|-------|
+| *(not used)* | `inner.ip4.src_ip` ← `ue_ipv4` | Always exact-matched to the UE's IP (see note below) |
+| `sdf_dst_ip` | `inner.ip4.dst_ip` | Conditional; 0 = wildcard |
+| `sdf_proto` | `inner.ip4.next_proto` | Conditional; 0 = wildcard |
+| `sdf_src_port` | `inner.transport.src_port` | Conditional; 0 = wildcard |
+| `sdf_dst_port` | `inner.transport.dst_port` | Conditional; 0 = wildcard |
+
+> **Why `sdf_src_ip` is not applied separately:** Rules are installed per-session per-UE.
+> In UL, the inner source IP is always the UE's own IP.  When SDF says `"from assigned"`,
+> `sdf_src_ip` equals `ue_ipv4` — redundant. When SDF says `"from any"`, `sdf_src_ip == 0`,
+> but the inner source is still the UE; matching on the exact `ue_ipv4` is more specific and
+> correct.  For subnet SDFs like `"from 10.0.0.0/8"`, the UPF-C already knows the exact UE IP
+> for this session, so exact-matching `ue_ipv4` is both correct and tighter than the subnet mask.
+> The `sdf_src_ip` field is carried in the message for completeness and potential future use
+> (e.g., multi-UE aggregation rules).
 
 ### Downlink SDF Application (Reversed)
 
@@ -578,10 +591,14 @@ doca_flow_pipe_cfg_set_match(pipe_cfg, &match, &mask);
 ```c
 struct doca_flow_match match_mask = {};
 
-// Always exact-match: TEID, QFI, UE IP
+// Always exact-match: TEID, UE IP
 match_mask.tun.gtp_teid = UINT32_MAX;
-match_mask.tun.gtp_ext_psc_qfi = UINT8_MAX;
 match_mask.inner.ip4.src_ip = UINT32_MAX;
+
+// QFI: exact-match if specified, wildcard if qfi=0
+if (msg->qfi > 0)
+    match_mask.tun.gtp_ext_psc_qfi = UINT8_MAX;
+// else: stays 0 → wildcard (matches any QFI)
 
 // SDF dst_ip: prefix mask or wildcard
 if (msg->has_sdf && msg->sdf_dst_pref > 0)
@@ -806,6 +823,8 @@ The DPU Agent calls `rte_eal_init()` to initialize DPDK, which is required by DO
 
 `dv_xmeta_en=4` is **critical** — without it, the `pkt_meta` tag set by DL_MATCH would not survive the cross-domain transit to DL_ENCAP on the egress side.
 
+> **Note (Relaxed Matching Mode):** In DOCA Flow v3.x, HWS mode (`dv_flow_en=2`, configured via `"switch,hws"` mode_args) uses **relaxed matching by default**. No explicit flag is needed. In relaxed mode, type selectors (`l3_type`, `l4_type_ext`, `tun.type`) in the `outer`, `inner`, and `tun` parts of `doca_flow_match` are used **only for the type cast of the underlying unions** — they do not enforce a hardware match on the specific protocol. It is the application's responsibility to ensure that packets arriving at a pipe have the expected header structure. Our pipeline achieves this via the ROOT control pipe, which steers packets by `port_id` and GTP-U protocol before they reach the match pipes.
+
 ---
 
 ## 23. Pipeline Teardown
@@ -872,6 +891,8 @@ Currently, `doca_flow_entries_process()` is called after each rule insertion (no
 | **Comch buffer lifetime** | Likely safe | `rte_free()` after Comch submit — DOCA likely copies the buffer, but moving free to completion callback would be safest |
 | **Counter statistics** | Not implemented | Shared counters could be attached alongside meters for reporting |
 | **DROP/BUFF actions** | Not offloaded | Only FORWARD rules are offloaded; DROP/BUFF remain software-handled |
+| **`fteid_ipv4` matching** | By design | UL matches TEID only; F-TEID IP is implied by the physical N3 port in single-BF3 deployments. Field is carried for future multi-UPF use |
+| **`sdf_src_ip` in UL/DL** | By design | Not applied to match; `ue_ipv4` is used instead (exact, per-UE). See §15 for rationale |
 
 ---
 
@@ -888,6 +909,8 @@ Currently, `doca_flow_entries_process()` is called after each rule insertion (no
 | `d264d21` | fix(dpu_pipeline): add L4 port matching for full SDF 5-tuple enforcement |
 | `06d2da3` | refactor(dpu_pipeline): use protocol-agnostic .transport accessor for SDF L4 ports |
 | `13e6075` | fix(upf_hw_offload): use pdr->qer (QFI-resolved) for MBR/GBR instead of qers[0] |
+| `556b1b8` | docs: update technical doc for QER selection fix and transport accessor |
+| `b9d3932` | fix(dpu_pipeline): QFI wildcard mask; docs: sdf_src_ip, fteid_ipv4, relaxed mode |
 
 ---
 
