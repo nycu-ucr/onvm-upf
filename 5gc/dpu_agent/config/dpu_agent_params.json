@@ -1,0 +1,37 @@
+{
+    "doca_dpdk_flags": {
+        "devices": [
+            {
+                "device": "pf",
+                "id": "0000:03:00.0",
+                "hws": true
+            },
+            {
+                "device": "pf",
+                "id": "0000:03:00.1",
+                "hws": true
+            }
+        ],
+        "core-list": "0-3",
+        "flags": ""
+    },
+    "doca_general_flags": {
+        "log-level": 60
+    },
+    "doca_program_flags": {
+        "comch-pci": "03:00.0",
+        "rep-pci": "",
+        "server-name": "dpu_agent",
+        "n3-pci": "03:00.0",
+        "n6-pci": "03:00.1",
+        "vf-pci": "",
+        "n3-port": 0,
+        "n6-port": 1,
+        "vf-port": 2,
+        "upf-n3-ip": "",
+        "upf-n3-mac": "00:00:00:00:00:03",
+        "gnb-mac": "00:00:00:00:00:04",
+        "upf-n6-mac": "00:00:00:00:00:01",
+        "dn-gw-mac": "00:00:00:00:00:02"
+    }
+}
