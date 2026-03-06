@@ -72,3 +72,4 @@ env
 **/.DS_Store
 
 .vscode/
+doca-samples/

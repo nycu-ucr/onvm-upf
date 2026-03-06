@@ -8,6 +8,7 @@ project('dpu_agent', 'c',
 )
 
 doca_dep = dependency('doca', required: true)
+argp_dep = dependency('doca-argp', required: true)  # DOCA Arg Parser (ships with SDK)
 
 # hw_offload_msg.h lives in onvm/upf/ — include that path
 upf_inc = include_directories('../../onvm/upf')
@@ -15,9 +16,10 @@ upf_inc = include_directories('../../onvm/upf')
 executable('dpu_agent',
     sources: files(
         'dpu_agent.c',
+        'dpu_agent_config.c',
         'dpu_pipeline.c',
     ),
     include_directories: [upf_inc],
-    dependencies: [doca_dep],
+    dependencies: [doca_dep, argp_dep],
     install: true,
 )

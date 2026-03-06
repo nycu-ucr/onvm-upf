@@ -80,7 +80,10 @@ The Split-Agent design separates the 5G UPF control plane (PFCP handling, sessio
 |------|----------|------|
 | `dpu_pipeline.h` | `5gc/dpu_agent/` | Pipeline context struct, pipe handles, API declarations |
 | `dpu_pipeline.c` | `5gc/dpu_agent/` | 13-pipe DOCA Flow hierarchy: build, insert, destroy (~1025 lines) |
-| `dpu_agent.c` | `5gc/dpu_agent/` | Standalone DOCA app on BF3 ARM: EAL init, Comch server, main loop (~528 lines) |
+| `dpu_agent.c` | `5gc/dpu_agent/` | Standalone DOCA app on BF3 ARM: doca_argp config, Comch server, main loop |
+| `dpu_agent_config.h` | `5gc/dpu_agent/` | doca_argp config struct (`dpu_agent_cfg_t`) and registration API |
+| `dpu_agent_config.c` | `5gc/dpu_agent/` | doca_argp callbacks + `register_dpu_agent_params()` |
+| `dpu_agent_params.json` | `5gc/dpu_agent/config/` | DOCA Arg Parser JSON config (PCI addresses, MACs, IPs) |
 | `host_agent.c` | `5gc/host_agent/` | ONVM NF #3: receives from UPF-C ring, sends via Comch client (~454 lines) |
 | `hw_offload_msg.h` | `onvm/upf/` | Flat C struct for cross-domain message (PDR→FAR→QER→SDF, ~126 lines) |
 | `upf_hw_offload.h` | `5gc/upf_c/` | Inline helper: builds `hw_offload_msg_t` from PFCP PDR and sends to Host Agent |
@@ -714,13 +717,52 @@ The DPU Agent (`5gc/dpu_agent/dpu_agent.c`) runs natively on BlueField-3 ARM cor
 
 ### Lifecycle
 
-1. **EAL init:** `rte_eal_init(argc, argv)` — consumes EAL args (including `-a` PCI devargs)
-2. **CLI parsing:** `--n3-pci`, `--n6-pci`, `--vf-pci`, MAC addresses, `--upf-n3-ip`
-3. **Device opening:** `open_doca_device_by_pci()` for N3, N6, and VF
-4. **Comch server:** `comch_server_init()` — listens for Host Agent connection
-5. **Pipeline:** `dpu_pipeline_init()` — builds the 13-pipe hierarchy
-6. **Main loop:** `while (g_running) doca_pe_progress(g_comch_pe)`
-7. **Shutdown:** `dpu_pipeline_destroy()`, `comch_server_destroy()`, `doca_dev_close()`, `rte_eal_cleanup()`
+1. **`doca_argp_init()`** — initialise DOCA Arg Parser with `&g_cfg` config struct
+2. **`doca_argp_set_dpdk_program(dpdk_init_cb)`** — register EAL init callback
+3. **`register_dpu_agent_params()`** — register 14 application-specific CLI/JSON params
+4. **`doca_argp_start(argc, argv)`** — parse CLI + JSON (`-j`), invoke DPDK callback (`rte_eal_init`), invoke all parameter callbacks to populate `g_cfg`
+5. **`finalize_config()`** — parse MAC/IP strings → binary, validate required fields
+6. **Device opening:** `open_doca_device_by_pci()` for N3, N6, and VF
+7. **Comch server:** `comch_server_init()` — opens host PF representor via `open_doca_device_rep_by_pci()`, then creates Comch server bound to that representor
+8. **Pipeline:** `dpu_pipeline_init()` — builds the 13-pipe hierarchy
+9. **Main loop:** `while (g_running) doca_pe_progress(g_comch_pe)`
+10. **Shutdown:** `dpu_pipeline_destroy()`, `comch_server_destroy()`, `doca_dev_close()`, `rte_eal_cleanup()`, `doca_argp_destroy()`
+
+### DOCA Arg Parser Configuration
+
+Deployment-specific parameters are managed by **`doca_argp`** (DOCA Arg Parser), the native DOCA SDK configuration framework used by all NVIDIA DOCA sample applications. This eliminates external dependencies (no libyaml needed on the DPU).
+
+Parameters can be provided via **CLI flags**, a **JSON config file** (`-j` / `--json`), or both (CLI overrides JSON). The JSON file follows the standard three-section DOCA layout (`config/dpu_agent_params.json`):
+
+```json
+{
+    "doca_dpdk_flags": {
+        "devices": [
+            { "device": "pf", "id": "0000:03:00.0", "hws": true },
+            { "device": "pf", "id": "0000:03:00.1", "hws": true }
+        ],
+        "core-list": "0-3",
+        "flags": ""
+    },
+    "doca_general_flags": { "log-level": 60 },
+    "doca_program_flags": {
+        "comch-pci": "03:00.0",
+        "rep-pci": "b5:00.0",
+        "server-name": "dpu_agent",
+        "n3-pci": "03:00.0",
+        "n6-pci": "03:00.1",
+        "upf-n3-ip": "192.168.1.1",
+        "upf-n3-mac": "00:11:22:33:44:55",
+        "gnb-mac": "00:11:22:33:44:66",
+        "upf-n6-mac": "00:11:22:33:44:77",
+        "dn-gw-mac": "00:11:22:33:44:88"
+    }
+}
+```
+
+**Key names** in `doca_program_flags` match the `--long-name` registered via `doca_argp_param_set_long_name()`. The `hws: true` flag in `doca_dpdk_flags` auto-generates HW-steering devargs (`dv_flow_en=2,fdb_def_rule_en=0,...`).
+
+`dpu_agent_config.c` registers 14 parameters (11 STRING, 3 INT) using callback macros (`STRING_CB`, `INT_CB`) and helper functions (`reg_str`, `reg_int`). Two parameters are marked mandatory: `--rep-pci` and `--upf-n3-ip`.
 
 ### Comch Receive Path
 
@@ -730,20 +772,38 @@ comch_recv_cb() → validate magic → switch(op) → dpu_pipeline_insert_rule()
 
 ### Device Management
 
-Three `doca_dev` handles are opened — one per physical port. The VF device falls back to the N3 device if `--vf-pci` is not specified. Devices are passed to `create_port()` which calls `doca_flow_port_cfg_set_dev()`.
+Three `doca_dev` handles are opened — one per physical port. The VF device falls back to the N3 device if `vf_pci` is not specified. Devices are passed to `create_port()` which calls `doca_flow_port_cfg_set_dev()`.
+
+Additionally, a `doca_dev_rep` is opened for the Comch server (`comch.rep_pci`). This representor identifies the host-side PF/VF on the BF3, allowing the DOCA Comch server to accept connections only from the designated host client. This is a **security requirement** per the DOCA Comch documentation: *"Only clients on the PF/VF/SF represented by the `doca_dev_rep` provided upon server creation can connect."*
 
 ### CLI Example
+
+With JSON config (recommended — edit `config/dpu_agent_params.json` once per deployment):
+
+```bash
+./dpu_agent -j config/dpu_agent_params.json
+```
+
+With CLI overrides (useful for testing — overrides JSON values):
+
+```bash
+./dpu_agent -j config/dpu_agent_params.json \
+  --rep-pci b5:00.1 \
+  --upf-n3-ip 10.0.0.1
+```
+
+Pure CLI (no JSON file):
 
 ```bash
 ./dpu_agent \
   -a 03:00.0,dv_flow_en=2,fdb_def_rule_en=0,vport_match=1,repr_matching_en=0,dv_xmeta_en=4 \
   -a 03:00.1,dv_flow_en=2,fdb_def_rule_en=0,vport_match=1,repr_matching_en=0,dv_xmeta_en=4 \
   -- \
-  --n3-pci 03:00.0 --n6-pci 03:00.1 \
-  --upf-n3-ip 192.168.1.1 \
-  --upf-n3-mac 00:11:22:33:44:55 --gnb-mac 00:11:22:33:44:66 \
-  --upf-n6-mac 00:11:22:33:44:77 --dn-gw-mac 00:11:22:33:44:88
+  --rep-pci b5:00.0 \
+  --upf-n3-ip 192.168.1.1
 ```
+
+> **`--rep-pci`** (required): The BF3-side representor PCI address of the host PF that runs the Host Agent. This is hardware-dependent and can be discovered on the DPU with `doca_caps` or by listing representors under `/sys/class/net/`. The DOCA Comch API requires this representor so the server knows which host-side PCIe function is allowed to connect.
 
 ---
 
@@ -923,6 +983,9 @@ onvm/upf/pdr_hash_bypass.h         ← phb_parse_flow_description(), SDF parser
 5gc/upf_c/upf_hw_offload.h         ← UPF-C → hw_offload_msg builder + sender
 5gc/host_agent/host_agent.c         ← ONVM NF #3, Comch client relay
 5gc/dpu_agent/dpu_agent.c           ← BF3 ARM app, Comch server, main loop
+5gc/dpu_agent/dpu_agent_config.h    ← doca_argp config struct + registration API
+5gc/dpu_agent/dpu_agent_config.c    ← doca_argp callbacks + register_dpu_agent_params()
+5gc/dpu_agent/config/dpu_agent_params.json ← DOCA Arg Parser JSON config (PCI, MAC, IP)
 5gc/dpu_agent/dpu_pipeline.h        ← Pipeline context + API declarations
 5gc/dpu_agent/dpu_pipeline.c        ← 13-pipe DOCA Flow hierarchy
 ```

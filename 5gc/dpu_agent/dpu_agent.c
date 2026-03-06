@@ -5,7 +5,7 @@
  * primary owner of the physical HW devices (no --proc-type flag needed).
  *
  * Lifecycle:
- *   1. Parse CLI for PCI device, port IDs, MAC addresses
+ *   1. doca_argp parses CLI / JSON config, calls DPDK EAL init callback
  *   2. Open DOCA Comch server — waits for Host Agent connection
  *   3. Initialise DOCA Flow pipeline (7-pipe switch,hws hierarchy)
  *   4. Main loop: drive DOCA PE for Comch events
@@ -16,7 +16,6 @@
  */
 
 #include <errno.h>
-#include <getopt.h>
 #include <signal.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -28,6 +27,7 @@
 
 #include <rte_eal.h>
 
+#include <doca_argp.h>
 #include <doca_comch.h>
 #include <doca_dev.h>
 #include <doca_error.h>
@@ -36,6 +36,7 @@
 
 #include "hw_offload_msg.h"
 #include "dpu_pipeline.h"
+#include "dpu_agent_config.h"
 
 DOCA_LOG_REGISTER(DPU_AGENT);
 
@@ -45,6 +46,7 @@ static dpu_pipeline_ctx_t g_pipeline;
 
 /* DOCA Comch server state */
 static struct doca_dev          *g_comch_dev;
+static struct doca_dev_rep      *g_comch_rep;   /* host PF/VF representor */
 static struct doca_comch_server *g_comch_server;
 static struct doca_pe           *g_comch_pe;
 
@@ -53,31 +55,28 @@ static uint64_t g_msgs_received;
 static uint64_t g_rules_inserted;
 static uint64_t g_rules_failed;
 
-/* ── CLI defaults ───────────────────────────────────────────────────── */
-static char g_pci_addr[32]    = "03:00.0";
-static char g_server_name[64] = "dpu_agent";
-
-/* PCI addresses for DOCA Flow ports */
-static char g_n3_pci[32]  = "03:00.0";   /* N3 physical port (PF0) */
-static char g_n6_pci[32]  = "03:00.1";   /* N6 physical port (PF1) */
-static char g_vf_pci[32]  = "";          /* Host VF (optional, probed if empty) */
-
 /* Opened DOCA devices for Flow ports */
 static struct doca_dev *g_n3_dev;
 static struct doca_dev *g_n6_dev;
 static struct doca_dev *g_vf_dev;
 
-/* Port IDs (explicitly assigned via doca_flow_port_cfg_set_port_id) */
-static uint16_t g_n3_port_id      = 0;
-static uint16_t g_n6_port_id      = 1;
-static uint16_t g_host_vf_port_id = 2;
-
-/* MAC addresses (configurable via CLI) */
-static uint8_t g_upf_n6_mac[6] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x01};
-static uint8_t g_dn_gw_mac[6]  = {0x00, 0x00, 0x00, 0x00, 0x00, 0x02};
-static uint8_t g_upf_n3_mac[6] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x03};
-static uint8_t g_gnb_mac[6]    = {0x00, 0x00, 0x00, 0x00, 0x00, 0x04};
-static uint32_t g_upf_n3_ip    = 0;  /* NBO, set via CLI */
+/* ── Configuration (populated by doca_argp from CLI / JSON) ─────────── */
+static dpu_agent_cfg_t g_cfg = {
+    .comch_pci       = "03:00.0",
+    .rep_pci         = "",
+    .server_name     = "dpu_agent",
+    .n3_pci          = "03:00.0",
+    .n6_pci          = "03:00.1",
+    .vf_pci          = "",
+    .n3_port_id      = 0,
+    .n6_port_id      = 1,
+    .host_vf_port_id = 2,
+    .upf_n3_ip_str   = "",
+    .upf_n3_mac_str  = "00:00:00:00:00:03",
+    .gnb_mac_str     = "00:00:00:00:00:04",
+    .upf_n6_mac_str  = "00:00:00:00:00:01",
+    .dn_gw_mac_str   = "00:00:00:00:00:02",
+};
 
 
 /* ── Signal handler ─────────────────────────────────────────────────── */
@@ -176,7 +175,7 @@ comch_recv_cb(struct doca_comch_event_msg_recv *event,
     }
 }
 
-/* Comch send task completion callback (task-based model) */
+/* Comch send task completion callbacks (task-based model) */
 static void
 comch_send_complete_cb(struct doca_comch_task_send *task,
                        union doca_data task_user_data,
@@ -185,6 +184,17 @@ comch_send_complete_cb(struct doca_comch_task_send *task,
     (void)task;
     (void)task_user_data;
     (void)ctx_user_data;
+}
+
+static void
+comch_send_error_cb(struct doca_comch_task_send *task,
+                    union doca_data task_user_data,
+                    union doca_data ctx_user_data)
+{
+    (void)task_user_data;
+    (void)ctx_user_data;
+    DOCA_LOG_WARN("Comch send task failed");
+    doca_task_free(doca_comch_task_send_as_task(task));
 }
 
 
@@ -219,24 +229,68 @@ open_doca_device_by_pci(const char *pci_addr, struct doca_dev **dev)
     return DOCA_ERROR_NOT_FOUND;
 }
 
+/* Open representor device by PCI address (server-side, for Comch) */
+static doca_error_t
+open_doca_device_rep_by_pci(struct doca_dev *dev, const char *rep_pci_addr,
+                            struct doca_dev_rep **rep_dev)
+{
+    struct doca_devinfo_rep **rep_list;
+    uint32_t nb_reps;
+    doca_error_t result;
+
+    result = doca_devinfo_rep_create_list(dev, DOCA_DEVINFO_REP_FILTER_NET,
+                                          &rep_list, &nb_reps);
+    if (result != DOCA_SUCCESS) {
+        DOCA_LOG_ERR("Failed to list representors: %s",
+                     doca_error_get_descr(result));
+        return result;
+    }
+
+    for (uint32_t i = 0; i < nb_reps; i++) {
+        char addr_buf[DOCA_DEVINFO_REP_PCI_ADDR_SIZE] = {};
+        result = doca_devinfo_rep_get_pci_addr_str(rep_list[i], addr_buf);
+        if (result != DOCA_SUCCESS)
+            continue;
+        if (strcmp(addr_buf, rep_pci_addr) == 0) {
+            result = doca_dev_rep_open(rep_list[i], rep_dev);
+            doca_devinfo_rep_destroy_list(rep_list);
+            return result;
+        }
+    }
+
+    doca_devinfo_rep_destroy_list(rep_list);
+    DOCA_LOG_ERR("Representor %s not found on device", rep_pci_addr);
+    return DOCA_ERROR_NOT_FOUND;
+}
+
 static int
 comch_server_init(void)
 {
     doca_error_t result;
 
-    result = open_doca_device_by_pci(g_pci_addr, &g_comch_dev);
+    result = open_doca_device_by_pci(g_cfg.comch_pci, &g_comch_dev);
     if (result != DOCA_SUCCESS) {
         DOCA_LOG_ERR("Cannot open device %s: %s",
-                     g_pci_addr, doca_error_get_descr(result));
+                     g_cfg.comch_pci, doca_error_get_descr(result));
         return -1;
     }
 
     result = doca_pe_create(&g_comch_pe);
     if (result != DOCA_SUCCESS) return -1;
 
-    /* Server create: (dev, rep_dev, server_name, &server)
-     * rep_dev = NULL — DPU runs natively, no representor needed */
-    result = doca_comch_server_create(g_comch_dev, NULL, g_server_name,
+    /* Open the host PF/VF representor — required by DOCA Comch server to
+     * identify which host-side PCIe function is allowed to connect.
+     * See DOCA Comch docs §"Security Considerations": "Only clients on the
+     * PF/VF/SF represented by the doca_dev_rep provided upon server creation
+     * can connect to the server." */
+    result = open_doca_device_rep_by_pci(g_comch_dev, g_cfg.rep_pci, &g_comch_rep);
+    if (result != DOCA_SUCCESS) {
+        DOCA_LOG_ERR("Cannot open representor %s: %s",
+                     g_cfg.rep_pci, doca_error_get_descr(result));
+        return -1;
+    }
+
+    result = doca_comch_server_create(g_comch_dev, g_comch_rep, g_cfg.server_name,
                                       &g_comch_server);
     if (result != DOCA_SUCCESS) {
         DOCA_LOG_ERR("Comch server create failed: %s",
@@ -259,10 +313,10 @@ comch_server_init(void)
                                                  sizeof(hw_offload_msg_t) + 64);
     if (result != DOCA_SUCCESS) return -1;
 
-    /* Configure send task callbacks (required for task-based send) */
+    /* Configure send task callbacks (success + error) */
     result = doca_comch_server_task_send_set_conf(g_comch_server,
                                                    comch_send_complete_cb,
-                                                   comch_send_complete_cb,
+                                                   comch_send_error_cb,
                                                    8);
     if (result != DOCA_SUCCESS) return -1;
 
@@ -286,8 +340,8 @@ comch_server_init(void)
         return -1;
     }
 
-    DOCA_LOG_INFO("Comch server started: name=%s dev=%s",
-                  g_server_name, g_pci_addr);
+    DOCA_LOG_INFO("Comch server started: name=%s dev=%s rep=%s",
+                  g_cfg.server_name, g_cfg.comch_pci, g_cfg.rep_pci);
     return 0;
 }
 
@@ -303,6 +357,10 @@ comch_server_destroy(void)
         doca_pe_destroy(g_comch_pe);
         g_comch_pe = NULL;
     }
+    if (g_comch_rep) {
+        doca_dev_rep_close(g_comch_rep);
+        g_comch_rep = NULL;
+    }
     if (g_comch_dev) {
         doca_dev_close(g_comch_dev);
         g_comch_dev = NULL;
@@ -311,7 +369,7 @@ comch_server_destroy(void)
 
 
 /* ═══════════════════════════════════════════════════════════════════════
- *  CLI parsing
+ *  DPDK EAL init callback + config finalization
  * ═══════════════════════════════════════════════════════════════════════ */
 
 static int
@@ -326,94 +384,70 @@ parse_mac(const char *str, uint8_t mac[6])
     return 0;
 }
 
-static void
-usage(const char *progname)
+/**
+ * DPDK EAL init callback — registered via doca_argp_set_dpdk_program().
+ * Called by doca_argp_start() after it separates DPDK flags from app flags.
+ */
+static doca_error_t
+dpdk_init_cb(int argc, char **argv)
 {
-    printf("Usage: %s [EAL options] -- [options]\n\n", progname);
-    printf("Options:\n");
-    printf("  -d <PCI>          BF3 PCI address (Comch)  (default: %s)\n", g_pci_addr);
-    printf("  -s <name>         Comch server name        (default: %s)\n", g_server_name);
-    printf("  --n3-pci <PCI>    N3 port PCI address      (default: %s)\n", g_n3_pci);
-    printf("  --n6-pci <PCI>    N6 port PCI address      (default: %s)\n", g_n6_pci);
-    printf("  --vf-pci <PCI>    Host VF PCI address      (probed if empty)\n");
-    printf("  --n3-port <id>    N3 physical port ID      (default: %u)\n", g_n3_port_id);
-    printf("  --n6-port <id>    N6 physical port ID      (default: %u)\n", g_n6_port_id);
-    printf("  --vf-port <id>    Host VF representor ID   (default: %u)\n", g_host_vf_port_id);
-    printf("  --upf-n3-ip <IP>  UPF N3 IP (for encap)   (required)\n");
-    printf("  --upf-n6-mac <M>  UPF N6 MAC (for UL L2 inject)\n");
-    printf("  --dn-gw-mac <M>   DN gateway MAC\n");
-    printf("  --upf-n3-mac <M>  UPF N3 MAC (for DL encap)\n");
-    printf("  --gnb-mac <M>     gNB MAC (for DL encap)\n");
-    printf("  -h                Show this help\n");
+    int ret = rte_eal_init(argc, argv);
+    if (ret < 0) {
+        DOCA_LOG_ERR("EAL initialization failed");
+        return DOCA_ERROR_DRIVER;
+    }
+    return DOCA_SUCCESS;
 }
 
+/**
+ * Parse string config values → binary after doca_argp_start() completes.
+ * MAC strings → 6-byte arrays, IP string → NBO uint32_t.
+ * Also validates required fields as defence-in-depth (doca_argp_param_set_mandatory
+ * already ensures they are provided, but an empty string could slip through).
+ */
 static int
-parse_args(int argc, char *argv[])
+finalize_config(dpu_agent_cfg_t *cfg)
 {
-    static struct option long_opts[] = {
-        {"n3-pci",      required_argument, NULL, 0},
-        {"n6-pci",      required_argument, NULL, 0},
-        {"vf-pci",      required_argument, NULL, 0},
-        {"n3-port",     required_argument, NULL, 0},
-        {"n6-port",     required_argument, NULL, 0},
-        {"vf-port",     required_argument, NULL, 0},
-        {"upf-n3-ip",   required_argument, NULL, 0},
-        {"upf-n6-mac",  required_argument, NULL, 0},
-        {"dn-gw-mac",   required_argument, NULL, 0},
-        {"upf-n3-mac",  required_argument, NULL, 0},
-        {"gnb-mac",     required_argument, NULL, 0},
-        {NULL,          0,                 NULL, 0},
-    };
+    /* MAC strings → binary */
+    if (cfg->upf_n3_mac_str[0] != '\0' &&
+        parse_mac(cfg->upf_n3_mac_str, cfg->upf_n3_mac) < 0) {
+        DOCA_LOG_ERR("Invalid upf-n3-mac: %s", cfg->upf_n3_mac_str);
+        return -1;
+    }
+    if (cfg->gnb_mac_str[0] != '\0' &&
+        parse_mac(cfg->gnb_mac_str, cfg->gnb_mac) < 0) {
+        DOCA_LOG_ERR("Invalid gnb-mac: %s", cfg->gnb_mac_str);
+        return -1;
+    }
+    if (cfg->upf_n6_mac_str[0] != '\0' &&
+        parse_mac(cfg->upf_n6_mac_str, cfg->upf_n6_mac) < 0) {
+        DOCA_LOG_ERR("Invalid upf-n6-mac: %s", cfg->upf_n6_mac_str);
+        return -1;
+    }
+    if (cfg->dn_gw_mac_str[0] != '\0' &&
+        parse_mac(cfg->dn_gw_mac_str, cfg->dn_gw_mac) < 0) {
+        DOCA_LOG_ERR("Invalid dn-gw-mac: %s", cfg->dn_gw_mac_str);
+        return -1;
+    }
 
-    int c, opt_idx;
-    while ((c = getopt_long(argc, argv, "d:s:h", long_opts, &opt_idx)) != -1) {
-        if (c == 0) {
-            const char *name = long_opts[opt_idx].name;
-            if (strcmp(name, "n3-pci") == 0)
-                snprintf(g_n3_pci, sizeof(g_n3_pci), "%s", optarg);
-            else if (strcmp(name, "n6-pci") == 0)
-                snprintf(g_n6_pci, sizeof(g_n6_pci), "%s", optarg);
-            else if (strcmp(name, "vf-pci") == 0)
-                snprintf(g_vf_pci, sizeof(g_vf_pci), "%s", optarg);
-            else if (strcmp(name, "n3-port") == 0)
-                g_n3_port_id = (uint16_t)atoi(optarg);
-            else if (strcmp(name, "n6-port") == 0)
-                g_n6_port_id = (uint16_t)atoi(optarg);
-            else if (strcmp(name, "vf-port") == 0)
-                g_host_vf_port_id = (uint16_t)atoi(optarg);
-            else if (strcmp(name, "upf-n3-ip") == 0) {
-                struct in_addr a;
-                if (inet_pton(AF_INET, optarg, &a) == 1)
-                    g_upf_n3_ip = a.s_addr;  /* NBO */
-                else {
-                    fprintf(stderr, "Invalid IP: %s\n", optarg);
-                    return -1;
-                }
-            }
-            else if (strcmp(name, "upf-n6-mac") == 0)
-                parse_mac(optarg, g_upf_n6_mac);
-            else if (strcmp(name, "dn-gw-mac") == 0)
-                parse_mac(optarg, g_dn_gw_mac);
-            else if (strcmp(name, "upf-n3-mac") == 0)
-                parse_mac(optarg, g_upf_n3_mac);
-            else if (strcmp(name, "gnb-mac") == 0)
-                parse_mac(optarg, g_gnb_mac);
-        } else if (c == 'd') {
-            snprintf(g_pci_addr, sizeof(g_pci_addr), "%s", optarg);
-        } else if (c == 's') {
-            snprintf(g_server_name, sizeof(g_server_name), "%s", optarg);
-        } else if (c == 'h') {
-            usage(argv[0]);
-            return -1;
+    /* IP string → NBO */
+    if (cfg->upf_n3_ip_str[0] != '\0') {
+        struct in_addr a;
+        if (inet_pton(AF_INET, cfg->upf_n3_ip_str, &a) == 1) {
+            cfg->upf_n3_ip = a.s_addr;
         } else {
-            usage(argv[0]);
+            DOCA_LOG_ERR("Invalid upf-n3-ip: %s", cfg->upf_n3_ip_str);
             return -1;
         }
     }
 
-    if (g_upf_n3_ip == 0) {
-        fprintf(stderr, "ERROR: --upf-n3-ip is required\n");
-        usage(argv[0]);
+    /* Validate required fields (defence-in-depth) */
+    if (cfg->rep_pci[0] == '\0') {
+        DOCA_LOG_ERR("rep-pci is required (--rep-pci or JSON doca_program_flags)");
+        return -1;
+    }
+    if (cfg->upf_n3_ip == 0) {
+        DOCA_LOG_ERR("upf-n3-ip is required (--upf-n3-ip or JSON doca_program_flags)");
         return -1;
     }
 
@@ -428,43 +462,65 @@ parse_args(int argc, char *argv[])
 int
 main(int argc, char *argv[])
 {
+    doca_error_t result;
+
     signal(SIGINT,  signal_handler);
     signal(SIGTERM, signal_handler);
 
-    /* ── DPDK EAL init ─────────────────────────────────────────────── */
-    /* EAL consumes args before "--"; our options come after.
-     * Devargs (dv_flow_en=2,...) are passed via -a flags to EAL. */
-    int eal_ret = rte_eal_init(argc, argv);
-    if (eal_ret < 0) {
-        DOCA_LOG_ERR("EAL init failed");
+    /* ── doca_argp: init → register → start ────────────────────────── */
+    result = doca_argp_init(NULL, &g_cfg);
+    if (result != DOCA_SUCCESS) {
+        DOCA_LOG_ERR("doca_argp_init failed: %s", doca_error_get_descr(result));
         return EXIT_FAILURE;
     }
-    argc -= eal_ret;
-    argv += eal_ret;
 
-    if (parse_args(argc, argv) < 0)
+    doca_argp_set_dpdk_program(dpdk_init_cb);
+
+    result = register_dpu_agent_params();
+    if (result != DOCA_SUCCESS) {
+        DOCA_LOG_ERR("Failed to register argp params: %s",
+                     doca_error_get_descr(result));
+        doca_argp_destroy();
         return EXIT_FAILURE;
+    }
+
+    result = doca_argp_start(argc, argv);
+    if (result != DOCA_SUCCESS) {
+        DOCA_LOG_ERR("doca_argp_start failed: %s",
+                     doca_error_get_descr(result));
+        doca_argp_destroy();
+        return EXIT_FAILURE;
+    }
+
+    /* Parse string config values → binary (MACs, IP) and validate */
+    if (finalize_config(&g_cfg) < 0) {
+        doca_argp_destroy();
+        return EXIT_FAILURE;
+    }
 
     /* ── Open DOCA devices for Flow ports ──────────────────────────── */
     doca_error_t dev_result;
-    dev_result = open_doca_device_by_pci(g_n3_pci, &g_n3_dev);
+    dev_result = open_doca_device_by_pci(g_cfg.n3_pci, &g_n3_dev);
     if (dev_result != DOCA_SUCCESS) {
         DOCA_LOG_ERR("Cannot open N3 device %s: %s",
-                     g_n3_pci, doca_error_get_descr(dev_result));
+                     g_cfg.n3_pci, doca_error_get_descr(dev_result));
+        doca_argp_destroy();
         return EXIT_FAILURE;
     }
-    dev_result = open_doca_device_by_pci(g_n6_pci, &g_n6_dev);
+    dev_result = open_doca_device_by_pci(g_cfg.n6_pci, &g_n6_dev);
     if (dev_result != DOCA_SUCCESS) {
         DOCA_LOG_ERR("Cannot open N6 device %s: %s",
-                     g_n6_pci, doca_error_get_descr(dev_result));
+                     g_cfg.n6_pci, doca_error_get_descr(dev_result));
+        doca_argp_destroy();
         return EXIT_FAILURE;
     }
     /* VF device: open by PCI if specified, else use N3 device */
-    if (g_vf_pci[0] != '\0') {
-        dev_result = open_doca_device_by_pci(g_vf_pci, &g_vf_dev);
+    if (g_cfg.vf_pci[0] != '\0') {
+        dev_result = open_doca_device_by_pci(g_cfg.vf_pci, &g_vf_dev);
         if (dev_result != DOCA_SUCCESS) {
             DOCA_LOG_ERR("Cannot open VF device %s: %s",
-                         g_vf_pci, doca_error_get_descr(dev_result));
+                         g_cfg.vf_pci, doca_error_get_descr(dev_result));
+            doca_argp_destroy();
             return EXIT_FAILURE;
         }
     } else {
@@ -474,28 +530,30 @@ main(int argc, char *argv[])
     /* ── Comch server ──────────────────────────────────────────────── */
     if (comch_server_init() < 0) {
         DOCA_LOG_ERR("Failed to init Comch server");
+        doca_argp_destroy();
         return EXIT_FAILURE;
     }
 
     /* ── DOCA Flow pipeline ────────────────────────────────────────── */
     dpu_port_cfg_t port_cfg = {};
-    port_cfg.n3_port_id      = g_n3_port_id;
-    port_cfg.n6_port_id      = g_n6_port_id;
-    port_cfg.host_vf_port_id = g_host_vf_port_id;
+    port_cfg.n3_port_id      = (uint16_t)g_cfg.n3_port_id;
+    port_cfg.n6_port_id      = (uint16_t)g_cfg.n6_port_id;
+    port_cfg.host_vf_port_id = (uint16_t)g_cfg.host_vf_port_id;
     port_cfg.n3_dev          = g_n3_dev;
     port_cfg.n6_dev          = g_n6_dev;
     port_cfg.host_vf_dev     = g_vf_dev;
     port_cfg.host_vf_rep     = NULL;  /* set by caller if probing representors */
-    port_cfg.upf_n3_ip       = g_upf_n3_ip;
-    memcpy(port_cfg.upf_n6_mac, g_upf_n6_mac, 6);
-    memcpy(port_cfg.dn_gw_mac,  g_dn_gw_mac,  6);
-    memcpy(port_cfg.upf_n3_mac, g_upf_n3_mac, 6);
-    memcpy(port_cfg.gnb_mac,    g_gnb_mac,    6);
+    port_cfg.upf_n3_ip       = g_cfg.upf_n3_ip;
+    memcpy(port_cfg.upf_n6_mac, g_cfg.upf_n6_mac, 6);
+    memcpy(port_cfg.dn_gw_mac,  g_cfg.dn_gw_mac,  6);
+    memcpy(port_cfg.upf_n3_mac, g_cfg.upf_n3_mac, 6);
+    memcpy(port_cfg.gnb_mac,    g_cfg.gnb_mac,    6);
 
-    doca_error_t result = dpu_pipeline_init(&g_pipeline, &port_cfg);
+    result = dpu_pipeline_init(&g_pipeline, &port_cfg);
     if (result != DOCA_SUCCESS) {
         DOCA_LOG_ERR("Pipeline init failed: %s", doca_error_get_descr(result));
         comch_server_destroy();
+        doca_argp_destroy();
         return EXIT_FAILURE;
     }
 
@@ -520,6 +578,7 @@ main(int argc, char *argv[])
         doca_dev_close(g_n3_dev);
 
     rte_eal_cleanup();
+    doca_argp_destroy();
 
     DOCA_LOG_INFO("DPU Agent exiting: recv=%lu inserted=%lu failed=%lu",
                   g_msgs_received, g_rules_inserted, g_rules_failed);
