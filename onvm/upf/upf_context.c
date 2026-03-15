@@ -265,6 +265,29 @@ Status UpfPDRRegisterToSession(UpfSession *session, UpfPDR *pdr) {
     UTLT_Assert(session->pdr_list, return STATUS_ERROR, "PDR list not initialized");
 
     list_rpush(session->pdr_list, list_node_new(pdr));
+
+    if (pdr->pdi.flags.fTeid) {
+        uint32_t teid = pdr->pdi.fTeid.teid;
+
+        /* Check if this TEID is already registered (e.g. during session establishment
+           where UpfSessionAdd already inserted the first PDR's TEID). */
+        bool already_registered = false;
+        for (int i = 0; i < session->teid_count; i++) {
+            if (session->teid_list[i] == teid) {
+                already_registered = true;
+                break;
+            }
+        }
+
+        if (!already_registered) {
+            UTLT_Info("Registering additional TEID %u for session (count=%d)",
+                      teid, session->teid_count);
+            UTLT_Assert(InsertTEIDtoSessionMap(teid, session) == STATUS_OK,
+                return STATUS_ERROR, "Failed to map TEID %u to session", teid);
+        }
+    }
+
+    return STATUS_OK;
 }
 
 Status UpfFARRegisterToSession(UpfSession *session, UpfFAR * far) {
@@ -356,7 +379,8 @@ UpfSession *UpfSessionAdd(PfcpUeIpAddr *ueIp,
     //use to check srr flag
     session->srr_flag = false;
 
-    session->teid = rte_cpu_to_be_32(teid->teid);
+    session->teid_count = 0;
+    uint32_t first_teid = rte_cpu_to_be_32(teid->teid);
     session->pdn.paa.pdnType = pdnType;
     if (pdnType == PFCP_PDN_TYPE_IPV4) {
         session->ueIpv4.addr4.s_addr = rte_cpu_to_be_32(ueIp->addr4.s_addr);
@@ -365,8 +389,8 @@ UpfSession *UpfSessionAdd(PfcpUeIpAddr *ueIp,
         UTLT_Assert(0, return NULL, "UnSupported PDN Type(%d)", pdnType);
     }
 
-    UTLT_Assert(InsertTEIDtoSessionMap(session->teid, session) == STATUS_OK,
-                UpfSessionRemove(session); return NULL, "Unable to create Uplink data for TEID (%u)", session->teid);
+    UTLT_Assert(InsertTEIDtoSessionMap(first_teid, session) == STATUS_OK,
+                UpfSessionRemove(session); return NULL, "Unable to create Uplink data for TEID (%u)", first_teid);
     UTLT_Assert(InsertUEIPtoSessionMap(session->ueIpv4.addr4.s_addr, session) == STATUS_OK,
                 UpfSessionRemove(session); return NULL, "Unable to create Downlink data for UE IP (%u)", ueIp->addr4.s_addr);
 
@@ -385,7 +409,11 @@ Status UpfSessionRemove(UpfSession *session) {
         list_destroy(session->pdr_list);
     }
     UeIpToUpfSessionMapFree(session->ueIpv4.addr4.s_addr);
-    TeidToUpfSessionMapFree(session->teid);
+    /* Remove TEIDs from the hash map. TeidToUpfSessionMapFree modifies
+       teid_list via swap-and-shrink, so always remove index 0. */
+    while (session->teid_count > 0) {
+        TeidToUpfSessionMapFree(session->teid_list[0]);
+    }
     UpfSessionFree(session);
     return STATUS_OK;
 }

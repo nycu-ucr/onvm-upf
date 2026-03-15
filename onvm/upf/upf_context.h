@@ -28,6 +28,8 @@
 
 #include "list.h"
 
+#define MAX_NUM_OF_TEIDS 16
+
 #ifdef __cplusplus
 extern "C" {
 #endif /* __cplusplus */
@@ -132,7 +134,9 @@ typedef struct _UpfSession {
     Pdn             pdn;
     UpfUeIp         ueIpv4;
     UpfUeIp         ueIpv6;
-    uint32_t        teid;
+
+    uint32_t        teid_list[MAX_NUM_OF_TEIDS];  /* network byte order */
+    uint8_t         teid_count;
 
     /* User location */
     Tai             tai;
