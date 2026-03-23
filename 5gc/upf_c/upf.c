@@ -39,6 +39,7 @@
 #include "pfcp_path.h"
 
 #include "upf_cls_ctrl.h"
+#include "upf_sess_buf.h"
 
 #define NF_TAG "upf_c"
 
@@ -75,6 +76,11 @@ int main(int argc, char *argv[]) {
     // Create the shared classifier control slot
     if (UpfClsCtrlInit() < 0) {
         rte_exit(EXIT_FAILURE, "CLS_CTRL memzone init failed\n");
+    }
+
+    // Create the shared per-session buffer state
+    if (UpfSessBufInit() < 0) {
+        rte_exit(EXIT_FAILURE, "SESS_BUF memzone init failed\n");
     }
 
     UpfPDRGlobalInit();

@@ -263,8 +263,9 @@ typedef struct {
     UPDK_QER *qers[2];
     uint8_t   qer_count;
 
-    /* Precomputed SDF flow-description fields (set by UPF-C at Create/Update PDR).
-     * Eliminates per-packet string parsing of flowDescription in UPF-U. */
+    /* Precomputed fields (set by UPF-C at Create/Update PDR).
+     * Eliminates per-packet lookups in UPF-U. */
+    int32_t   session_index;   /* owning session's index (for per-session buffer lookup) */
     uint32_t  meter_key;       /* SourceInterfaceToPort(srcIf) + fd_target, or just the port */
     uint32_t  fd_target;       /* masked IP from "from <IP/prefix>" in flowDescription */
     uint8_t   has_fd;          /* 1 if flowDescription contains a specific IP (not "any") */
