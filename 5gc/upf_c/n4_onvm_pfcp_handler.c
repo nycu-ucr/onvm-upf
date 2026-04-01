@@ -689,6 +689,9 @@ Status UpfN4HandleCreatePdr(UpfSession *session, CreatePDR *createPdr) {
     /* Pre-compile SDF flowDescription into meter_key/fd_target/has_fd */
     UpfPdrPrecompileSdf(upfPdr, Self()->accessPort, Self()->corePort, Self()->sgiPort);
 
+    /* Pre-compute session index for O(1) buffer lookup in UPF-U */
+    upfPdr->session_index = session->index;
+
     // Register PDR to Session
     UTLT_Assert(UpfPDRRegisterToSession(session, upfPdr),
                 rte_free(upfPdr);
@@ -1207,6 +1210,9 @@ Status UpfN4HandleUpdatePdr(UpfSession *session, UpdatePDR *updatePdr) {
     /* Re-compile SDF flowDescription (PDI may have been updated) */
     UpfPdrPrecompileSdf(upfPdr, Self()->accessPort, Self()->corePort, Self()->sgiPort);
 
+    /* Pre-compute session index for O(1) buffer lookup in UPF-U */
+    upfPdr->session_index = session->index;
+
 #ifdef CHECK
     // Register PDR to Session
     UTLT_Assert(UpfPDRRegisterToSession(session, &upfPdr),
@@ -1333,6 +1339,14 @@ Status UpfN4HandleUpdateFar(UpfSession *session, UpdateFAR *updateFar) {
 
     UTLT_Assert(_ConvertUpdateFARTlvToRule(upfFar, updateFar) == STATUS_OK,
         return STATUS_ERROR, "Convert FAR TLV To Rule is failed");
+
+    /* Send drain event AFTER the FAR is updated in shared memory, so
+     * UPF-U sees the new FORW action when it processes drained packets. */
+    if ((oldAction & PFCP_FAR_APPLY_ACTION_BUFF) &&
+        (upfFar->applyAction & PFCP_FAR_APPLY_ACTION_FORW)) {
+         UpfSendEvt1(UPF_U_SERVICE_ID, UPF_EVENT_CLEAR_AND_DRAIN,
+                     (uintptr_t)session->index);
+    }
 
 #if HANDLE_BUFFER
     // Buffered packet handle

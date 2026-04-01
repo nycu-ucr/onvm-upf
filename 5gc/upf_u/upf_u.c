@@ -46,6 +46,7 @@
 
 #include "upf_events.h"
 #include "upf_cls_ctrl.h"
+#include "upf_sess_buf.h"
 
 #include "../classifiers/upf_cls_adapter.h"
 #include "../classifiers/classifier_wrapper.h"
@@ -74,7 +75,8 @@
 #define IP_MASKED(BIGENDIINT, LEN) (BIGENDIINT & (0xFFFFFFFF << (32-LEN)))
 #define MAX_UE 256 // Max number of UEs
 #define MIN(x, y) (((x) < (y)) ? (x) : (y))
-#define MAX_OF_BUFFER_PACKET_SIZE 30000
+#define INLINE_DRAIN_BATCH       8    /* pkts drained per INLINE (FORW)  */
+#define DRAIN_CHUNK             64    /* max pkts dequeued per drain call */
 
 /* mask for 20-bit IPv6 flow label */
 #ifndef IPV6_FLOWLABEL_MASK
@@ -112,9 +114,6 @@ int16_t g_sgi_port    = 0;
 struct rte_meter_trtcm_profile app_trtcm_profile;
 struct rte_meter_trtcm_profile app_flow_trtcm_profile;
 struct rte_meter_trtcm app_flows[APP_FLOWS_MAX];
-
-struct rte_mbuf *buffer[MAX_OF_BUFFER_PACKET_SIZE];
-uint32_t buffer_length = 0;
 
 /* trTCM */
 struct rte_meter_trtcm_params app_trtcm_params = {
@@ -947,13 +946,9 @@ HandlePacketWithFar(struct rte_mbuf *pkt, UPDK_FAR *far, UPDK_QER *qer, struct o
                 meta->action = ONVM_NF_ACTION_OUT;
                 break;
             case UPDK_FAR_APPLY_ACTION_BUFF:
-                meta->destination = pkt->port ^ 1;
+                /* UL should never hit BUFF; DL uses per-session rings.
+                 * If we get here unexpectedly, just drop the packet. */
                 meta->action = ONVM_NF_ACTION_DROP;
-                if (buffer_length < MAX_OF_BUFFER_PACKET_SIZE) {
-                    Encap(pkt, far, qer);
-                    buffer[buffer_length++] = pkt;
-                    buff = 1;
-                }
                 break;
             default:
                 UTLT_Error("Unspec apply action[%u] in FAR[%u]", far->applyAction, far->farId);
@@ -997,6 +992,44 @@ AttachL2Header(struct rte_mbuf *pkt, bool is_dl) {
     }
 
     eth_hdr->ether_type = rte_cpu_to_be_16(RTE_ETHER_TYPE_IPV4);
+}
+
+/* Per-session drain helper
+ * Dequeue up to max_pkts from session ring, set meta OUT, and TX.
+ * Returns the number of packets actually transmitted. */
+static uint32_t
+drain_session_batch(int sess_idx, uint32_t max_pkts, struct onvm_nf *nf) {
+    UpfSessBuf *sb = &g_sess_buf[sess_idx];
+    if (!sb->ring_created || !sb->ring)
+        return 0;
+
+    struct onvm_configuration *onvm_config = onvm_nflib_get_onvm_config();
+    struct rte_mbuf *drain_buf[DRAIN_CHUNK];
+    uint32_t total = 0;
+
+    while (total < max_pkts) {
+        uint32_t want = max_pkts - total;
+        if (want > DRAIN_CHUNK) want = DRAIN_CHUNK;
+        uint32_t n = rte_ring_sc_dequeue_burst(sb->ring,
+                        (void **)drain_buf, want, NULL);
+        if (n == 0) break;
+
+        /* Restore action to OUT so onvm_pkt_process_tx_batch sends them */
+        for (uint32_t j = 0; j < n; j++) {
+            struct onvm_pkt_meta *m =
+                onvm_get_pkt_meta(drain_buf[j],
+                                  onvm_config->dynfield_offset);
+            m->action = ONVM_NF_ACTION_OUT;
+        }
+
+        onvm_pkt_process_tx_batch(nf->nf_tx_mgr, drain_buf,
+                                  onvm_config->dynfield_offset, n, nf);
+        onvm_pkt_flush_all_nfs(nf->nf_tx_mgr, nf);
+        total += n;
+    }
+    if (rte_ring_count(sb->ring) == 0)
+        sb->touched = 0;
+    return total;
 }
 
 static int
@@ -1092,66 +1125,133 @@ packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm_nf_
         }
     }
 
-    int status = 0, color_result = 0;
-    status = HandlePacketWithFar(pkt, far, pdr->qer, meta);
-    if (meta->action == ONVM_NF_ACTION_DROP) {
-        UTLT_Info("Action is drop\n");
-    } else if (meta->action == ONVM_NF_ACTION_OUT) {
-        UTLT_Info("Action is out\n");
-    } else {
-        UTLT_Trace("Action is unknown\n");
-    }
-    AttachL2Header(pkt, is_dl);
-    if (meta->action == ONVM_NF_ACTION_OUT && is_dl) {
+    if (is_dl) {
+        /* ── DL: split BUFF vs FORW ─────────────────────────── */
+        uint8_t far_action = far->applyAction & FAR_ACTION_MASK;
+        struct onvm_nf *nf = nf_local_ctx->nf;
+        int32_t sess_idx = pdr->session_index;
 
-        if (ue_idx < 0) {
-            UTLT_Error("No UE IP found in the table");
-            return status;
+        /* DROP → just let the framework free the pkt */
+        if (far_action == UPDK_FAR_APPLY_ACTION_DROP) {
+            meta->action = ONVM_NF_ACTION_DROP;
+            goto dl_nocp;
+        }
+         /* Validate session ring */
+        if (sess_idx < 0 || sess_idx >= SESS_BUF_MAX_USERS) {
+            meta->action = ONVM_NF_ACTION_DROP;
+            goto dl_nocp;
+        }
+        UpfSessBuf *sb = &g_sess_buf[sess_idx];
+        if (!sb->ring_created || !sb->ring) {
+            meta->action = ONVM_NF_ACTION_DROP;
+            goto dl_nocp;
         }
 
-        // Step 1. trTCM (QoS flow) — use precomputed SDF fields from CP
-        bool isQos = false;
-        uint64_t curr_time = rte_get_tsc_cycles();
-        struct rte_meter_trtcm_profile *trtcm_profile = NULL;
-
-        if (pdr->has_fd) {
-            isQos = true;
-            trtcm_profile = &app_flow_trtcm_profile;
-            int ft_idx = ftSearch(pdr->meter_key);
-            color_result = trtcmColorHandle(cal_pktlen, curr_time, ft_idx, trtcm_profile);
-            if (trtcmPolicer(meta, color_result) > 0)
-                UTLT_Error("trTCM Policer error");
+        /* Encap (GTP-U outer header) */
+        if (far->flags.forwardingParameters &&
+            far->forwardingParameters.flags.outerHeaderCreation) {
+            UPDK_OuterHeaderCreation *ohc =
+                &far->forwardingParameters.outerHeaderCreation;
+            if (ohc->description ==
+                UPDK_OUTER_HEADER_CREATION_DESCRIPTION_GTPU_UDP_IPV4)
+                Encap(pkt, far, pdr->qer);
         }
-        
-        // Step 2. bucket (QoS flow)
-        if (isQos) {
-            if (meta->flags == RTE_COLOR_RED) {
+
+        meta->destination = pkt->port ^ 1;
+        AttachL2Header(pkt, true);
+
+        if (far_action == UPDK_FAR_APPLY_ACTION_BUFF) {
+            /* Buffer-only: prepare packet for later TX, enqueue, then DROP */
+            sb->is_buffering = 1;
+
+            /* Enqueue into session ring.
+             * Bump refcnt so the framework's rte_pktmbuf_free (DROP below)
+             * only decrements 2→1 — the ring holds the other reference. */
+            rte_mbuf_refcnt_update(pkt, 1);
+            if (rte_ring_sp_enqueue(sb->ring, pkt) != 0) {
+                rte_mbuf_refcnt_update(pkt, -1);
                 meta->action = ONVM_NF_ACTION_DROP;
+                goto dl_nocp;
             }
-            if (meta->flags == RTE_COLOR_GREEN) {
-                ue_table[ue_idx].ue_qos_tb_params.tb_tokens -= cal_pktlen;
-                meta->action = ONVM_NF_ACTION_OUT;
+
+            sb->touched = 1;
+            meta->action = ONVM_NF_ACTION_DROP;
+            goto dl_nocp;
+        }
+
+        /* QoS policing — FORW only */
+        if (far_action == UPDK_FAR_APPLY_ACTION_FORW) {
+            if (ue_idx < 0) {
+                UTLT_Error("No UE IP found in the table");
+                meta->action = ONVM_NF_ACTION_DROP;
+                goto dl_nocp;
             }
-            if (meta->flags == RTE_COLOR_YELLOW) {
-                while (ue_table[ue_idx].ue_qos_tb_params.tb_tokens < cal_pktlen) {
+
+            int color_result = 0;
+            bool isQos = false;
+            uint64_t curr_time = rte_get_tsc_cycles();
+            struct rte_meter_trtcm_profile *trtcm_profile = NULL;
+
+            if (pdr->has_fd) {
+                isQos = true;
+                trtcm_profile = &app_flow_trtcm_profile;
+                int ft_idx = ftSearch(pdr->meter_key);
+                color_result = trtcmColorHandle(cal_pktlen, curr_time,
+                                                ft_idx, trtcm_profile);
+                if (trtcmPolicer(meta, color_result) > 0)
+                    UTLT_Error("trTCM Policer error");
+            }
+
+            if (isQos) {
+                if (meta->flags == RTE_COLOR_RED) {
+                    meta->action = ONVM_NF_ACTION_DROP;
+                    goto dl_nocp;
+                }
+                if (meta->flags == RTE_COLOR_GREEN) {
+                    ue_table[ue_idx].ue_qos_tb_params.tb_tokens -= cal_pktlen;
+                }
+                if (meta->flags == RTE_COLOR_YELLOW) {
+                    while (ue_table[ue_idx].ue_qos_tb_params.tb_tokens < cal_pktlen) {
+                        updateTokenbyIndex(ue_idx);
+                        usleep(1);
+                    }
+                    ue_table[ue_idx].ue_qos_tb_params.tb_tokens -= cal_pktlen;
+                }
+            } else {
+                while (ue_table[ue_idx].ue_nqos_tb_params.tb_tokens < cal_pktlen) {
                     updateTokenbyIndex(ue_idx);
                     usleep(1);
                 }
-                ue_table[ue_idx].ue_qos_tb_params.tb_tokens -= cal_pktlen;
-                meta->action = ONVM_NF_ACTION_OUT;      
+                ue_table[ue_idx].ue_nqos_tb_params.tb_tokens -= cal_pktlen;
             }
         }
-        // Step 2. bucket (non QoS flow)
-        else {
-            while (ue_table[ue_idx].ue_nqos_tb_params.tb_tokens < cal_pktlen) {
-                updateTokenbyIndex(ue_idx);
-                usleep(1);
-            }
-            ue_table[ue_idx].ue_nqos_tb_params.tb_tokens -= cal_pktlen;
-            meta->action = ONVM_NF_ACTION_OUT;
-        }
+
+        /* Non-BUFF (typically FORW): drain any previously queued packets,
+         * then forward the current packet immediately (no enqueue). */
+        sb->is_buffering = 0;
+        if (sb->touched)
+            drain_session_batch(sess_idx, INLINE_DRAIN_BATCH, nf);
+
+        meta->action = ONVM_NF_ACTION_OUT;
+
+        goto dl_nocp;
+
+    dl_nocp:
+        if (far->applyAction & UPDK_FAR_APPLY_ACTION_NOCP) {
+            Event *msg = (Event *)rte_calloc(NULL, 1, sizeof(Event), 0);
+            msg->type = UPF_EVENT_SESSION_REPORT;
+            msg->arg0 = seid;
+            msg->arg1 = pdrId;
+            UTLT_Debug("Send to upf-c, namely service id is 2\n");
+            onvm_nflib_send_msg_to_nf(2, msg);
+        } 
+        return 0;
+    } else {
+        /* ── UL: original HandlePacketWithFar path (unchanged) ── */
+        int status = HandlePacketWithFar(pkt, far, pdr->qer, meta);
+        AttachL2Header(pkt, is_dl);
+        return status;
     }
-    return status;
 }
 
 void
@@ -1175,34 +1275,19 @@ msg_handler(void *msg_data, struct onvm_nf_local_ctx *nf_local_ctx) {
         return;
     }
 
-
-    struct onvm_nf *nf = nf_local_ctx->nf;
-
-    if (buffer_length <= 0) {
-        if (e) rte_free(e);
+    /* EVENT drain: CP tells us BUFF→FORW for a specific session */
+    if (e && (uint32_t)e->type == UPF_EVENT_CLEAR_AND_DRAIN) {
+        struct onvm_nf *nf = nf_local_ctx->nf;
+        int sess_idx = (int)(uintptr_t)e->arg0;
+        if (sess_idx >= 0 && sess_idx < SESS_BUF_MAX_USERS) {
+            g_sess_buf[sess_idx].is_buffering = 0;
+            uint32_t n = drain_session_batch(sess_idx, UINT32_MAX, nf);
+            UTLT_Debug("EVENT drain: sess %d, sent %u pkts\n", sess_idx, n);
+        }
+        rte_free(e);
         return;
     }
 
-    // struct onvm_pkt_meta *meta;
-//#ifdef FIX_BUFFER
-//    for (i = 0; i < buffer_length; i++) {
-        // TODO: (@vivek fix it)
-//        Encap(buffer[i]);
-//        AttachL2Header(buffer[i], 1); // 1 == Downlink packet
-//        meta = onvm_get_pkt_meta(buffer[i]);
-//        meta = ONVM_NF_ACTION_OUT;
-//    }
-//#endif
-
-    struct onvm_configuration *onvm_config = onvm_nflib_get_onvm_config();
-    if (onvm_config == NULL) {
-        fprintf(stderr, "Error: onvm_nflib_get_onvm_config() returned NULL\n");
-        exit(EXIT_FAILURE);
-    }
-    onvm_pkt_process_tx_batch(nf->nf_tx_mgr, buffer, onvm_config->dynfield_offset, buffer_length, nf);
-    onvm_pkt_flush_all_nfs(nf->nf_tx_mgr, nf);
-    UTLT_Debug("Sending out %u packets\n", buffer_length);
-    buffer_length = 0;
     if (e) rte_free(e);
 }
 
@@ -1273,6 +1358,10 @@ main(int argc, char *argv[]) {
 
     if (UpfClsCtrlInit() < 0) {
         rte_exit(EXIT_FAILURE, "CLS_CTRL memzone init failed\n");
+    }
+
+    if (UpfSessBufInit() < 0) {
+        rte_exit(EXIT_FAILURE, "SESS_BUF memzone init failed\n");
     }
 
     int ret;
