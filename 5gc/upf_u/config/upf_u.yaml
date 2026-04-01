@@ -1,12 +1,15 @@
 info:
   version: 1.0.0
-  description: L25GC-plus UPF-U dataplane configuration
+  description: L25GC+ UPF-U Configuration
 
 configuration:
   dataplane:
     dn_mac: "3c:fd:fe:b4:fe:21"
     an_mac: "3c:fd:fe:b5:00:14"
-    upf_ip: "192.168.1.2"
+    upf_access_ip: "192.168.1.2"    # UPF local IP on the access-facing port
+    upf_core_ip: "192.168.1.2"      # UPF local IP on the core/SGi-facing port
+    an_peer_ip: "192.168.1.2"  # Next-hop IP of the AN/gNB peer
+    dn_peer_ip: "192.168.1.2"  # Next-hop IP of the DN/upstream router peer
 
     ports:
       access: 0                     # ACCESS_PORT

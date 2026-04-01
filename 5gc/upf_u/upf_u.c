@@ -1,5 +1,5 @@
 /*
-# Copyright 2025 University of California, Riverside and National Yang Ming Chiao Tung University
+# Copyright 2026 University of California, Riverside and National Yang Ming Chiao Tung University
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -51,37 +51,19 @@
 #include "../classifiers/upf_cls_adapter.h"
 #include "../classifiers/classifier_wrapper.h"
 
+#include "upf_u_helper.h"
 #include "upf_u_config.h"
+#include "upf_u_arp.h"
 
 #define NF_TAG "upf_u"
 
-// #if 0
-// #define SELF_IP RTE_IPV4(10, 100, 200, 3)
-// #else
-// #define SELF_IP 33622538  // 10.10.1.2
-
-// #endif
-
-// #define SRC_INTF_ACCESS 0
-// #define SRC_INTF_CORE 1
-// #define SRC_INTF_SGI_LAN 2
-// #define SRC_INTF_CP 3
-// #define SRC_INTF_NUM (SRC_INTF_CP + 1)
-#define FIX_BUFFER
-#define DEFAULT_TB_RATE 10         // (Mbps)
-#define DEFAULT_TB_DEPTH 10000  // Max proceed length
-#define DEFAULT_TB_TOKENS 10000
 #define APP_FLOWS_MAX 256
-#define IP_MASKED(BIGENDIINT, LEN) (BIGENDIINT & (0xFFFFFFFF << (32-LEN)))
 #define MAX_UE 256 // Max number of UEs
 #define MIN(x, y) (((x) < (y)) ? (x) : (y))
+
+/* Used for buffering */
 #define INLINE_DRAIN_BATCH       8    /* pkts drained per INLINE (FORW)  */
 #define DRAIN_CHUNK             64    /* max pkts dequeued per drain call */
-
-/* mask for 20-bit IPv6 flow label */
-#ifndef IPV6_FLOWLABEL_MASK
-#define IPV6_FLOWLABEL_MASK 0x000FFFFFu
-#endif
 
 
 static inline int UpfSendEvt1(uint16_t dest_sid, uint32_t type, uintptr_t a0) {
@@ -95,21 +77,7 @@ static inline int UpfSendEvt1(uint16_t dest_sid, uint32_t type, uintptr_t a0) {
     return rc;
 }
 
-static struct rte_ether_addr dn_eth;
-static struct rte_ether_addr an_eth;
-static struct rte_ether_addr cn_dn_eth;
-static struct rte_ether_addr cn_ue_eth;
-
-uint8_t DnMac[RTE_ETHER_ADDR_LEN];
-uint8_t AnMac[RTE_ETHER_ADDR_LEN];
-int SELF_IP;
-
 enum { IF_UNKNOWN = -1 };
-
-int16_t g_access_port = 0;
-int16_t g_core_port   = 0;
-int16_t g_sgi_port    = 0;
-
 
 struct rte_meter_trtcm_profile app_trtcm_profile;
 struct rte_meter_trtcm_profile app_flow_trtcm_profile;
@@ -146,7 +114,8 @@ typedef struct {
 static upf_cls_local_t g_cls_local = {0};
 
 // Flip to the latest published snapshot (called at burst boundary)
-static inline void UpfClsMaybeFlipAndAck(void) {
+static inline void
+UpfClsMaybeFlipAndAck(void) {
     if (likely(!g_cls_local.flip_pending))
         return;
 
@@ -187,7 +156,8 @@ static inline void UpfClsMaybeFlipAndAck(void) {
 }
 
 
-/* static inline const UPDK_PDR *UpfLookupPdr(const ps_packet_t *key) {
+/* static inline const UPDK_PDR *
+UpfLookupPdr(const ps_packet_t *key) {
     const cls_handle_t *snap = (const cls_handle_t *)g_cls_local.ptr;
     if (unlikely(!snap)) return NULL;
 
@@ -199,7 +169,8 @@ static inline void UpfClsMaybeFlipAndAck(void) {
     return (const UPDK_PDR *)cookie;
 } */
 
-static inline uint16_t UpfClassifyGetPdrId(const ps_packet_t *key) {
+static inline uint16_t
+UpfClassifyGetPdrId(const ps_packet_t *key) {
     const cls_handle_t *snap = (const cls_handle_t *)g_cls_local.ptr;
     if (unlikely(!snap)) {
         UTLT_Warning("CLS classify: no snapshot yet (ver=%u) — dropping", g_cls_local.ver);
@@ -220,7 +191,8 @@ static inline uint16_t UpfClassifyGetPdrId(const ps_packet_t *key) {
     return (uint16_t)pdrId;
 }
 
-static inline const UPDK_PDR *UpfClassifyGetPdrPtr(const ps_packet_t *key) {
+static inline const UPDK_PDR *
+UpfClassifyGetPdrPtr(const ps_packet_t *key) {
     const cls_handle_t *snap = (const cls_handle_t *)g_cls_local.ptr;
     if (unlikely(!snap)) {
         UTLT_Warning("CLS classify: no snapshot yet (ver=%u) — dropping", g_cls_local.ver);
@@ -233,9 +205,8 @@ static inline const UPDK_PDR *UpfClassifyGetPdrPtr(const ps_packet_t *key) {
     return (const UPDK_PDR *)descriptor;
 }
 
-
-
-bool ftAddEntry(uint32_t subnet, int flow_idx) {
+bool
+ftAddEntry(uint32_t subnet, int flow_idx) {
     if (iPFlowsLen >= APP_FLOWS_MAX) {
         printf("Error: Maximum flow entries reached.\n");
         return false;
@@ -260,25 +231,8 @@ bool ftAddEntry(uint32_t subnet, int flow_idx) {
     return true;
 }
 
-const char *ip4(uint32_t host_ip) {
-    static char buf[16];
-    struct in_addr a = { .s_addr = htonl(host_ip) };
-    return inet_ntop(AF_INET, &a, buf, sizeof(buf)) ? buf : "<err>";
-}
-
-uint32_t charStr2MaskedIP(char *str, uint32_t *prefix_val){
-    char ip_str[INET_ADDRSTRLEN];
-    uint32_t prefix_len, subnet;
-
-    sscanf(str, "%[^/]/%d", ip_str, &prefix_len);
-    struct in_addr ip_addr;
-    inet_pton(AF_INET, ip_str, &ip_addr);
-
-    if (prefix_val) *prefix_val = prefix_len;
-    return IP_MASKED(ip_addr.s_addr, prefix_len);
-}
-
-static inline int SourceInterfaceToPort(source_interface_t srcIf) {
+static inline uint16_t
+SourceInterfaceToPort(source_interface_t srcIf) {
     switch (srcIf) {
       case SRC_IF_ACCESS:   return g_access_port;
       case SRC_IF_CORE:     return g_core_port;
@@ -355,50 +309,18 @@ ConfigureQerFlows(const UPDK_PDR *pdr, bool is_uplink)
     trTCMidx++;
 }
 
-char *
-convertToIpAddress(uint32_t big_endian_value) {
-    static char ip_string[16];
+// static inline source_interface_t
+// PortToSourceInterface(uint16_t port) {
+//     if (port == g_access_port)  return SRC_IF_ACCESS;
+//     if (port == g_core_port)    return SRC_IF_CORE;
+//     if (port == g_sgi_port)     return SRC_IF_SGI_LAN;
+//     UTLT_Warning("PortToSourceInterface: unknown port %" PRIu16
+//              " (ACCESS=%" PRIu16 " CORE=%" PRIu16 " SGI=%" PRIu16
+//              ") — defaulting to ACCESS",
+//              port, g_access_port, g_core_port, g_sgi_port);
 
-    uint8_t ip_address[4];
-    ip_address[0] = (big_endian_value >> 24) & 0xFF;
-    ip_address[1] = (big_endian_value >> 16) & 0xFF;
-    ip_address[2] = (big_endian_value >> 8) & 0xFF;
-    ip_address[3] = big_endian_value & 0xFF;
-
-    sprintf(ip_string, "%d.%d.%d.%d", ip_address[3], ip_address[2], ip_address[1], ip_address[0]);
-
-    return ip_string;
-}
-
-int
-parseIpv4Address(const char *addrStr) {
-    const char *p = addrStr;
-    char *endp;
-
-    unsigned long a = strtoul(p, &endp, 10);
-    if (*endp != '.')
-        return -1;
-    unsigned long b = strtoul(p = endp + 1, &endp, 10);
-    if (*endp != '.')
-        return -1;
-    unsigned long c = strtoul(p = endp + 1, &endp, 10);
-    if (*endp != '.')
-        return -1;
-    unsigned long d = strtoul(p = endp + 1, &endp, 10);
-
-    SELF_IP = (uint32_t)((d << 24) | (c << 16) | (b << 8) | a);
-    UTLT_Info("IP Address: %s -> %d\n", addrStr, SELF_IP);
-    return 0;
-}
-
-static inline source_interface_t PortToSourceInterface(uint8_t port) {
-    if ((int)port == g_access_port)  return SRC_IF_ACCESS;
-    if ((int)port == g_core_port)    return SRC_IF_CORE;
-    if ((int)port == g_sgi_port)     return SRC_IF_SGI_LAN;
-    UTLT_Warning("PortToSourceInterface: unknown port %u (ACCESS=%d CORE=%d SGI=%d) — defaulting to ACCESS",
-                 port, g_access_port, g_core_port, g_sgi_port);
-    return SRC_IF_ACCESS;
-}
+//     return SRC_IF_ACCESS;
+// }
 
 static int
 trtcmConfigFlowTables(void){
@@ -496,13 +418,11 @@ int ftSearch(uint32_t subnet) {
     return -1;  // Not found
 }
 
-
-
-void ftInit() {
-    for (int i = 0; i < APP_FLOWS_MAX; i++) {
-        iPFlows[i].in_use = false;
-    }
-}
+// void ftInit() {
+//     for (int i = 0; i < APP_FLOWS_MAX; i++) {
+//         iPFlows[i].in_use = false;
+//     }
+// }
 
 /* Token Bucket */
 struct tb_config {
@@ -717,22 +637,8 @@ GetPdrByUeIpAddress(struct rte_mbuf *pkt, uint32_t ue_ip)
     return pdr;
 }
 
-static inline const char *
-ip4_to_buf(uint32_t be_addr, char buf[16]) {
-  inet_ntop(AF_INET, &be_addr, buf, 16);
-  return buf;
-}
-
-static void dump_gtpu(const uint8_t *start, size_t len, size_t gtp_off) {
-    printf("---- GTPU Dump (offset %zu, %zu bytes) ----\n", gtp_off, len);
-    for (size_t i = 0; i < len; i++) {
-        if (i % 16 == 0) printf("\n%04zu : ", i);
-        printf("%02x ", start[i]);
-    }
-    printf("\n------------------------------------------\n");
-}
-
-UPDK_PDR *GetPdrByTeid(struct rte_mbuf *pkt, const gtp_parse_result_t *gtp_info) {
+UPDK_PDR *
+GetPdrByTeid(struct rte_mbuf *pkt, const gtp_parse_result_t *gtp_info) {
         // Locate inner IP header using pre-computed offset
     size_t inner_offset = sizeof(struct rte_ether_hdr) + gtp_info->outer_hdr_len;
 
@@ -909,7 +815,7 @@ Encap(struct rte_mbuf *pkt, UPDK_FAR *far, UPDK_QER *qer) {
                               // udppayloadlen should be raw + gtp header
 
     struct rte_ipv4_hdr *ipv4_hdr = rte_pktmbuf_mtod_offset(pkt, struct rte_ipv4_hdr *, 0);
-    onvm_pkt_fill_ipv4(ipv4_hdr, rte_cpu_to_be_32(SELF_IP), rte_cpu_to_be_32(outerHeaderCreation->ipv4.s_addr),
+    onvm_pkt_fill_ipv4(ipv4_hdr, rte_cpu_to_be_32(UPF_U_IP), rte_cpu_to_be_32(outerHeaderCreation->ipv4.s_addr),
                IPPROTO_UDP);
     ipv4_hdr->total_length = rte_cpu_to_be_16(payloadLen + sizeof(gtpv1_t) + sizeof(struct rte_udp_hdr) +
                           sizeof(struct rte_ipv4_hdr));  // raw+gtp8+udp8+ip20
@@ -917,7 +823,8 @@ Encap(struct rte_mbuf *pkt, UPDK_FAR *far, UPDK_QER *qer) {
 }
 
 static int
-HandlePacketWithFar(struct rte_mbuf *pkt, UPDK_FAR *far, UPDK_QER *qer, struct onvm_pkt_meta *meta) {
+HandlePacketWithFar(struct rte_mbuf *pkt, UPDK_FAR *far, UPDK_QER *qer, 
+                    uint16_t out_port, struct onvm_pkt_meta *meta) {
     int buff = 0;
 #define FAR_ACTION_MASK 0x07
     if (far->flags.applyAction) {
@@ -942,7 +849,8 @@ HandlePacketWithFar(struct rte_mbuf *pkt, UPDK_FAR *far, UPDK_QER *qer, struct o
                         }
                     }
                 }
-                meta->destination = pkt->port ^ 1;
+                // meta->destination = pkt->port ^ 1;
+                meta->destination = out_port;
                 meta->action = ONVM_NF_ACTION_OUT;
                 break;
             case UPDK_FAR_APPLY_ACTION_BUFF:
@@ -983,12 +891,12 @@ AttachL2Header(struct rte_mbuf *pkt, bool is_dl) {
 
     // next hop's mac address
     if (is_dl == true) {
-        rte_ether_addr_copy(&cn_ue_eth, &eth_hdr->src_addr);
-        rte_ether_addr_copy(&an_eth, &eth_hdr->dst_addr);
+        rte_ether_addr_copy(&g_cn_ue_eth, &eth_hdr->src_addr);
+        rte_ether_addr_copy(&g_an_eth, &eth_hdr->dst_addr);
 
     } else {
-        rte_ether_addr_copy(&cn_dn_eth, &eth_hdr->src_addr);
-        rte_ether_addr_copy(&dn_eth, &eth_hdr->dst_addr);
+        rte_ether_addr_copy(&g_cn_dn_eth, &eth_hdr->src_addr);
+        rte_ether_addr_copy(&g_dn_eth, &eth_hdr->dst_addr);
     }
 
     eth_hdr->ether_type = rte_cpu_to_be_16(RTE_ETHER_TYPE_IPV4);
@@ -1037,6 +945,20 @@ packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm_nf_
     if (pkt == NULL || meta == NULL) {
         return 0;
     }
+
+    /* Get Ethernet header */
+    struct rte_ether_hdr *eth = onvm_pkt_ether_hdr(pkt);
+    if (!eth) {
+        meta->action = ONVM_NF_ACTION_DROP;
+        return 0;
+    }
+
+    /* Handle ARP packets */
+    if (rte_be_to_cpu_16(eth->ether_type) == RTE_ETHER_TYPE_ARP) {
+        handle_arp_packet(pkt, meta, nf_local_ctx);
+        return 0;
+    }
+
     uint32_t cal_pktlen = 0;
     UTLT_Trace("Get packet\n");
     UTLT_Info("Handle PKT from port: %d [len: %d]", pkt->port, pkt->pkt_len);
@@ -1044,8 +966,9 @@ packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm_nf_
 
     bool is_dl = false;
     meta->action = ONVM_NF_ACTION_DROP;
-    struct rte_ipv4_hdr *iph = onvm_pkt_ipv4_hdr(pkt);
 
+    /* Get IPv4 header */
+    struct rte_ipv4_hdr *iph = onvm_pkt_ipv4_hdr(pkt);
     if (iph == NULL) {
         UTLT_Info("Not IP packet, ignore it\n");
         return 0;
@@ -1058,12 +981,12 @@ packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm_nf_
     gtp_parse_result_t gtp_info = {0};
     int ue_idx = -1;
 
-    /* char *src_address = convertToIpAddress(iph->src_addr);
+    /* char *src_address = convertToIpAddressString(iph->src_addr);
     UTLT_Info("Src IP is %s\n", src_address);
-    char *dst_address = convertToIpAddress(iph->dst_addr);
+    char *dst_address = convertToIpAddressString(iph->dst_addr);
     UTLT_Info("Dst IP is %s\n", dst_address); */
 
-    if (iph->dst_addr == SELF_IP) {  //
+    if (iph->dst_addr == UPF_U_IP) {  //
         UTLT_Info("It is uplink\n");
 
         struct rte_udp_hdr *udp_header = onvm_pkt_udp_hdr(pkt);
@@ -1077,13 +1000,13 @@ packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm_nf_
         pdr = GetPdrByTeid(pkt, &gtp_info);
 
     } else {
-        // UTLT_Info("It is downlink, dst is %s\n", convertToIpAddress(iph->dst_addr));
+        // UTLT_Info("It is downlink, dst is %s\n", convertToIpAddressString(iph->dst_addr));
         pdr = GetPdrByUeIpAddress(pkt, rte_cpu_to_be_32(iph->dst_addr));
         is_dl = true;
     }
 
     if (!pdr) {
-        UTLT_Error("no PDR found for %s, skip\n", convertToIpAddress(iph->dst_addr));
+        UTLT_Error("no PDR found for %s, skip\n", convertToIpAddressString(iph->dst_addr));
         // TODO(vivek): what to do?
         return 0;
     }
@@ -1093,7 +1016,7 @@ packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm_nf_
         uint32_t ue_key = rte_cpu_to_be_32(iph->dst_addr);
         ue_idx = (int)findIndexByUeIpAddress(ue_key);
         if (ue_idx < 0) {
-            ue_idx = GetQerByUEIpAddressFromPdr(ue_key, pdr, convertToIpAddress(iph->dst_addr));
+            ue_idx = GetQerByUEIpAddressFromPdr(ue_key, pdr, convertToIpAddressString(iph->dst_addr));
         }
     }
 
@@ -1157,8 +1080,17 @@ packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm_nf_
                 Encap(pkt, far, pdr->qer);
         }
 
-        meta->destination = pkt->port ^ 1;
-        AttachL2Header(pkt, true);
+        // meta->destination = pkt->port ^ 1;
+        // AttachL2Header(pkt, true);
+
+        // Regardless of BUFF vs FORW, we need to attach L2 (or ARP) header
+        // before sending to access port.
+        if (attach_l2_or_arp(pkt, g_access_port, g_access_ip_be, g_an_peer_ip_be,
+                            nf_local_ctx->nf) < 0) {
+            meta->action = ONVM_NF_ACTION_DROP;   /* or buffer */
+            return 0;
+        }
+        meta->destination = g_access_port; // DL always goes to access port after FAR processing (may be modified by QoS policing below)
 
         if (far_action == UPDK_FAR_APPLY_ACTION_BUFF) {
             /* Buffer-only: prepare packet for later TX, enqueue, then DROP */
@@ -1248,8 +1180,15 @@ packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm_nf_
         return 0;
     } else {
         /* ── UL: original HandlePacketWithFar path (unchanged) ── */
-        int status = HandlePacketWithFar(pkt, far, pdr->qer, meta);
-        AttachL2Header(pkt, is_dl);
+        int status = HandlePacketWithFar(pkt, far, pdr->qer, g_core_port, meta);
+        // AttachL2Header(pkt, is_dl);
+        if (meta->action == ONVM_NF_ACTION_OUT) {
+            if (attach_l2_or_arp(pkt, g_core_port, g_core_ip_be, g_dn_peer_ip_be,
+                                nf_local_ctx->nf) < 0) {
+                meta->action = ONVM_NF_ACTION_DROP;
+                return 0;
+            }
+        }
         return status;
     }
 }
@@ -1353,8 +1292,11 @@ main(int argc, char *argv[]) {
     if (argc > arg_offset + 1) {
         config_path = argv[arg_offset + 1];
     }
+
     printf("[UPF-U] Using config: %s\n", config_path);
-    UpfU_LoadAndParseConfig(config_path);
+    if (UpfU_LoadAndParseConfig(config_path) != 0) {
+        rte_exit(EXIT_FAILURE, "Failed to load/parse UPF-U YAML config.\n");
+    }
 
     if (UpfClsCtrlInit() < 0) {
         rte_exit(EXIT_FAILURE, "CLS_CTRL memzone init failed\n");
@@ -1364,20 +1306,8 @@ main(int argc, char *argv[]) {
         rte_exit(EXIT_FAILURE, "SESS_BUF memzone init failed\n");
     }
 
-    int ret;
-    ret = rte_eth_macaddr_get(g_access_port, &cn_ue_eth);
-    if (ret < 0)
-        rte_exit(EXIT_FAILURE, "Cannot get MAC address: err=%d, port=%d\n", ret, g_access_port);
-    ret = rte_eth_macaddr_get(g_core_port, &cn_dn_eth);
-    if (ret < 0)
-        rte_exit(EXIT_FAILURE, "Cannot get MAC address: err=%d, port=%d\n", ret, g_core_port);
-
-    /* UTLT_Info("[UPF-U][CONFIG] Port map: ACCESS=%d CORE=%d SGI=%d",
-          g_access_port, g_core_port, g_sgi_port); */
-
-    // 8c:dc:d4:ac:6c:7d
-    memcpy(dn_eth.addr_bytes, DnMac, RTE_ETHER_ADDR_LEN);
-    memcpy(an_eth.addr_bytes, AnMac, RTE_ETHER_ADDR_LEN);
+    // Initialize L2 addresses, must be done after config is loaded (UpfU_LoadAndParseConfig)
+    init_l2_addrs();
 
     // trTCM
     trtcmConfigFlowTables();
@@ -1388,9 +1318,13 @@ main(int argc, char *argv[]) {
     UeIpToUpfSessionMapInit();
     TeidToUpfSessionMapInit();
 
+    /* ARP module init */
+    if (upf_arp_init() < 0) {
+        rte_exit(EXIT_FAILURE, "failed to init ARP module\n");
+    }
+
     onvm_nflib_run(nf_local_ctx);
 
     onvm_nflib_stop(nf_local_ctx);
-    printf("If we reach here, program is ending\n");
     return 0;
 }
