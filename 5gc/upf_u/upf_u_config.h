@@ -32,13 +32,10 @@ extern uint16_t  g_access_port;    // UPF-U DPDK port connected to the access si
 extern uint16_t  g_core_port;      // UPF-U DPDK port connected to the core side (SGi)
 extern uint16_t  g_sgi_port;       // UPF-U DPDK port connected to the SGi side
 
-extern uint8_t  g_an_mac[RTE_ETHER_ADDR_LEN];       // MAC address of the AN peer (e.g., gNB)
-extern uint8_t  g_dn_mac[RTE_ETHER_ADDR_LEN];       // MAC address of the DN peer (e.g., upstream router or DN server)
-
-extern struct rte_ether_addr g_an_eth;     // Ethernet address for AN peer
-extern struct rte_ether_addr g_dn_eth;     // Ethernet address for DN peer
 extern struct rte_ether_addr g_cn_ue_eth;  // Ethernet address for access-facing side of UPF (used when sending to UE)
 extern struct rte_ether_addr g_cn_dn_eth;  // Ethernet address for core-facing side of UPF (used when sending to DN)
+
+extern char g_log_level[16]; // Log level for UPF-U (e.g., "trace", "debug", "info", "warning", "error")
 
 int
 UpfU_LoadAndParseConfig(const char *path);

@@ -24,9 +24,15 @@
 #include "upf_u_arp.h"
 #include "upf_u_config.h"
 #include "upf_u_helper.h"
+#include "utlt_debug.h"
 
-#define ARP_PKTMBUF_POOL_NAME "ARP_pktmbuf_pool"
+#define PKTMBUF_POOL_NAME "MProc_pktmbuf_pool"
 #define NEIGH_TIMEOUT_SEC 300
+
+/* Broadcast MAC address */
+static const struct rte_ether_addr broadcast_mac = {
+    .addr_bytes = {0xff, 0xff, 0xff, 0xff, 0xff, 0xff}
+};
 
 /* ARP Neighbor Table */
 static struct neigh_entry neigh_tbl[NEIGH_MAX];
@@ -45,7 +51,7 @@ is_local_ip_on_port(uint16_t port, uint32_t ip_be) {
 int
 upf_arp_init(void) {
     memset(neigh_tbl, 0, sizeof(neigh_tbl));
-    g_pktmbuf_pool = rte_mempool_lookup(ARP_PKTMBUF_POOL_NAME);
+    g_pktmbuf_pool = rte_mempool_lookup(PKTMBUF_POOL_NAME);
     return (g_pktmbuf_pool != NULL) ? 0 : -1;
 }
 
@@ -151,9 +157,9 @@ send_arp_request(uint16_t port,
         return -1;
 
     if (g_pktmbuf_pool == NULL) {
-        g_pktmbuf_pool = rte_mempool_lookup(ARP_PKTMBUF_POOL_NAME);
+        g_pktmbuf_pool = rte_mempool_lookup(PKTMBUF_POOL_NAME);
         if (g_pktmbuf_pool == NULL) {
-            UTLT_Error("Cannot find mbuf pool %s", ARP_PKTMBUF_POOL_NAME);
+            UTLT_Error("Cannot find mbuf pool %s", PKTMBUF_POOL_NAME);
             return -1;
         }
     }
@@ -179,7 +185,7 @@ send_arp_request(uint16_t port,
 
     /* Ethernet */
     rte_ether_addr_copy(&src_mac, &eth_hdr->src_addr);
-    rte_ether_addr_copy(&rte_ether_broadcast, &eth_hdr->dst_addr);
+    rte_ether_addr_copy(&broadcast_mac, &eth_hdr->dst_addr);
     eth_hdr->ether_type = rte_cpu_to_be_16(RTE_ETHER_TYPE_ARP);
 
     /* ARP request */
@@ -311,9 +317,9 @@ handle_arp_packet(struct rte_mbuf *pkt,
         }
 
         if (g_pktmbuf_pool == NULL) {
-            g_pktmbuf_pool = rte_mempool_lookup(ARP_PKTMBUF_POOL_NAME);
+            g_pktmbuf_pool = rte_mempool_lookup(PKTMBUF_POOL_NAME);
             if (g_pktmbuf_pool == NULL) {
-                UTLT_Error("Cannot find mbuf pool %s", ARP_PKTMBUF_POOL_NAME);
+                UTLT_Error("Cannot find mbuf pool %s", PKTMBUF_POOL_NAME);
                 meta->action = ONVM_NF_ACTION_DROP;
                 return 0;
             }

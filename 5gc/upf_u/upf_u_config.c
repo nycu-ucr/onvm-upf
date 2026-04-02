@@ -16,19 +16,15 @@
 # SPDX-License-Identifier: Apache-2.0
 */
 
-#include "upf_u_config.h"
-
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
 #include <yaml.h>
 
-uint8_t  g_dn_mac[RTE_ETHER_ADDR_LEN];
-uint8_t  g_an_mac[RTE_ETHER_ADDR_LEN];
+#include "upf_u_config.h"
+#include "utlt_debug.h"
 
-struct rte_ether_addr g_an_eth;
-struct rte_ether_addr g_dn_eth;
 struct rte_ether_addr g_cn_ue_eth;
 struct rte_ether_addr g_cn_dn_eth;
 
@@ -41,6 +37,7 @@ uint32_t g_core_ip_be   = 0;
 uint32_t g_an_peer_ip_be = 0;
 uint32_t g_dn_peer_ip_be = 0;
 
+char g_log_level[16] = "warning";
 
 static int
 parse_mac(const char *input_string, uint8_t out_mac_addr[6]) {
@@ -116,29 +113,23 @@ do_parse(yaml_document_t *doc) {
     if (!cfg || cfg->type != YAML_MAPPING_NODE)
         return -1;
 
+    // log_level (optional)
+    {
+        yaml_node_t *n = map_get(doc, cfg, "log_level");
+        const char *s = scalar_str(n);
+
+        if (s && *s) {
+            size_t len = strlen(s);
+            if (len >= sizeof(g_log_level))
+                len = sizeof(g_log_level) - 1;
+            memcpy(g_log_level, s, len);
+            g_log_level[len] = '\0';
+        }
+    }
+
     yaml_node_t *dp   = map_get(doc, cfg,  "dataplane");
     if (!dp || dp->type != YAML_MAPPING_NODE)
         return -1;
-
-    // dn_mac
-    {
-        yaml_node_t *n = map_get(doc, dp, "dn_mac");
-        const char *s = scalar_str(n);
-        if (!s || parse_mac(s, g_dn_mac) != 0) {
-            fprintf(stderr, "[UPF-U][CONFIG] invalid dn_mac\n");
-            return -1;
-        }
-    }
-
-    // an_mac
-    {
-        yaml_node_t *n = map_get(doc, dp, "an_mac");
-        const char *s = scalar_str(n);
-        if (!s || parse_mac(s, g_an_mac) != 0) {
-            fprintf(stderr, "[UPF-U][CONFIG] invalid an_mac\n");
-            return -1;
-        }
-    }
 
     // upf_access_ip
     {
@@ -306,10 +297,4 @@ init_l2_addrs(void) {
                  "Cannot get MAC address: err=%d, port=%" PRIu16 "\n",
                  ret, g_core_port);
     }
-
-    /* UTLT_Info("[UPF-U][CONFIG] Port map: ACCESS=%" PRIu16 " CORE=%" PRIu16 " SGI=%" PRIu16 ",",
-          g_access_port, g_core_port, g_sgi_port); */
-
-    memcpy(g_dn_eth.addr_bytes, g_dn_mac, RTE_ETHER_ADDR_LEN);
-    memcpy(g_an_eth.addr_bytes, g_an_mac, RTE_ETHER_ADDR_LEN);
 }

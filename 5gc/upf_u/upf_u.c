@@ -639,7 +639,7 @@ GetPdrByUeIpAddress(struct rte_mbuf *pkt, uint32_t ue_ip)
 
 UPDK_PDR *
 GetPdrByTeid(struct rte_mbuf *pkt, const gtp_parse_result_t *gtp_info) {
-        // Locate inner IP header using pre-computed offset
+    // Locate inner IP header using pre-computed offset
     size_t inner_offset = sizeof(struct rte_ether_hdr) + gtp_info->outer_hdr_len;
 
     uint16_t data_len = rte_pktmbuf_data_len(pkt);
@@ -815,7 +815,7 @@ Encap(struct rte_mbuf *pkt, UPDK_FAR *far, UPDK_QER *qer) {
                               // udppayloadlen should be raw + gtp header
 
     struct rte_ipv4_hdr *ipv4_hdr = rte_pktmbuf_mtod_offset(pkt, struct rte_ipv4_hdr *, 0);
-    onvm_pkt_fill_ipv4(ipv4_hdr, rte_cpu_to_be_32(UPF_U_IP), rte_cpu_to_be_32(outerHeaderCreation->ipv4.s_addr),
+    onvm_pkt_fill_ipv4(ipv4_hdr, rte_cpu_to_be_32(g_access_ip_be), rte_cpu_to_be_32(outerHeaderCreation->ipv4.s_addr),
                IPPROTO_UDP);
     ipv4_hdr->total_length = rte_cpu_to_be_16(payloadLen + sizeof(gtpv1_t) + sizeof(struct rte_udp_hdr) +
                           sizeof(struct rte_ipv4_hdr));  // raw+gtp8+udp8+ip20
@@ -881,25 +881,6 @@ HandlePacketWithFar(struct rte_mbuf *pkt, UPDK_FAR *far, UPDK_QER *qer,
         }
     }
     return buff;
-}
-
-static inline void
-AttachL2Header(struct rte_mbuf *pkt, bool is_dl) {
-    // Prepend ethernet header
-    struct rte_ether_hdr *eth_hdr =
-        (struct rte_ether_hdr *)rte_pktmbuf_prepend(pkt, (uint16_t)sizeof(struct rte_ether_hdr));
-
-    // next hop's mac address
-    if (is_dl == true) {
-        rte_ether_addr_copy(&g_cn_ue_eth, &eth_hdr->src_addr);
-        rte_ether_addr_copy(&g_an_eth, &eth_hdr->dst_addr);
-
-    } else {
-        rte_ether_addr_copy(&g_cn_dn_eth, &eth_hdr->src_addr);
-        rte_ether_addr_copy(&g_dn_eth, &eth_hdr->dst_addr);
-    }
-
-    eth_hdr->ether_type = rte_cpu_to_be_16(RTE_ETHER_TYPE_IPV4);
 }
 
 /* Per-session drain helper
@@ -986,7 +967,7 @@ packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm_nf_
     char *dst_address = convertToIpAddressString(iph->dst_addr);
     UTLT_Info("Dst IP is %s\n", dst_address); */
 
-    if (iph->dst_addr == UPF_U_IP) {  //
+    if (iph->dst_addr == g_access_ip_be) {  //
         UTLT_Info("It is uplink\n");
 
         struct rte_udp_hdr *udp_header = onvm_pkt_udp_hdr(pkt);
@@ -1267,8 +1248,7 @@ main(int argc, char *argv[]) {
     int arg_offset;
     struct onvm_nf_local_ctx *nf_local_ctx;
     struct onvm_nf_function_table *nf_function_table;
-    // UTLT_SetLogLevel("Panic"); // to eliminate log print influenced jitter
-    UTLT_SetLogLevel("warning"); // to eliminate log print influenced jitter
+    UTLT_SetLogLevel("warning"); // temporary default before config is loaded
 
     nf_local_ctx = onvm_nflib_init_nf_local_ctx();
     onvm_nflib_start_signal_handler(nf_local_ctx, NULL);
@@ -1287,6 +1267,10 @@ main(int argc, char *argv[]) {
         }
     }
 
+    /* Initialize dynamic field offset */
+    struct onvm_configuration *onvm_config = onvm_nflib_get_onvm_config();
+    nf_local_ctx->nf->dynfield_offset = onvm_config->dynfield_offset;
+
     const char *config_path = "config/upf_u.yaml";
 
     if (argc > arg_offset + 1) {
@@ -1297,6 +1281,9 @@ main(int argc, char *argv[]) {
     if (UpfU_LoadAndParseConfig(config_path) != 0) {
         rte_exit(EXIT_FAILURE, "Failed to load/parse UPF-U YAML config.\n");
     }
+
+    UTLT_SetLogLevel(g_log_level);
+    printf("[UPF-U] Log level: %s\n", g_log_level);
 
     if (UpfClsCtrlInit() < 0) {
         rte_exit(EXIT_FAILURE, "CLS_CTRL memzone init failed\n");
