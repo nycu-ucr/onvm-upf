@@ -899,8 +899,8 @@ typedef struct _PFCPSessionEstablishmentResponse {
 typedef struct _PFCPSessionModificationRequest {
     unsigned long presence;
     FSEID cPFSEID;
-    RemovePDR removePDR;
-    RemoveFAR removeFAR;
+    RemovePDR removePDR[4];
+    RemoveFAR removeFAR[4];
     RemoveURR removeURR;
     RemoveQER removeQER;
     RemoveBAR removeBAR;

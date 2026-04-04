@@ -427,6 +427,14 @@ Status InsertTEIDtoSessionMap(const uint32_t teid, UpfSession *session) {
     if (status >= 0) {
         return STATUS_ERROR;
     }
+
+    if (session->teid_count >= MAX_NUM_OF_TEIDS) {
+        UTLT_Error("Maximum number of TEIDs (%d) reached for session", MAX_NUM_OF_TEIDS);
+        return STATUS_ERROR;
+    }
+
+    session->teid_list[session->teid_count++] = teid;
+
     status = rte_hash_add_key_with_hash_data(teid_upf_session_map->hash,
                                              (const void *) &teid,
                                              cal_hash,
@@ -445,12 +453,24 @@ void UeIpToUpfSessionMapFree(const uint32_t ueip) {
 }
 
 void TeidToUpfSessionMapFree(const uint32_t teid) {
+    /* Look up the session BEFORE removing from hash so we can clean teid_list */
+    UpfSession *session = UpfSessionFindByTeid(teid);
+    if (session) {
+        for (int i = 0; i < session->teid_count; i++) {
+            if (session->teid_list[i] == teid) {
+                session->teid_list[i] = session->teid_list[session->teid_count - 1];
+                session->teid_count--;
+                break;
+            }
+        }
+    }
+
     uint32_t cal_hash = TEID_TO_HASH_KEY(teid);
     int32_t status = rte_hash_del_key_with_hash(teid_upf_session_map->hash,
                                                 (const void *)&teid,
                                                 cal_hash);
     if (status < 0) {
-        UTLT_Error("Error deleting a TeidToUpfSessionMapFree");
+        UTLT_Error("Error deleting TeidToUpfSessionMap for TEID %u", teid);
     }
 }
 
@@ -471,7 +491,10 @@ void DumpUpfSession() {
         printf("Value:\n");
         printf("\tIndex: %d\n", *index);
         printf("\tSession: %p\tSize: %ld (0x%lx)\n", session, sizeof(UpfSession), sizeof(UpfSession));
-        printf("\tTEID: %d\n", session->teid);
+        printf("\tTEID count: %d\n", session->teid_count);
+        for (int t = 0; t < session->teid_count; t++) {
+            printf("\t  TEID[%d]: %u\n", t, session->teid_list[t]);
+        }
         printf("\tupfSeid: %ld\n", session->upfSeid);
         printf("\tsmfSeid: %ld\n", session->smfSeid);
 

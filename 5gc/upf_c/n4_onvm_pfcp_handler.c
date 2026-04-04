@@ -1526,6 +1526,13 @@ Status UpfN4HandleRemovePdr(UpfSession *session, uint16_t nPDRID) {
 
     UpfPDR *upfPdr = d.pdr;   /* pointer to the removed PDR */
 
+    /* Clean up TEID→session mapping for this PDR's F-TEID */
+    if (upfPdr->pdi.flags.fTeid) {
+        UTLT_Info("Removing TEID %u mapping for PDR[%u]",
+                  upfPdr->pdi.fTeid.teid, pdrID);
+        TeidToUpfSessionMapFree(upfPdr->pdi.fTeid.teid);
+    }
+
     UpfPDRGlobalRemove(upfPdr);
  
     uint32_t new_ver;
@@ -1742,13 +1749,15 @@ Status UpfN4HandleSessionModificationRequest(UpfSession *session, PfcpXact *xact
     }
 
     /* Remove FAR */
-    if (request->removeFAR.presence) {
-        UTLT_Assert(request->removeFAR.fARID.presence == 1, ,
-                    "[PFCP] FarId in removeFAR not presence");
-        status = UpfN4HandleRemoveFar(session, *(uint32_t*)
-                                      request->removeFAR.fARID.value);
-        UTLT_Assert(status == STATUS_OK, return STATUS_ERROR,
-                    "Modification: Remove FAR error");
+    for (int i = 0; i < 4; i++) {
+        if (request->removeFAR[i].presence) {
+            UTLT_Assert(request->removeFAR[i].fARID.presence == 1, ,
+                        "[PFCP] FarId in removeFAR[%d] not presence", i);
+            status = UpfN4HandleRemoveFar(session, *(uint32_t*)
+                                          request->removeFAR[i].fARID.value);
+            UTLT_Assert(status == STATUS_OK, return STATUS_ERROR,
+                        "Modification: Remove FAR[%d] error", i);
+        }
     }
 
     /* Remove QER */
@@ -1760,15 +1769,17 @@ Status UpfN4HandleSessionModificationRequest(UpfSession *session, PfcpXact *xact
         UTLT_Assert(status == STATUS_OK, return STATUS_ERROR,
                     "Modification: Remove QER error");
     }
-    // The order of PDF should be the lastest
+
     /* Remove PDR */
-    if (request->removePDR.presence) {
-        UTLT_Assert(request->removePDR.pDRID.presence == 1, ,
-                    "[PFCP] PdrId in removePDR not presence!");
-        status = UpfN4HandleRemovePdr(session, *(uint16_t*)
-                                      request->removePDR.pDRID.value);
-        UTLT_Assert(status == STATUS_OK, return STATUS_ERROR,
-                    "Modification: Remove PDR error");
+    for (int i = 0; i < 4; i++) {
+        if (request->removePDR[i].presence) {
+            UTLT_Assert(request->removePDR[i].pDRID.presence == 1, ,
+                        "[PFCP] PdrId in removePDR[%d] not presence!", i);
+            status = UpfN4HandleRemovePdr(session, *(uint16_t*)
+                                          request->removePDR[i].pDRID.value);
+            UTLT_Assert(status == STATUS_OK, return STATUS_ERROR,
+                        "Modification: Remove PDR[%d] error", i);
+        }
     }
 
     /* Send Session Modification Response */
