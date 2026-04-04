@@ -6,6 +6,14 @@ configuration:
   dataplane:
     dn_mac: "3c:fd:fe:b4:fe:21"
     an_mac: "3c:fd:fe:b5:00:14"
+    dc_an_mac: "3c:fd:fe:b5:00:15"       # DC (secondary) gNB next-hop MAC
+
+    # NR-DC downlink ECMP (optional — omit nrdc section to disable)
+    # dc_gnb_ip must be the secondary gNB N3 IP advertised to SMF/UPF,
+    # not the UE-facing ranDataPlaneIp.
+    nrdc:
+      dc_gnb_ip: "10.0.1.3"              # secondary gNB ranN3Ip (TEID resolved at runtime from PFCP FAR)
+
     upf_ip: "192.168.1.2"
 
     ports:

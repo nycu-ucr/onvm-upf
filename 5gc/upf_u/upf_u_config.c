@@ -4,14 +4,20 @@
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
+#include <arpa/inet.h>
 #include <yaml.h>
 
 extern uint8_t  DnMac[6];
 extern uint8_t  AnMac[6];
+extern uint8_t  DcAnMac[6];
 extern uint32_t SELF_IP;
 extern int16_t  g_access_port;
 extern int16_t  g_core_port;
 extern int16_t  g_sgi_port;
+
+/* NR-DC downlink ECMP */
+extern int      DcEnabled;
+extern uint32_t DcGnbIp;
 
 
 static void fatal(const char *msg) {
@@ -91,6 +97,42 @@ static int do_parse(yaml_document_t *doc) {
         if (!s || parse_mac(s, AnMac) != 0) {
             fprintf(stderr, "[UPF-U][CONFIG] invalid an_mac\n");
             return -1;
+        }
+    }
+
+    // dc_an_mac (optional, defaults to an_mac)
+    {
+        yaml_node_t *n = map_get(doc, dp, "dc_an_mac");
+        const char *s = scalar_str(n);
+        if (s) {
+            if (parse_mac(s, DcAnMac) != 0) {
+                fprintf(stderr, "[UPF-U][CONFIG] invalid dc_an_mac\n");
+                return -1;
+            }
+        } else {
+            memcpy(DcAnMac, AnMac, 6);
+        }
+    }
+
+    // nrdc (optional DC ECMP config)
+    // Only dc_gnb_ip is needed — the TEID is resolved at runtime from the session FAR list.
+    {
+        yaml_node_t *nrdc = map_get(doc, dp, "nrdc");
+        if (nrdc && nrdc->type == YAML_MAPPING_NODE) {
+            yaml_node_t *ip_n = map_get(doc, nrdc, "dc_gnb_ip");
+            const char *ip_s = scalar_str(ip_n);
+
+            if (ip_s) {
+                struct in_addr addr;
+                if (inet_pton(AF_INET, ip_s, &addr) != 1) {
+                    fprintf(stderr, "[UPF-U][CONFIG] invalid nrdc.dc_gnb_ip\n");
+                    return -1;
+                }
+                DcGnbIp = addr.s_addr;  // network byte order
+                DcEnabled = 1;
+                fprintf(stderr, "[UPF-U][CONFIG] NR-DC ECMP enabled: dc_gnb_ip=%s (TEID resolved at runtime)\n",
+                        ip_s);
+            }
         }
     }
 
