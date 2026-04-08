@@ -1,6 +1,8 @@
 sources = files(
     'upf_u.c',
-    'upf_u_config.c'
+    'upf_u_config.c',
+    'upf_u_arp.c',
+    'upf_u_helper.c'
 )
 
 upf_u_link_deps = [
