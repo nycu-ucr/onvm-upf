@@ -161,13 +161,13 @@ int packet_handler(
     Event event;
     Status status;
     Bufblk *bufBlk = NULL;
-    bufBlk = BufblkAlloc(1, MAX_SDU_LEN);
+    uint32_t pfcpPayloadLen = pkt->pkt_len - outerHeader;
+    bufBlk = BufblkAlloc(1, pfcpPayloadLen);
     if (bufBlk == NULL) {
         return 0;
     }
-    bufBlk->buf = pfcpHeader;
-    bufBlk->size = pkt->pkt_len - outerHeader;
-    bufBlk->len = pkt->pkt_len - outerHeader;
+    memcpy(bufBlk->buf, pfcpHeader, pfcpPayloadLen);
+    bufBlk->len = pfcpPayloadLen;
 
     event.type = UPF_EVENT_N4_MESSAGE;
     event.arg0 = (uintptr_t)bufBlk;
