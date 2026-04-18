@@ -276,11 +276,11 @@ upf_build_and_send_hw_offload(UPDK_PDR *pdr)
     /* ── Send to Host Agent via ONVM lockless ring ─────────────────── */
     int rc = onvm_nflib_send_msg_to_nf(HOST_AGENT_SERVICE_ID, msg);
     if (rc < 0) {
-        UTLT_Warning("hw_offload: send to Host Agent failed (rc=%d) for "
-                     "PDR %u, hw_rule_id %u — SW fallback active",
-                     rc, pdr_id, hw_rule_id);
+        UTLT_Info("hw_offload: Host Agent unavailable (rc=%d) for "
+                  "PDR %u, hw_rule_id %u — continuing with SW fallback",
+                  rc, pdr_id, hw_rule_id);
         rte_free(msg);   /* sender frees on failure per ONVM convention */
-        return rc;
+        return 0;
     }
 
     UTLT_Info("hw_offload: sent %s PDR %u → hw_rule_id %u, teid=0x%x, "
