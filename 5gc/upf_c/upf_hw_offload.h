@@ -267,12 +267,18 @@ upf_build_and_send_hw_offload(UPDK_PDR *pdr)
         }
     }
 
+    uint16_t pdr_id = msg->pdr_id;
+    uint32_t hw_rule_id = msg->hw_rule_id;
+    uint32_t teid = msg->teid;
+    uint32_t ue_ip = msg->ue_ipv4.s_addr;
+    uint8_t apply_action = msg->apply_action;
+
     /* ── Send to Host Agent via ONVM lockless ring ─────────────────── */
     int rc = onvm_nflib_send_msg_to_nf(HOST_AGENT_SERVICE_ID, msg);
     if (rc < 0) {
         UTLT_Warning("hw_offload: send to Host Agent failed (rc=%d) for "
                      "PDR %u, hw_rule_id %u — SW fallback active",
-                     rc, msg->pdr_id, msg->hw_rule_id);
+                     rc, pdr_id, hw_rule_id);
         rte_free(msg);   /* sender frees on failure per ONVM convention */
         return rc;
     }
@@ -280,11 +286,10 @@ upf_build_and_send_hw_offload(UPDK_PDR *pdr)
     UTLT_Info("hw_offload: sent %s PDR %u → hw_rule_id %u, teid=0x%x, "
               "ue_ip=%08x, action=%u",
               direction == HW_DIR_UPLINK ? "UL" : "DL",
-              msg->pdr_id, msg->hw_rule_id, msg->teid,
-              msg->ue_ipv4.s_addr, msg->apply_action);
+              pdr_id, hw_rule_id, teid, ue_ip, apply_action);
 
     /* Store hw_rule_id back into PDR for future update/delete references */
-    pdr->hw_rule_id = msg->hw_rule_id;
+    pdr->hw_rule_id = hw_rule_id;
     UTLT_Info("hw_offload_trace: stored hw_rule_id=%u into PDR %u at pdr_ptr=%p",
               pdr->hw_rule_id, pdr->pdrId, (void *)pdr);
 
