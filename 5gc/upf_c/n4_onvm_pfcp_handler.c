@@ -1236,13 +1236,21 @@ Status UpfN4HandleUpdatePdr(UpfSession *session, UpdatePDR *updatePdr) {
      *    to DPU so it can delete + re-insert with new match fields.
      *    If the PDR is no longer offloadable (FAR changed to DROP/BUFF),
      *    delete the stale HW rule instead. ──────────────────────────── */
+    UTLT_Info("hw_offload_trace: Update PDR decision pdr=%u hw_rule_id=%u far_action=%u src_if=%u",
+              upfPdr->pdrId,
+              upfPdr->hw_rule_id,
+              upfPdr->far ? upfPdr->far->applyAction : 0,
+              upfPdr->pdi.sourceInterface);
     if (upfPdr->hw_rule_id != 0) {
         if (upfPdr->far &&
             (upfPdr->far->applyAction & UPDK_FAR_APPLY_ACTION_FORW)) {
             upf_send_hw_offload_update_pdr(upfPdr);
         } else {
-            if (upf_send_hw_offload_delete(upfPdr->hw_rule_id) == 0)
+            if (upf_send_hw_offload_delete(upfPdr->hw_rule_id) == 0) {
+                UTLT_Info("hw_offload_trace: clearing hw_rule_id for PDR %u after Update PDR delete path (old hw_rule_id=%u)",
+                          upfPdr->pdrId, upfPdr->hw_rule_id);
                 upfPdr->hw_rule_id = 0;
+            }
         }
     }
 
@@ -1377,6 +1385,13 @@ Status UpfN4HandleUpdateFar(UpfSession *session, UpdateFAR *updateFar) {
         while (it && (n = list_iterator_next(it))) {
             UpfPDR *p = (UpfPDR *)n->val;
             if (p && p->farId == farID) {
+                UTLT_Info("hw_offload_trace: Update FAR inspect pdr=%u far=%u old_action=%u new_action=%u hw_rule_id=%u src_if=%u",
+                          p->pdrId,
+                          farID,
+                          oldAction,
+                          upfFar->applyAction,
+                          p->hw_rule_id,
+                          p->pdi.sourceInterface);
                 /* ── UL buffering omission ─────────────────────────────
                  * If the previous FAR action was BUFF and this is a UL
                  * PDR (sourceInterface == ACCESS), UPF-C never forwarded
@@ -1395,18 +1410,25 @@ Status UpfN4HandleUpdateFar(UpfSession *session, UpdateFAR *updateFar) {
                     continue;
                 }
                 if (p->hw_rule_id != 0) {
+                    UTLT_Info("hw_offload_trace: Update FAR sending UPDATE_FAR for PDR %u with hw_rule_id=%u",
+                              p->pdrId, p->hw_rule_id);
                     int rc = upf_send_hw_offload_update_far(p, upfFar);
                     /* DROP deletes the HW rule on DPU — clear hw_rule_id so
                      * a later UpdateFAR(FORW) won't reference a stale rule.
                      * Only clear on send success; if send fails, DPU still
                      * has the rule and CP must keep the reference. */
                     if (rc == 0 &&
-                        (upfFar->applyAction & PFCP_FAR_APPLY_ACTION_DROP))
+                        (upfFar->applyAction & PFCP_FAR_APPLY_ACTION_DROP)) {
+                        UTLT_Info("hw_offload_trace: clearing hw_rule_id for PDR %u after Update FAR DROP (old hw_rule_id=%u)",
+                                  p->pdrId, p->hw_rule_id);
                         p->hw_rule_id = 0;
+                    }
                 } else if (upfFar->applyAction & PFCP_FAR_APPLY_ACTION_FORW) {
                     /* DROP→FORW recovery: hw_rule_id was cleared by a prior
                      * DROP.  Re-offload the PDR to restore HW acceleration.
                      * Non-fatal: if re-offload fails, SW fallback handles it. */
+                    UTLT_Info("hw_offload_trace: Update FAR re-offload path for PDR %u because hw_rule_id=0 and new_action=%u",
+                              p->pdrId, upfFar->applyAction);
                     upf_build_and_send_hw_offload(p);
                 }
             }
@@ -1606,8 +1628,11 @@ Status UpfN4HandleRemovePdr(UpfSession *session, uint16_t nPDRID) {
 
     /* ── HW offload: tell DPU to remove the rule before we free it ── */
     if (upfPdr->hw_rule_id != 0) {
-        if (upf_send_hw_offload_delete(upfPdr->hw_rule_id) == 0)
+        if (upf_send_hw_offload_delete(upfPdr->hw_rule_id) == 0) {
+            UTLT_Info("hw_offload_trace: clearing hw_rule_id for PDR %u during Remove PDR (old hw_rule_id=%u)",
+                      upfPdr->pdrId, upfPdr->hw_rule_id);
             upfPdr->hw_rule_id = 0;
+        }
     }
 
     UpfPDRGlobalRemove(upfPdr);
@@ -1641,8 +1666,11 @@ Status UpfN4HandleRemoveFar(UpfSession *session, uint32_t nFARID) {
         while (it && (n = list_iterator_next(it))) {
             UpfPDR *p = (UpfPDR *)n->val;
             if (p && p->hw_rule_id != 0 && p->farId == farID) {
-                if (upf_send_hw_offload_delete(p->hw_rule_id) == 0)
+                if (upf_send_hw_offload_delete(p->hw_rule_id) == 0) {
+                    UTLT_Info("hw_offload_trace: clearing hw_rule_id for PDR %u during Remove FAR %u (old hw_rule_id=%u)",
+                              p->pdrId, farID, p->hw_rule_id);
                     p->hw_rule_id = 0;
+                }
             }
         }
         if (it) list_iterator_destroy(it);
