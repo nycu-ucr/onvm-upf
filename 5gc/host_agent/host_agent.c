@@ -113,8 +113,38 @@ format_ipv4_host_order(uint32_t addr_host_order, char *buf, size_t buf_len)
 }
 
 static void
+print_op_name(uint8_t op, char *buf, size_t buf_len)
+{
+    const char *name;
+
+    switch (op) {
+        case HW_OP_CREATE:
+            name = "CREATE";
+            break;
+        case HW_OP_DELETE:
+            name = "DELETE";
+            break;
+        case HW_OP_UPDATE_FAR:
+            name = "UPDATE_FAR";
+            break;
+        case HW_OP_UPDATE_QER:
+            name = "UPDATE_QER";
+            break;
+        case HW_OP_UPDATE_PDR:
+            name = "UPDATE_PDR";
+            break;
+        default:
+            name = "UNKNOWN";
+            break;
+    }
+
+    snprintf(buf, buf_len, "%s", name);
+}
+
+static void
 print_msg_summary(const hw_offload_msg_t *msg)
 {
+    char op_buf[24];
     char ue_ipv4_buf[INET_ADDRSTRLEN];
     char src_ip_buf[INET_ADDRSTRLEN];
     char dst_ip_buf[INET_ADDRSTRLEN];
@@ -126,8 +156,11 @@ print_msg_summary(const hw_offload_msg_t *msg)
         dst_ip = format_ipv4_host_order(msg->sdf_dst_ip, dst_ip_buf, sizeof(dst_ip_buf));
     }
 
+    print_op_name(msg->op, op_buf, sizeof(op_buf));
     fprintf(stderr,
-            "host_agent: pdr_id=%u teid=0x%x ue_ipv4=%s src_ip=%s dst_ip=%s\n",
+            "host_agent: op=%s hw_rule_id=%u pdr_id=%u teid=0x%x ue_ipv4=%s src_ip=%s dst_ip=%s\n",
+            op_buf,
+            msg->hw_rule_id,
             msg->pdr_id,
             msg->teid,
             format_ipv4_nbo(msg->ue_ipv4, ue_ipv4_buf, sizeof(ue_ipv4_buf)),
