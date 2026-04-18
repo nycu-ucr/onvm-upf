@@ -141,6 +141,7 @@ Status UpfContextInit() {
     self.accessPort = 0;
     self.corePort   = 1;
     self.sgiPort    = 1;  // SGi follows CORE by convention
+    self.hostAgentOffload = 1;
     strcpy(self.envParams->virtualDevice->deviceID, self.gtpDevNamePrefix);
 
     // Init Resource

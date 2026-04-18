@@ -179,6 +179,9 @@ upf_build_and_send_hw_offload(UPDK_PDR *pdr)
         return 0;   /* CP / LI interface — not offloaded */
     }
 
+    if (!Self()->hostAgentOffload)
+        return 0;
+
     /* ── Allocate message from hugepage (visible to Host Agent) ────── */
     hw_offload_msg_t *msg = (hw_offload_msg_t *)rte_calloc(
         "hw_offload", 1, sizeof(hw_offload_msg_t), RTE_CACHE_LINE_SIZE);
@@ -301,6 +304,9 @@ upf_build_and_send_hw_offload(UPDK_PDR *pdr)
 static inline int
 upf_send_hw_offload_delete(uint32_t hw_rule_id)
 {
+    if (!Self()->hostAgentOffload)
+        return 0;
+
     hw_offload_msg_t *msg = (hw_offload_msg_t *)rte_calloc(
         "hw_offload", 1, sizeof(hw_offload_msg_t), RTE_CACHE_LINE_SIZE);
     if (!msg) {
@@ -335,6 +341,9 @@ static inline int
 upf_send_hw_offload_update_far(UPDK_PDR *pdr, const UPDK_FAR *far)
 {
     if (!pdr || pdr->hw_rule_id == 0 || !far)
+        return 0;
+
+    if (!Self()->hostAgentOffload)
         return 0;
 
     /* ── UL buffering omission ──────────────────────────────────────
@@ -405,6 +414,9 @@ upf_send_hw_offload_update_qer(UPDK_PDR *pdr)
     if (!pdr || pdr->hw_rule_id == 0)
         return 0;
 
+    if (!Self()->hostAgentOffload)
+        return 0;
+
     hw_offload_msg_t *msg = (hw_offload_msg_t *)rte_calloc(
         "hw_offload", 1, sizeof(hw_offload_msg_t), RTE_CACHE_LINE_SIZE);
     if (!msg) {
@@ -462,6 +474,9 @@ upf_send_hw_offload_update_pdr(UPDK_PDR *pdr)
 
     /* Re-check offloadability (FAR must be FORW) */
     if (!pdr->far || !(pdr->far->applyAction & UPDK_FAR_APPLY_ACTION_FORW))
+        return 0;
+
+    if (!Self()->hostAgentOffload)
         return 0;
 
     uint32_t saved_rule_id = pdr->hw_rule_id;

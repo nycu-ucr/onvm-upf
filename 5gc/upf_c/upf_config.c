@@ -90,6 +90,15 @@ Status UpfConfigParse() {
                         // Always fail here
                         UTLT_Assert(UTLT_SetReportCaller(REPORTCALLER_MAX) == STATUS_OK, return STATUS_ERROR, "ReportCaller is invalid");
                     }
+                } else if (!strcmp(upfKey, "hostAgentOffload")) {
+                    const char *hostAgentOffload = YamlIterGet(&upfIter, GET_VALUE);
+                    if (!strcmp(hostAgentOffload, "true")) {
+                        Self()->hostAgentOffload = 1;
+                    } else if (!strcmp(hostAgentOffload, "false")) {
+                        Self()->hostAgentOffload = 0;
+                    } else {
+                        UTLT_Assert(0, return STATUS_ERROR, "hostAgentOffload is invalid");
+                    }
                 } else if (!strcmp(upfKey, "gtpu")) {
                     YamlIter gtpuList, gtpuIter;
                     YamlIterChild(&upfIter, &gtpuList);
@@ -250,6 +259,9 @@ Status UpfConfigParse() {
             }
         }
     }
+
+    UTLT_Info("Host Agent offload: %s",
+              Self()->hostAgentOffload ? "enabled" : "disabled");
 
     DeleteYamlDocument();
     

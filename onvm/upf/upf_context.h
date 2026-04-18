@@ -117,6 +117,9 @@ typedef struct {
     int             accessPort;          // Default : 0
     int             corePort;            // Default : 1
     int             sgiPort;             // Default : 1  (SGi follows CORE)
+
+    // Host Agent offload integration
+    uint8_t         hostAgentOffload;    // Default : 1 (enabled)
 } UpfContext;
 
 typedef struct _UpfUeIp {
