@@ -285,6 +285,8 @@ upf_build_and_send_hw_offload(UPDK_PDR *pdr)
 
     /* Store hw_rule_id back into PDR for future update/delete references */
     pdr->hw_rule_id = msg->hw_rule_id;
+    UTLT_Info("hw_offload_trace: stored hw_rule_id=%u into PDR %u at pdr_ptr=%p",
+              pdr->hw_rule_id, pdr->pdrId, (void *)pdr);
 
     return 0;
 }

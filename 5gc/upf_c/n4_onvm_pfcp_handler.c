@@ -1236,8 +1236,9 @@ Status UpfN4HandleUpdatePdr(UpfSession *session, UpdatePDR *updatePdr) {
      *    to DPU so it can delete + re-insert with new match fields.
      *    If the PDR is no longer offloadable (FAR changed to DROP/BUFF),
      *    delete the stale HW rule instead. ──────────────────────────── */
-    UTLT_Info("hw_offload_trace: Update PDR decision pdr=%u hw_rule_id=%u far_action=%u src_if=%u",
+    UTLT_Info("hw_offload_trace: Update PDR decision pdr=%u pdr_ptr=%p hw_rule_id=%u far_action=%u src_if=%u",
               upfPdr->pdrId,
+              (void *)upfPdr,
               upfPdr->hw_rule_id,
               upfPdr->far ? upfPdr->far->applyAction : 0,
               upfPdr->pdi.sourceInterface);
@@ -1385,8 +1386,9 @@ Status UpfN4HandleUpdateFar(UpfSession *session, UpdateFAR *updateFar) {
         while (it && (n = list_iterator_next(it))) {
             UpfPDR *p = (UpfPDR *)n->val;
             if (p && p->farId == farID) {
-                UTLT_Info("hw_offload_trace: Update FAR inspect pdr=%u far=%u old_action=%u new_action=%u hw_rule_id=%u src_if=%u",
+                UTLT_Info("hw_offload_trace: Update FAR inspect pdr=%u pdr_ptr=%p far=%u old_action=%u new_action=%u hw_rule_id=%u src_if=%u",
                           p->pdrId,
+                          (void *)p,
                           farID,
                           oldAction,
                           upfFar->applyAction,
