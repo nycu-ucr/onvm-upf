@@ -18,6 +18,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+#include <arpa/inet.h>
 #include <errno.h>
 #include <getopt.h>
 #include <inttypes.h>
@@ -89,6 +90,49 @@ progress_engine_once(void)
 {
     if (comch_pe != NULL)
         doca_pe_progress(comch_pe);
+}
+
+static const char *
+format_ipv4_nbo(struct in_addr addr, char *buf, size_t buf_len)
+{
+    if (inet_ntop(AF_INET, &addr, buf, buf_len) == NULL) {
+        snprintf(buf, buf_len, "invalid");
+    }
+
+    return buf;
+}
+
+static const char *
+format_ipv4_host_order(uint32_t addr_host_order, char *buf, size_t buf_len)
+{
+    struct in_addr addr = {
+        .s_addr = htonl(addr_host_order),
+    };
+
+    return format_ipv4_nbo(addr, buf, buf_len);
+}
+
+static void
+print_msg_summary(const hw_offload_msg_t *msg)
+{
+    char ue_ipv4_buf[INET_ADDRSTRLEN];
+    char src_ip_buf[INET_ADDRSTRLEN];
+    char dst_ip_buf[INET_ADDRSTRLEN];
+    const char *src_ip = "-";
+    const char *dst_ip = "-";
+
+    if (msg->has_sdf) {
+        src_ip = format_ipv4_host_order(msg->sdf_src_ip, src_ip_buf, sizeof(src_ip_buf));
+        dst_ip = format_ipv4_host_order(msg->sdf_dst_ip, dst_ip_buf, sizeof(dst_ip_buf));
+    }
+
+    fprintf(stderr,
+            "host_agent: pdr_id=%u teid=0x%x ue_ipv4=%s src_ip=%s dst_ip=%s\n",
+            msg->pdr_id,
+            msg->teid,
+            format_ipv4_nbo(msg->ue_ipv4, ue_ipv4_buf, sizeof(ue_ipv4_buf)),
+            src_ip,
+            dst_ip);
 }
 
 static bool
@@ -309,6 +353,15 @@ comch_init(void)
     else
         DOCA_LOG_WARN("Comch client not yet connected (will retry in background)");
 
+    if (comch_connected) {
+        fprintf(stderr,
+                "host_agent: Comch connected (server=%s, pci=%s)\n",
+                g_server_name, g_pci_addr);
+    } else {
+        fprintf(stderr,
+                "host_agent: Comch not connected yet; continuing without offload connection\n");
+    }
+
     return 0;
 
 error:
@@ -373,6 +426,7 @@ msg_handler(void *msg_data,
     }
 
     __atomic_fetch_add(&g_msgs_received, 1, __ATOMIC_RELAXED);
+    print_msg_summary(msg);
 
     DOCA_LOG_INFO("msg_handler: op=%u dir=%s pdr=%u hw_rule=%u teid=0x%x",
                   msg->op,
@@ -407,6 +461,9 @@ msg_handler(void *msg_data,
             doca_task_free(doca_comch_task_send_as_task(task));
         }
     } else {
+        fprintf(stderr,
+                "host_agent: no Comch connection; rule hw_rule_id=%u stays local-only\n",
+                msg->hw_rule_id);
         DOCA_LOG_WARN("Comch not connected — dropping hw_rule_id=%u",
                       msg->hw_rule_id);
         __atomic_fetch_add(&g_msgs_failed, 1, __ATOMIC_RELAXED);
@@ -563,6 +620,8 @@ main(int argc, char *argv[]) {
 
     /* Initialise DOCA Comch client to DPU */
     if (comch_init() < 0) {
+        fprintf(stderr,
+                "host_agent: Comch init failed; continuing without DPU offload\n");
         DOCA_LOG_ERR("Comch init failed — running without DPU offload");
         /* Non-fatal: packets will fall through to SW path */
     }
