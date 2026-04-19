@@ -272,7 +272,20 @@ fi
 sudo rm -rf /mnt/huge/rtemap_*
 # watch out for variable expansion
 # shellcheck disable=SC2086
-sudo ./build/onvm/onvm_mgr/onvm_mgr -l "$cpu" -n 4 --proc-type=primary ${virt_addr} -- -p ${ports} -n ${nf_cores} ${num_srvc} ${def_srvc} ${stats} ${stats_sleep_time} ${verbosity_level} ${ttl} ${packet_limit} ${shared_cpu_flag} ${jumbo_frames_flag}
+
+ALLOW_LIST="${ONVM_ALLOW_LIST:-0000:08:00.0 0000:09:00.0}"
+
+allow_args=()
+for dev in $ALLOW_LIST; do
+    allow_args+=(--allow "$dev")
+done
+
+# echo "Using PCI allow list: ${allow_args[*]}"
+sudo ./build/onvm/onvm_mgr/onvm_mgr \
+    -l "$cpu" -n 4 --proc-type=primary \
+    "${allow_args[@]}" \
+    ${virt_addr} \
+    -- -p ${ports} -n ${nf_cores} ${num_srvc} ${def_srvc} ${stats} ${stats_sleep_time} ${verbosity_level} ${ttl} ${packet_limit} ${shared_cpu_flag} ${jumbo_frames_flag}
 
 if [ "${stats}" = "-s web" ]
 then
