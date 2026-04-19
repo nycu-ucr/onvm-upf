@@ -54,6 +54,7 @@
 #include "upf_u_helper.h"
 #include "upf_u_config.h"
 #include "upf_u_arp.h"
+#include "upf_u_icmp.h"
 
 #define NF_TAG "upf_u"
 
@@ -937,6 +938,11 @@ packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm_nf_
     /* Handle ARP packets */
     if (rte_be_to_cpu_16(eth->ether_type) == RTE_ETHER_TYPE_ARP) {
         handle_arp_packet(pkt, meta, nf_local_ctx);
+        return 0;
+    }
+
+    /* Handle local ICMP echo request to UPF-U itself */
+    if (handle_local_icmp_echo(pkt, meta, nf_local_ctx)) {
         return 0;
     }
 
