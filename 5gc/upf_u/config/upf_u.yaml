@@ -7,8 +7,6 @@ configuration:
   dataplane:
     upf_n3_ip: "192.168.1.2"        # N3 interface IP address on the Core Network node
     upf_n6_ip: "192.168.1.3"        # N6 interface IP address on the Core Network node
-    an_peer_n3_ip: "192.168.1.1"    # N3 interface IP address on the UE/RAN node
-    dn_peer_n6_ip: "192.168.1.4"    # N6 interface IP address on the DN node
 
     ports:
       n3_port: 0                     # NIC port used for N3 interface
