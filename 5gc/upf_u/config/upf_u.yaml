@@ -4,17 +4,17 @@ info:
 
 configuration:
   dataplane:
-    dn_mac: "3c:fd:fe:b4:fe:21"
-    an_mac: "3c:fd:fe:b5:00:14"
-    dc_an_mac: "3c:fd:fe:b5:00:15"       # DC (secondary) gNB next-hop MAC
+    dn_mac: "26:ac:e5:99:d5:44"
+    an_mac: "9e:dc:65:7b:19:7b"
+    dc_an_mac: "a6:81:4b:7c:8d:b8"       # DC (secondary) gNB next-hop MAC (node3 enp8s0)
 
-    # NR-DC downlink ECMP (optional — omit nrdc section to disable)
-    # dc_gnb_ip must be the secondary gNB N3 IP advertised to SMF/UPF,
-    # not the UE-facing ranDataPlaneIp.
+    # NR-DC downlink ECMP is disabled for single-gNB bring-up.
+    # Re-add the nrdc block only after validating basic master-gNB data plane.
     nrdc:
-      dc_gnb_ip: "10.0.1.3"              # secondary gNB ranN3Ip (TEID resolved at runtime from PFCP FAR)
+      dc_gnb_ip: "192.168.31.1"
+      dc_upf_ip: "192.168.31.2"
 
-    upf_ip: "192.168.1.2"
+    upf_ip: "192.168.21.2"
 
     ports:
       access: 0                     # ACCESS_PORT

@@ -404,7 +404,7 @@ Status InsertUEIPtoSessionMap(const uint32_t ue_ip, UpfSession *session) {
                                              (const void *) &ue_ip,
                                              cal_hash,
                                              &session->index);
-    return status == 0? STATUS_OK : STATUS_ERROR;
+    return status >= 0 ? STATUS_OK : STATUS_ERROR;
 }
 
 UpfSession *UpfSessionFindByTeid(uint32_t teid) {
@@ -424,7 +424,16 @@ Status InsertTEIDtoSessionMap(const uint32_t teid, UpfSession *session) {
     int32_t status = rte_hash_lookup_with_hash(teid_upf_session_map->hash,
                                                (const void *)&teid,
                                                cal_hash);
+    UTLT_Info("InsertTEIDtoSessionMap: session=%d teid=%u lookup_status=%d teid_count=%u",
+              session->index, teid, status, session->teid_count);
     if (status >= 0) {
+        /* The first PDR TEID is pre-registered during session creation.
+           Treat re-registration for the same session as success so the
+           later CreatePDR path is idempotent. */
+        if (status == session->index) {
+            return STATUS_OK;
+        }
+        UTLT_Error("TEID %u is already mapped to session index %d", teid, status);
         return STATUS_ERROR;
     }
 
@@ -439,7 +448,13 @@ Status InsertTEIDtoSessionMap(const uint32_t teid, UpfSession *session) {
                                              (const void *) &teid,
                                              cal_hash,
                                              &session->index);
-    return status == 0? STATUS_OK : STATUS_ERROR;
+    if (status < 0) {
+        UTLT_Error("InsertTEIDtoSessionMap add failed for TEID %u with status %d", teid, status);
+        session->teid_count--;
+        return STATUS_ERROR;
+    }
+    UTLT_Info("InsertTEIDtoSessionMap: inserted TEID %u into slot %d", teid, status);
+    return STATUS_OK;
 }
 
 void UeIpToUpfSessionMapFree(const uint32_t ueip) {
@@ -469,7 +484,7 @@ void TeidToUpfSessionMapFree(const uint32_t teid) {
     int32_t status = rte_hash_del_key_with_hash(teid_upf_session_map->hash,
                                                 (const void *)&teid,
                                                 cal_hash);
-    if (status < 0) {
+    if (status < 0 && status != -ENOENT) {
         UTLT_Error("Error deleting TeidToUpfSessionMap for TEID %u", teid);
     }
 }

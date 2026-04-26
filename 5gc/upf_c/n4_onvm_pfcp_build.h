@@ -32,7 +32,7 @@ Status UpfN4BuildSessionEstablishmentResponse(
         Bufblk **bufBlk, uint8_t type, UpfSession *session, uint8_t cause,
         PFCPSessionEstablishmentRequest *establishRequest);
 Status UpfN4BuildSessionModificationResponse(
-        Bufblk **bufBlkPtr, uint8_t type, UpfSession *session,
+        Bufblk **bufBlkPtr, uint8_t type, UpfSession *session, uint8_t cause,
         PFCPSessionModificationRequest *modifyRequest);
 Status UpfN4BuildSessionDeletionResponse(
         Bufblk **bufBlkPtr, uint8_t type, UpfSession *session,

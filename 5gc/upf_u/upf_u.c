@@ -100,7 +100,8 @@ static struct rte_ether_addr cn_ue_eth;
 uint8_t DnMac[RTE_ETHER_ADDR_LEN];
 uint8_t AnMac[RTE_ETHER_ADDR_LEN];
 uint8_t DcAnMac[RTE_ETHER_ADDR_LEN];  // DC (secondary) gNB next-hop MAC
-int SELF_IP;
+uint32_t SELF_IP;
+uint32_t DcSelfIp = 0;        // secondary local UPF N3 IP for Option A bridge mode
 
 /* --- NR-DC downlink ECMP config --- */
 int      DcEnabled = 0;         // 1 = DC ECMP steering active
@@ -113,6 +114,18 @@ enum { IF_UNKNOWN = -1 };
 int16_t g_access_port = 0;
 int16_t g_core_port   = 0;
 int16_t g_sgi_port    = 0;
+
+static inline bool
+PacketTargetsLocalUpf(uint32_t dst_addr)
+{
+    if (dst_addr == (uint32_t)SELF_IP) {
+        return true;
+    }
+    if (DcSelfIp != 0 && dst_addr == DcSelfIp) {
+        return true;
+    }
+    return false;
+}
 
 
 struct rte_meter_trtcm_profile app_trtcm_profile;
@@ -757,6 +770,13 @@ ip4_to_buf(uint32_t be_addr, char buf[16]) {
   return buf;
 }
 
+static inline const char *
+mac_to_buf(const uint8_t *mac, char buf[18]) {
+    snprintf(buf, 18, "%02x:%02x:%02x:%02x:%02x:%02x",
+             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+    return buf;
+}
+
 static void dump_gtpu(const uint8_t *start, size_t len, size_t gtp_off) {
     printf("---- GTPU Dump (offset %zu, %zu bytes) ----\n", gtp_off, len);
     for (size_t i = 0; i < len; i++) {
@@ -995,8 +1015,22 @@ Encap(struct rte_mbuf *pkt, UPDK_FAR *far, UPDK_QER *qer) {
                               // udppayloadlen should be raw + gtp header
 
     struct rte_ipv4_hdr *ipv4_hdr = rte_pktmbuf_mtod_offset(pkt, struct rte_ipv4_hdr *, 0);
-    onvm_pkt_fill_ipv4(ipv4_hdr, rte_cpu_to_be_32(SELF_IP), rte_cpu_to_be_32(outerHeaderCreation->ipv4.s_addr),
-               IPPROTO_UDP);
+    /* SELF_IP and outerHeaderCreation->ipv4.s_addr are both kept in packet/network
+       representation elsewhere in this code. onvm_pkt_fill_ipv4() expects host-order
+       inputs and converts them internally, so convert back before filling. */
+    uint32_t outer_src_nbo = (uint32_t)SELF_IP;
+    if (DcSelfIp != 0 && outerHeaderCreation->ipv4.s_addr == DcGnbIp) {
+        outer_src_nbo = DcSelfIp;
+    }
+    uint32_t outer_src_host = rte_be_to_cpu_32(outer_src_nbo);
+    uint32_t outer_dst_host = rte_be_to_cpu_32(outerHeaderCreation->ipv4.s_addr);
+    char outer_src_ip[16], outer_dst_ip[16];
+    UTLT_Info("Encap outer IPv4 src=%s dst=%s teid=%u raw_dst=0x%08x",
+              ip4_to_buf(rte_cpu_to_be_32(outer_src_host), outer_src_ip),
+              ip4_to_buf(rte_cpu_to_be_32(outer_dst_host), outer_dst_ip),
+              outerHeaderCreation->teid,
+              outerHeaderCreation->ipv4.s_addr);
+    onvm_pkt_fill_ipv4(ipv4_hdr, outer_src_host, outer_dst_host, IPPROTO_UDP);
     ipv4_hdr->total_length = rte_cpu_to_be_16(payloadLen + sizeof(gtpv1_t) + sizeof(struct rte_udp_hdr) +
                           sizeof(struct rte_ipv4_hdr));  // raw+gtp8+udp8+ip20
     ipv4_hdr->hdr_checksum = rte_ipv4_cksum(ipv4_hdr);
@@ -1139,6 +1173,12 @@ AttachL2Header(struct rte_mbuf *pkt, bool is_dl, const uint8_t *dl_dst_mac) {
         rte_ether_addr_copy(&dn_eth, &eth_hdr->dst_addr);
     }
 
+    char src_mac[18], dst_mac[18];
+    UTLT_Info("AttachL2Header is_dl=%d src_mac=%s dst_mac=%s",
+              is_dl ? 1 : 0,
+              mac_to_buf(eth_hdr->src_addr.addr_bytes, src_mac),
+              mac_to_buf(eth_hdr->dst_addr.addr_bytes, dst_mac));
+
     eth_hdr->ether_type = rte_cpu_to_be_16(RTE_ETHER_TYPE_IPV4);
 }
 
@@ -1171,7 +1211,7 @@ packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm_nf_
     char *dst_address = convertToIpAddress(iph->dst_addr);
     UTLT_Info("Dst IP is %s\n", dst_address);
 
-    if (iph->dst_addr == SELF_IP) {  //
+    if (PacketTargetsLocalUpf(iph->dst_addr)) {
         UTLT_Info("It is uplink\n");
 
         struct rte_udp_hdr *udp_header = onvm_pkt_udp_hdr(pkt);
@@ -1257,12 +1297,36 @@ packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm_nf_
                 dc_far_copy.forwardingParameters.outerHeaderCreation.teid = DcTeid;
                 dc_far_copy.forwardingParameters.outerHeaderCreation.ipv4.s_addr = DcGnbIp;
                 far = &dc_far_copy;
-                dl_dst_mac = DcAnMac;
-                UTLT_Info("DC ECMP: steer to secondary gNB\n");
-            } else {
-                UTLT_Info("DC ECMP: steer to master gNB\n");
             }
         }
+    }
+
+    /* Derive L2 destination MAC from the FAR's actual outer IP destination.
+     * This ensures the MAC always matches the outer IP regardless of which
+     * PDR was matched or what the ECMP hash decided. */
+    if (is_dl && DcEnabled && DcGnbIp != 0 &&
+        far->flags.forwardingParameters &&
+        far->forwardingParameters.flags.outerHeaderCreation &&
+        far->forwardingParameters.outerHeaderCreation.ipv4.s_addr == DcGnbIp) {
+        dl_dst_mac = DcAnMac;
+    }
+
+    if (is_dl && far->flags.forwardingParameters &&
+        far->forwardingParameters.flags.outerHeaderCreation) {
+        uint32_t final_outer_dst = far->forwardingParameters.outerHeaderCreation.ipv4.s_addr;
+        const char *final_path = "default gNB";
+        char final_outer_dst_ip[16];
+
+        if (DcEnabled && DcGnbIp != 0 && final_outer_dst == DcGnbIp) {
+            final_path = "secondary gNB";
+        } else if ((uint32_t)SELF_IP != 0) {
+            final_path = "master gNB";
+        }
+
+        UTLT_Info("DC final path: %s outer_dst=%s teid=%u",
+                  final_path,
+                  ip4_to_buf(final_outer_dst, final_outer_dst_ip),
+                  far->forwardingParameters.outerHeaderCreation.teid);
     }
 
     status = HandlePacketWithFar(pkt, far, pdr->qer, meta);
@@ -1431,8 +1495,8 @@ main(int argc, char *argv[]) {
     int arg_offset;
     struct onvm_nf_local_ctx *nf_local_ctx;
     struct onvm_nf_function_table *nf_function_table;
-    // UTLT_SetLogLevel("Panic"); // to eliminate log print influenced jitter
-    UTLT_SetLogLevel("warning"); // to eliminate log print influenced jitter
+    // Use info while debugging dataplane path issues.
+    UTLT_SetLogLevel("info");
 
     nf_local_ctx = onvm_nflib_init_nf_local_ctx();
     onvm_nflib_start_signal_handler(nf_local_ctx, NULL);

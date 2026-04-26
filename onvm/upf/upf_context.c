@@ -267,7 +267,11 @@ Status UpfPDRRegisterToSession(UpfSession *session, UpfPDR *pdr) {
     list_rpush(session->pdr_list, list_node_new(pdr));
 
     if (pdr->pdi.flags.fTeid) {
-        uint32_t teid = pdr->pdi.fTeid.teid;
+        /* pdr->pdi.fTeid.teid is stored in host byte order after PFCP decode,
+           while session->teid_list and the TEID hash map use network byte order. */
+        uint32_t teid = rte_cpu_to_be_32(pdr->pdi.fTeid.teid);
+        UTLT_Info("UpfPDRRegisterToSession: session=%d pdr=%u host_teid=%u net_teid=%u teid_count=%u",
+                  session->index, pdr->pdrId, pdr->pdi.fTeid.teid, teid, session->teid_count);
 
         /* Check if this TEID is already registered (e.g. during session establishment
            where UpfSessionAdd already inserted the first PDR's TEID). */
@@ -275,6 +279,7 @@ Status UpfPDRRegisterToSession(UpfSession *session, UpfPDR *pdr) {
         for (int i = 0; i < session->teid_count; i++) {
             if (session->teid_list[i] == teid) {
                 already_registered = true;
+                UTLT_Info("UpfPDRRegisterToSession: TEID already present in session at slot %d", i);
                 break;
             }
         }
@@ -295,6 +300,7 @@ Status UpfFARRegisterToSession(UpfSession *session, UpfFAR * far) {
     UTLT_Assert(session->far_list, return STATUS_ERROR, "FAR list not initialized");
 
     list_rpush(session->far_list, list_node_new(far));
+    return STATUS_OK;
 }
 
 Status UpfQERRegisterToSession(UpfSession *session, UpfQER *qer){
@@ -302,6 +308,7 @@ Status UpfQERRegisterToSession(UpfSession *session, UpfQER *qer){
     UTLT_Assert(session->qer_list, return STATUS_ERROR, "QER list not initialized");
 
     list_rpush(session->qer_list, list_node_new(qer));
+    return STATUS_OK;
 }
 
 UpfPDR *UpfPDRFindByID(UpfSession *session, uint16_t id) {
@@ -380,7 +387,10 @@ UpfSession *UpfSessionAdd(PfcpUeIpAddr *ueIp,
     session->srr_flag = false;
 
     session->teid_count = 0;
-    uint32_t first_teid = rte_cpu_to_be_32(teid->teid);
+    /* The PFCP parser leaves F-TEID in network byte order here. Keep that
+       representation so it matches session->teid_list and the TEID hash map. */
+    uint32_t first_teid = teid->teid;
+    UTLT_Info("UpfSessionAdd: session=%d first_teid_raw=%u", session->index, first_teid);
     session->pdn.paa.pdnType = pdnType;
     if (pdnType == PFCP_PDN_TYPE_IPV4) {
         session->ueIpv4.addr4.s_addr = rte_cpu_to_be_32(ueIp->addr4.s_addr);
@@ -401,18 +411,21 @@ UpfSession *UpfSessionAdd(PfcpUeIpAddr *ueIp,
 Status UpfSessionRemove(UpfSession *session) {
     UTLT_Assert(session, return STATUS_ERROR, "session error");
 
-    if (!session->far_list) {
+    if (session->far_list) {
         list_destroy(session->far_list);
     }
 
-    if (!session->pdr_list) {
+    if (session->pdr_list) {
         list_destroy(session->pdr_list);
     }
     UeIpToUpfSessionMapFree(session->ueIpv4.addr4.s_addr);
-    /* Remove TEIDs from the hash map. TeidToUpfSessionMapFree modifies
-       teid_list via swap-and-shrink, so always remove index 0. */
+    /* Remove TEIDs directly from the current session. Using the hash lookup
+       helper here can fail after partial setup/rollback and leave teid_count
+       unchanged, which traps teardown in an infinite loop. */
     while (session->teid_count > 0) {
-        TeidToUpfSessionMapFree(session->teid_list[0]);
+        uint32_t teid = session->teid_list[session->teid_count - 1];
+        session->teid_count--;
+        TeidToUpfSessionMapFree(teid);
     }
     UpfSessionFree(session);
     return STATUS_OK;

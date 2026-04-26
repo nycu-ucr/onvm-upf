@@ -81,19 +81,17 @@ Status UpfN4BuildSessionEstablishmentResponse(Bufblk **bufBlk, uint8_t type,
 }
 
 Status UpfN4BuildSessionModificationResponse(Bufblk **bufBlkPtr, uint8_t type,
-                                             UpfSession *session,
+                                             UpfSession *session, uint8_t cause,
                                              PFCPSessionModificationRequest *modifyRequest) {
     Status status;
     PfcpMessage pfcpMessage;
     PFCPSessionModificationResponse *response = NULL;
-    uint8_t cause;
 
     response = &pfcpMessage.pFCPSessionModificationResponse;
     memset(&pfcpMessage, 0, sizeof(pfcpMessage));
 
     /* cause */
     response->cause.presence = 1;
-    cause = PFCP_CAUSE_REQUEST_ACCEPTED;
     response->cause.value = &cause;
     response->cause.len = 1;
 

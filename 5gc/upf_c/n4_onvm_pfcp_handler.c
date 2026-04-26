@@ -598,7 +598,7 @@ Status UpfN4HandleCreatePdr(UpfSession *session, CreatePDR *createPdr) {
     }
 
     // Register PDR to Session
-    UTLT_Assert(UpfPDRRegisterToSession(session, upfPdr),
+    UTLT_Assert(UpfPDRRegisterToSession(session, upfPdr) == STATUS_OK,
                 rte_free(upfPdr);
                 return STATUS_ERROR,
                 "UpfPDRRegisterToSession failed");
@@ -725,7 +725,7 @@ Status UpfN4HandleCreateFar(UpfSession *session, CreateFAR *createFar) {
         return STATUS_ERROR, "Convert FAR TLV To Rule is failed");
 
     // Register FAR to Session
-    UTLT_Assert(UpfFARRegisterToSession(session, upfFar),
+    UTLT_Assert(UpfFARRegisterToSession(session, upfFar) == STATUS_OK,
                 return STATUS_ERROR,
                 "UpfFARRegisterToSession failed");
     return STATUS_OK;
@@ -852,7 +852,7 @@ Status UpfN4HandleCreateQer(UpfSession *session, CreateQER *createQer) {
     
     // Register QER to Session
     // need to implement this function
-    UTLT_Assert(UpfQERRegisterToSession(session, upfQer),
+    UTLT_Assert(UpfQERRegisterToSession(session, upfQer) == STATUS_OK,
         return STATUS_ERROR, "UpfQERRegisterToSession failed");
 
     return STATUS_OK;
@@ -1074,7 +1074,7 @@ Status UpfN4HandleUpdatePdr(UpfSession *session, UpdatePDR *updatePdr) {
 
 #ifdef CHECK
     // Register PDR to Session
-    UTLT_Assert(UpfPDRRegisterToSession(session, &upfPdr),
+    UTLT_Assert(UpfPDRRegisterToSession(session, &upfPdr) == STATUS_OK,
         return STATUS_ERROR, "UpfPDRRegisterToSession failed");
 #endif
 
@@ -1434,6 +1434,7 @@ Status UpfN4HandleSessionEstablishmentRequest(UpfSession *session, PfcpXact *pfc
                                               PFCPSessionEstablishmentRequest *request) {
     Status status;
     uint8_t cause = PFCP_CAUSE_REQUEST_ACCEPTED;
+    bool cleanupSession = false;
 
     UTLT_Assert(session, return STATUS_ERROR, "Upf Session error");
     UTLT_Assert(pfcpXact, return STATUS_ERROR, "pfcpXact error");
@@ -1477,7 +1478,7 @@ Status UpfN4HandleSessionEstablishmentRequest(UpfSession *session, PfcpXact *pfc
                 UpfSession *s1 = UpfSessionFindBySeid(1);  // Get first creates session
                 UpfQER *upfQer = UpfQERFindByID(s1, 1);    // Always search QERID=1
 
-                UTLT_Assert(UpfQERRegisterToSession(session, upfQer), return STATUS_ERROR, "UpfQERRegisterToSession failed, seid=%d", session->upfSeid);
+                UTLT_Assert(UpfQERRegisterToSession(session, upfQer) == STATUS_OK, return STATUS_ERROR, "UpfQERRegisterToSession failed, seid=%d", session->upfSeid);
             }
         }
     }
@@ -1523,6 +1524,14 @@ Status UpfN4HandleSessionEstablishmentRequest(UpfSession *session, PfcpXact *pfc
     UTLT_Assert(status == STATUS_OK, return STATUS_ERROR,
                 "xact commit error");
 
+    if (cause != PFCP_CAUSE_REQUEST_ACCEPTED) {
+        cleanupSession = true;
+    }
+    if (cleanupSession) {
+        UTLT_Assert(UpfSessionRemove(session) == STATUS_OK, return STATUS_ERROR,
+                    "UpfSessionRemove failed after rejected establishment");
+    }
+
     UTLT_Info("[PFCP] Session Establishment Response");
     return STATUS_OK;
 }
@@ -1534,33 +1543,43 @@ Status UpfN4HandleSessionModificationRequest(UpfSession *session, PfcpXact *xact
 
     Status status;
     PfcpHeader header;
-    Bufblk *bufBlk;
+    Bufblk *bufBlk = NULL;
+    uint8_t cause = PFCP_CAUSE_REQUEST_ACCEPTED;
 
     /* Create FAR */
-    for (int i = 0; i < 2; i++) {
+    for (int i = 0; i < 4; i++) {
         if (request->createFAR[i].presence) {
             UTLT_Info("Create FAR[%d]", i);
             status = UpfN4HandleCreateFar(session, &request->createFAR[i]);
-            UTLT_Assert(status == STATUS_OK, return STATUS_ERROR,
-                        "Modification: Create FAR[%d] error",i);
+            if (status != STATUS_OK) {
+                cause = PFCP_CAUSE_REQUEST_REJECTED;
+                UTLT_Error("Modification: Create FAR[%d] error", i);
+                goto send_response;
+            }
         }
     }
 
     /* Create QER */
     if( request->createQER.presence){
         status = UpfN4HandleCreateQer(session, &request->createQER);
-        UTLT_Assert(status == STATUS_OK, return STATUS_ERROR,
-                    "Modification: Create QER error");
+        if (status != STATUS_OK) {
+            cause = PFCP_CAUSE_REQUEST_REJECTED;
+            UTLT_Error("Modification: Create QER error");
+            goto send_response;
+        }
     }
 
     // The order of PDF should be the lastest
     /* Create PDR */
-    for (int i = 0; i < 2; i++) {
+    for (int i = 0; i < 4; i++) {
         if (request->createPDR[i].presence) {
             UTLT_Info("Create PDR[%d]", i);
             status = UpfN4HandleCreatePdr(session, &request->createPDR[i]);
-            UTLT_Assert(status == STATUS_OK, return STATUS_ERROR,
-                        "Modification: Create PDR[%d] error",i);
+            if (status != STATUS_OK) {
+                cause = PFCP_CAUSE_REQUEST_REJECTED;
+                UTLT_Error("Modification: Create PDR[%d] error", i);
+                goto send_response;
+            }
         }
     }
 
@@ -1569,21 +1588,33 @@ Status UpfN4HandleSessionModificationRequest(UpfSession *session, PfcpXact *xact
         // UTLT_Info("Update FAR[%d] presence: %d", i, request->updateFAR[i].presence);
         if (request->updateFAR[i].presence) {
             UTLT_Info("Update FAR[%d]", i);
-            UTLT_Assert(request->updateFAR[i].fARID.presence == 1, ,
-                        "[PFCP] FarId in updateFAR not presence");
+            if (request->updateFAR[i].fARID.presence != 1) {
+                cause = PFCP_CAUSE_REQUEST_REJECTED;
+                UTLT_Error("[PFCP] FarId in updateFAR not presence");
+                goto send_response;
+            }
             status = UpfN4HandleUpdateFar(session, &request->updateFAR[i]);
-            UTLT_Assert(status == STATUS_OK, return STATUS_ERROR,
-                        "Modification: Update FAR[%d] error",i);
+            if (status != STATUS_OK) {
+                cause = PFCP_CAUSE_REQUEST_REJECTED;
+                UTLT_Error("Modification: Update FAR[%d] error", i);
+                goto send_response;
+            }
         }
     }
 
     /* Update QER */
     if (request->updateQER.presence){
-        UTLT_Assert(request->updateQER.qERID.presence == 1, ,
-                    "[PFCP] QerId in updateQER not presence");
+        if (request->updateQER.qERID.presence != 1) {
+            cause = PFCP_CAUSE_REQUEST_REJECTED;
+            UTLT_Error("[PFCP] QerId in updateQER not presence");
+            goto send_response;
+        }
         status = UpfN4HandleUpdateQer(session, &request->updateQER);
-        UTLT_Assert(status == STATUS_OK, return STATUS_ERROR,
-                    "Modification: Update QER error");
+        if (status != STATUS_OK) {
+            cause = PFCP_CAUSE_REQUEST_REJECTED;
+            UTLT_Error("Modification: Update QER error");
+            goto send_response;
+        }
     } 
 
     // The order of PDF should be the lastest
@@ -1591,55 +1622,80 @@ Status UpfN4HandleSessionModificationRequest(UpfSession *session, PfcpXact *xact
     for (int i = 0; i < 4; i++){
         if (request->updatePDR[i].presence) {
             UTLT_Info("Update PDR [%d]", i);
-            UTLT_Assert(request->updatePDR[i].pDRID.presence == 1, ,
-                        "[PFCP] PdrId in updatePDR not presence!");
-            status = UpfN4HandleUpdatePdr(session, &request->updatePDR);
-            UTLT_Assert(status == STATUS_OK, return STATUS_ERROR,
-                    "Modification: Update PDR[%d] error",i);
+            if (request->updatePDR[i].pDRID.presence != 1) {
+                cause = PFCP_CAUSE_REQUEST_REJECTED;
+                UTLT_Error("[PFCP] PdrId in updatePDR not presence!");
+                goto send_response;
+            }
+            status = UpfN4HandleUpdatePdr(session, &request->updatePDR[i]);
+            if (status != STATUS_OK) {
+                cause = PFCP_CAUSE_REQUEST_REJECTED;
+                UTLT_Error("Modification: Update PDR[%d] error", i);
+                goto send_response;
+            }
         }
     }
 
     /* Remove FAR */
     for (int i = 0; i < 4; i++) {
         if (request->removeFAR[i].presence) {
-            UTLT_Assert(request->removeFAR[i].fARID.presence == 1, ,
-                        "[PFCP] FarId in removeFAR[%d] not presence", i);
+            if (request->removeFAR[i].fARID.presence != 1) {
+                cause = PFCP_CAUSE_REQUEST_REJECTED;
+                UTLT_Error("[PFCP] FarId in removeFAR[%d] not presence", i);
+                goto send_response;
+            }
             status = UpfN4HandleRemoveFar(session, *(uint32_t*)
                                           request->removeFAR[i].fARID.value);
-            UTLT_Assert(status == STATUS_OK, return STATUS_ERROR,
-                        "Modification: Remove FAR[%d] error", i);
+            if (status != STATUS_OK) {
+                cause = PFCP_CAUSE_REQUEST_REJECTED;
+                UTLT_Error("Modification: Remove FAR[%d] error", i);
+                goto send_response;
+            }
         }
     }
 
     /* Remove QER */
     if (request->removeQER.presence){
-        UTLT_Assert(request->removeQER.qERID.presence == 1, ,
-                    "[PFCP] QerId in remove QER not presence");
+        if (request->removeQER.qERID.presence != 1) {
+            cause = PFCP_CAUSE_REQUEST_REJECTED;
+            UTLT_Error("[PFCP] QerId in remove QER not presence");
+            goto send_response;
+        }
         status = UpfN4HandleRemoveQer(session, *(uint32_t*)
                                         request->removeQER.qERID.value);
-        UTLT_Assert(status == STATUS_OK, return STATUS_ERROR,
-                    "Modification: Remove QER error");
+        if (status != STATUS_OK) {
+            cause = PFCP_CAUSE_REQUEST_REJECTED;
+            UTLT_Error("Modification: Remove QER error");
+            goto send_response;
+        }
     }
 
     /* Remove PDR */
     for (int i = 0; i < 4; i++) {
         if (request->removePDR[i].presence) {
-            UTLT_Assert(request->removePDR[i].pDRID.presence == 1, ,
-                        "[PFCP] PdrId in removePDR[%d] not presence!", i);
+            if (request->removePDR[i].pDRID.presence != 1) {
+                cause = PFCP_CAUSE_REQUEST_REJECTED;
+                UTLT_Error("[PFCP] PdrId in removePDR[%d] not presence!", i);
+                goto send_response;
+            }
             status = UpfN4HandleRemovePdr(session, *(uint16_t*)
                                           request->removePDR[i].pDRID.value);
-            UTLT_Assert(status == STATUS_OK, return STATUS_ERROR,
-                        "Modification: Remove PDR[%d] error", i);
+            if (status != STATUS_OK) {
+                cause = PFCP_CAUSE_REQUEST_REJECTED;
+                UTLT_Error("Modification: Remove PDR[%d] error", i);
+                goto send_response;
+            }
         }
     }
 
+send_response:
     /* Send Session Modification Response */
     memset(&header, 0, sizeof(PfcpHeader));
     header.type = PFCP_SESSION_MODIFICATION_RESPONSE;
     header.seid = session->smfSeid;
 
     status = UpfN4BuildSessionModificationResponse(&bufBlk, header.type,
-                                                   session, request);
+                                                   session, cause, request);
     UTLT_Assert(status == STATUS_OK, return STATUS_ERROR,
                 "N4 build error");
 
@@ -1651,7 +1707,7 @@ Status UpfN4HandleSessionModificationRequest(UpfSession *session, PfcpXact *xact
     UTLT_Assert(status == STATUS_OK, return STATUS_ERROR,
                 "PFCP Commit error");
 
-    UTLT_Info("[PFCP] Session Modification Response");
+    UTLT_Info("[PFCP] Session Modification Response cause=%u", cause);
     return STATUS_OK;
 }
 

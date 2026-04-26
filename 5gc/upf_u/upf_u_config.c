@@ -11,6 +11,7 @@ extern uint8_t  DnMac[6];
 extern uint8_t  AnMac[6];
 extern uint8_t  DcAnMac[6];
 extern uint32_t SELF_IP;
+extern uint32_t DcSelfIp;
 extern int16_t  g_access_port;
 extern int16_t  g_core_port;
 extern int16_t  g_sgi_port;
@@ -121,6 +122,8 @@ static int do_parse(yaml_document_t *doc) {
         if (nrdc && nrdc->type == YAML_MAPPING_NODE) {
             yaml_node_t *ip_n = map_get(doc, nrdc, "dc_gnb_ip");
             const char *ip_s = scalar_str(ip_n);
+            yaml_node_t *upf_ip_n = map_get(doc, nrdc, "dc_upf_ip");
+            const char *upf_ip_s = scalar_str(upf_ip_n);
 
             if (ip_s) {
                 struct in_addr addr;
@@ -132,6 +135,17 @@ static int do_parse(yaml_document_t *doc) {
                 DcEnabled = 1;
                 fprintf(stderr, "[UPF-U][CONFIG] NR-DC ECMP enabled: dc_gnb_ip=%s (TEID resolved at runtime)\n",
                         ip_s);
+            }
+
+            if (upf_ip_s) {
+                struct in_addr addr;
+                if (inet_pton(AF_INET, upf_ip_s, &addr) != 1) {
+                    fprintf(stderr, "[UPF-U][CONFIG] invalid nrdc.dc_upf_ip\n");
+                    return -1;
+                }
+                DcSelfIp = addr.s_addr;  // network byte order
+                fprintf(stderr, "[UPF-U][CONFIG] NR-DC secondary local UPF IP: dc_upf_ip=%s\n",
+                        upf_ip_s);
             }
         }
     }
