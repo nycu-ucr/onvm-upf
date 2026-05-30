@@ -728,6 +728,10 @@ Status UpfN4HandleCreateFar(UpfSession *session, CreateFAR *createFar) {
     UTLT_Assert(UpfFARRegisterToSession(session, upfFar) == STATUS_OK,
                 return STATUS_ERROR,
                 "UpfFARRegisterToSession failed");
+    if (UpfSessionUpsertDlPathFromFar(session, upfFar) != STATUS_OK) {
+        UTLT_Warning("DL path cache update failed during FAR create (session=%d far=%u)",
+                     session->index, upfFar->farId);
+    }
     return STATUS_OK;
 }
 
@@ -1199,6 +1203,11 @@ Status UpfN4HandleUpdateFar(UpfSession *session, UpdateFAR *updateFar) {
     UTLT_Assert(_ConvertUpdateFARTlvToRule(upfFar, updateFar) == STATUS_OK,
         return STATUS_ERROR, "Convert FAR TLV To Rule is failed");
 
+    if (UpfSessionUpsertDlPathFromFar(session, upfFar) != STATUS_OK) {
+        UTLT_Warning("DL path cache update failed during FAR update (session=%d far=%u)",
+                     session->index, upfFar->farId);
+    }
+
 #if HANDLE_BUFFER
     // Buffered packet handle
     if ((oldAction & PFCP_FAR_APPLY_ACTION_BUFF)) {
@@ -1406,6 +1415,11 @@ Status UpfN4HandleRemoveFar(UpfSession *session, uint32_t nFARID) {
                 "farId should not be 0");
     UTLT_Assert(session, return STATUS_ERROR,
                 "session not found");
+
+    if (UpfSessionRemoveDlPathByFarID(session, farID) != STATUS_OK) {
+        UTLT_Warning("DL path cache removal failed during FAR delete (session=%d far=%u)",
+                     session->index, farID);
+    }
 
     // Deregister FAR to Session
     UTLT_Assert(UpfFARDeregisterToSessionByID(session, farID) == STATUS_OK,

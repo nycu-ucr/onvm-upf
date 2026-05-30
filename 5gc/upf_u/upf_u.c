@@ -106,8 +106,6 @@ uint32_t DcSelfIp = 0;        // secondary local UPF N3 IP for Option A bridge m
 /* --- NR-DC downlink ECMP config --- */
 int      DcEnabled = 0;         // 1 = DC ECMP steering active
 uint32_t DcGnbIp   = 0;        // secondary gNB IP (network byte order)
-uint32_t DcTeid    = 0;         // secondary gNB TEID — resolved at runtime from FAR list
-int      DcTeidResolved = 0;    // 1 = DcTeid has been looked up from session
 
 enum { IF_UNKNOWN = -1 };
 
@@ -1123,41 +1121,6 @@ dc_hash_four_tuple(const struct rte_ipv4_hdr *iph, uint16_t pkt_len)
     return src_ip ^ dst_ip ^ ((uint32_t)src_port << 16) ^ (uint32_t)dst_port;
 }
 
-static inline bool
-dc_steer_to_secondary(const struct rte_ipv4_hdr *iph, uint16_t pkt_len)
-{
-    return (dc_hash_four_tuple(iph, pkt_len) & 1u) == 1;
-}
-
-/*
- * dc_resolve_teid — find the DC gNB's TEID from the session's FAR list.
- * Scans all FARs for one whose outerHeaderCreation.ipv4 matches DcGnbIp.
- * Called once (lazy) on first DL packet after DC is enabled.
- */
-static void
-dc_resolve_teid(uint32_t ue_ip)
-{
-    UpfSession *session = UpfSessionFindByUeIP(ue_ip);
-    if (!session || !session->far_list)
-        return;
-
-    list_node_t *node;
-    list_iterator_t *it = list_iterator_new(session->far_list, LIST_HEAD);
-    while ((node = list_iterator_next(it))) {
-        UpfFAR *far = (UpfFAR *)node->val;
-        if (far->flags.forwardingParameters &&
-            far->forwardingParameters.flags.outerHeaderCreation &&
-            far->forwardingParameters.outerHeaderCreation.ipv4.s_addr == DcGnbIp) {
-            DcTeid = far->forwardingParameters.outerHeaderCreation.teid;
-            DcTeidResolved = 1;
-            UTLT_Info("DC ECMP: resolved dc_teid=%u from FAR ID %u\n",
-                      DcTeid, far->farId);
-            break;
-        }
-    }
-    list_iterator_destroy(it);
-}
-
 static inline void
 AttachL2Header(struct rte_mbuf *pkt, bool is_dl, const uint8_t *dl_dst_mac) {
     // Prepend ethernet header
@@ -1274,29 +1237,38 @@ packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm_nf_
 
     int status = 0, color_result = 0;
 
-    /* --- NR-DC downlink ECMP steering --- */
+    /* --- Session-local downlink path selection --- */
     const uint8_t *dl_dst_mac = AnMac;  // default: master gNB MAC
-    UPDK_FAR dc_far_copy;               // stack-local FAR for DC tunnel
+    UPDK_FAR dl_far_copy;               // stack-local FAR with selected path endpoint
 
     if (is_dl && DcEnabled) {
-        // Lazy-resolve the DC TEID from session FAR list on first packet
-        if (!DcTeidResolved) {
-            dc_resolve_teid(rte_cpu_to_be_32(iph->dst_addr));
-        }
-
-        if (DcTeidResolved) {
-            // Read inner IP header BEFORE Encap buries it under outer headers.
-            // At this point L2 has been stripped (rte_pktmbuf_adj Ether above),
-            // so pkt data starts at the inner IPv4 header.
+        UpfSession *session = UpfSessionFindByUeIP(rte_cpu_to_be_32(iph->dst_addr));
+        if (session && session->dl_paths.count > 1) {
             struct rte_ipv4_hdr *inner_iph = rte_pktmbuf_mtod(pkt, struct rte_ipv4_hdr *);
             uint16_t inner_len = pkt->data_len;
+            uint32_t path_hash = dc_hash_four_tuple(inner_iph, inner_len);
+            const UpfDlPathEntry *selected_path = UpfSessionGetDlPathByHash(session, path_hash);
 
-            if (dc_steer_to_secondary(inner_iph, inner_len)) {
-                // Copy FAR and override outer header creation for DC tunnel
-                memcpy(&dc_far_copy, far, sizeof(UPDK_FAR));
-                dc_far_copy.forwardingParameters.outerHeaderCreation.teid = DcTeid;
-                dc_far_copy.forwardingParameters.outerHeaderCreation.ipv4.s_addr = DcGnbIp;
-                far = &dc_far_copy;
+            if (selected_path && far->flags.forwardingParameters &&
+                far->forwardingParameters.flags.outerHeaderCreation) {
+                if (far->forwardingParameters.outerHeaderCreation.teid != selected_path->teid ||
+                    far->forwardingParameters.outerHeaderCreation.ipv4.s_addr != selected_path->outer_ip.s_addr) {
+                    memcpy(&dl_far_copy, far, sizeof(UPDK_FAR));
+                    dl_far_copy.forwardingParameters.outerHeaderCreation.teid = selected_path->teid;
+                    dl_far_copy.forwardingParameters.outerHeaderCreation.ipv4 = selected_path->outer_ip;
+                    far = &dl_far_copy;
+                }
+
+                {
+                    char outer_ip_buf[16];
+                    UTLT_Info("DL path select: session=%d hash=%u far_id=%u outer_dst=%s teid=%u count=%u",
+                              session->index,
+                              path_hash,
+                              selected_path->far_id,
+                              ip4_to_buf(selected_path->outer_ip.s_addr, outer_ip_buf),
+                              selected_path->teid,
+                              session->dl_paths.count);
+                }
             }
         }
     }

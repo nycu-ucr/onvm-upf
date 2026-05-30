@@ -46,6 +46,125 @@ upf_cls_ctrl_t *g_upf_cls_ctrl = NULL;
 
 list_t *g_all_pdr_list = NULL;
 
+static int
+UpfSessionFindDlPathSlot(const UpfSession *session, uint32_t far_id) {
+    if (!session) {
+        return -1;
+    }
+
+    for (uint8_t i = 0; i < session->dl_paths.count; i++) {
+        if (session->dl_paths.entries[i].far_id == far_id) {
+            return (int)i;
+        }
+    }
+
+    return -1;
+}
+
+bool UpfFarIsDlAccessCandidate(const UpfFAR *far) {
+    const UPDK_ForwardingParameters *forwarding;
+
+    if (!far) {
+        return false;
+    }
+    if (!far->flags.applyAction || !(far->applyAction & UPDK_FAR_APPLY_ACTION_FORW)) {
+        return false;
+    }
+    if (!far->flags.forwardingParameters) {
+        return false;
+    }
+
+    forwarding = &far->forwardingParameters;
+    if (!forwarding->flags.outerHeaderCreation) {
+        return false;
+    }
+    if (forwarding->flags.destinationInterface &&
+        forwarding->destinationInterface != UPDK_INTERFACE_VALUE_ACCESS) {
+        return false;
+    }
+    if (forwarding->outerHeaderCreation.description !=
+        UPDK_OUTER_HEADER_CREATION_DESCRIPTION_GTPU_UDP_IPV4) {
+        return false;
+    }
+
+    return true;
+}
+
+Status UpfSessionUpsertDlPathFromFar(UpfSession *session, const UpfFAR *far) {
+    int slot;
+    UpfDlPathEntry *entry;
+
+    UTLT_Assert(session, return STATUS_ERROR, "session not found");
+    UTLT_Assert(far, return STATUS_ERROR, "far not found");
+
+    if (!UpfFarIsDlAccessCandidate(far)) {
+        return UpfSessionRemoveDlPathByFarID(session, far->farId);
+    }
+
+    slot = UpfSessionFindDlPathSlot(session, far->farId);
+    if (slot < 0) {
+        if (session->dl_paths.count >= MAX_DL_PATHS) {
+            UTLT_Warning("DL path cache full for session=%d; cannot add FAR ID[%u]",
+                         session->index, far->farId);
+            return STATUS_ERROR;
+        }
+        slot = session->dl_paths.count++;
+    }
+
+    entry = &session->dl_paths.entries[slot];
+    entry->far_id = far->farId;
+    entry->teid = far->forwardingParameters.outerHeaderCreation.teid;
+    entry->outer_ip = far->forwardingParameters.outerHeaderCreation.ipv4;
+
+    {
+        char ipbuf[INET_ADDRSTRLEN];
+        UTLT_Info("DL path upsert: session=%d slot=%d far_id=%u outer_dst=%s teid=%u count=%u",
+                  session->index,
+                  slot,
+                  entry->far_id,
+                  inet_ntop(AF_INET, &entry->outer_ip, ipbuf, sizeof(ipbuf)) ? ipbuf : "invalid",
+                  entry->teid,
+                  session->dl_paths.count);
+    }
+
+    return STATUS_OK;
+}
+
+Status UpfSessionRemoveDlPathByFarID(UpfSession *session, uint32_t far_id) {
+    int slot;
+
+    UTLT_Assert(session, return STATUS_ERROR, "session not found");
+
+    slot = UpfSessionFindDlPathSlot(session, far_id);
+    if (slot < 0) {
+        return STATUS_OK;
+    }
+
+    if ((uint8_t)(slot + 1) < session->dl_paths.count) {
+        memmove(&session->dl_paths.entries[slot],
+                &session->dl_paths.entries[slot + 1],
+                sizeof(session->dl_paths.entries[0]) *
+                    (session->dl_paths.count - (uint8_t)(slot + 1)));
+    }
+
+    session->dl_paths.count--;
+    memset(&session->dl_paths.entries[session->dl_paths.count], 0,
+           sizeof(session->dl_paths.entries[session->dl_paths.count]));
+
+    UTLT_Info("DL path remove: session=%d far_id=%u count=%u",
+              session->index, far_id, session->dl_paths.count);
+
+    return STATUS_OK;
+}
+
+const UpfDlPathEntry *UpfSessionGetDlPathByHash(const UpfSession *session, uint32_t hash) {
+    if (!session || session->dl_paths.count == 0) {
+        return NULL;
+    }
+
+    return &session->dl_paths.entries[hash % session->dl_paths.count];
+}
+
 
 void UpfPDRGlobalInit(void) {
     if (!g_all_pdr_list) {
@@ -382,6 +501,7 @@ UpfSession *UpfSessionAdd(PfcpUeIpAddr *ueIp,
     session->pdr_list = list_new();
     session->far_list = list_new();
     session->qer_list = list_new();
+    memset(&session->dl_paths, 0, sizeof(session->dl_paths));
     // DumpUpfSession();
     //use to check srr flag
     session->srr_flag = false;
@@ -410,6 +530,8 @@ UpfSession *UpfSessionAdd(PfcpUeIpAddr *ueIp,
 
 Status UpfSessionRemove(UpfSession *session) {
     UTLT_Assert(session, return STATUS_ERROR, "session error");
+
+    memset(&session->dl_paths, 0, sizeof(session->dl_paths));
 
     if (session->far_list) {
         list_destroy(session->far_list);

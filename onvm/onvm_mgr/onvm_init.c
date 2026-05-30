@@ -119,7 +119,11 @@ check_all_ports_link_status(uint8_t port_num, uint32_t port_mask);
 static const struct rte_eth_conf port_conf = {
     .rxmode = {
             .mq_mode = RTE_ETH_MQ_RX_RSS,
-            .mtu = RTE_ETHER_MAX_LEN,
+            /* DPDK expects MTU here, not full Ethernet frame size. Using
+             * RTE_ETHER_MAX_LEN makes the manager request a 1536-byte frame,
+             * which breaks AF_PACKET ports that correctly advertise 1518 as
+             * their max frame size. */
+            .mtu = RTE_ETHER_MTU,
             .offloads = RTE_ETH_RX_OFFLOAD_CHECKSUM,
         },
     .rx_adv_conf = {
@@ -384,6 +388,20 @@ init_port(uint8_t port_num) {
         /* Standard DPDK port initialisation - config port, then set up
          * rx and tx rings */
         rte_eth_dev_info_get(port_num, &dev_info);
+        local_port_conf.rxmode.offloads &= dev_info.rx_offload_capa;
+        if (local_port_conf.rxmode.offloads != port_conf.rxmode.offloads) {
+                printf(
+                    "Port %u modified RX offloads based on hardware support,"
+                    " requested:%#" PRIx64 " configured:%#" PRIx64 "\n",
+                    port_num, port_conf.rxmode.offloads, local_port_conf.rxmode.offloads);
+        }
+        local_port_conf.txmode.offloads &= dev_info.tx_offload_capa;
+        if (local_port_conf.txmode.offloads != port_conf.txmode.offloads) {
+                printf(
+                    "Port %u modified TX offloads based on hardware support,"
+                    " requested:%#" PRIx64 " configured:%#" PRIx64 "\n",
+                    port_num, port_conf.txmode.offloads, local_port_conf.txmode.offloads);
+        }
         if (dev_info.tx_offload_capa & RTE_ETH_TX_OFFLOAD_MBUF_FAST_FREE)
                 local_port_conf.txmode.offloads |= RTE_ETH_TX_OFFLOAD_MBUF_FAST_FREE;
         local_port_conf.rx_adv_conf.rss_conf.rss_hf &= dev_info.flow_type_rss_offloads;
@@ -419,7 +437,7 @@ init_port(uint8_t port_num) {
         }
 
         txq_conf = dev_info.default_txconf;
-        txq_conf.offloads = port_conf.txmode.offloads;
+        txq_conf.offloads = local_port_conf.txmode.offloads;
         for (q = 0; q < tx_rings; q++) {
                 retval = rte_eth_tx_queue_setup(port_num, q, tx_ring_size, rte_eth_dev_socket_id(port_num), &txq_conf);
                 if (retval < 0)
