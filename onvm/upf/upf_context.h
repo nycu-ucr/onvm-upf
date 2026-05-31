@@ -235,6 +235,8 @@ bool UpfFarIsDlAccessCandidate(const UpfFAR *far);
 Status UpfSessionUpsertDlPathFromFar(UpfSession *session, const UpfFAR *far);
 Status UpfSessionRemoveDlPathByFarID(UpfSession *session, uint32_t far_id);
 const UpfDlPathEntry *UpfSessionGetDlPathByHash(const UpfSession *session, uint32_t hash);
+UpfFAR *UpfSessionSelectDlFarByHash(const UpfSession *session, UpfFAR *base_far,
+                                    uint32_t hash, UpfFAR *far_copy);
 
 UpfPDR *UpfPDRFindByID(UpfSession *session, uint16_t id);
 UpfFAR *UpfFARFindByID(UpfSession *session, uint16_t id);

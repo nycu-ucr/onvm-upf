@@ -33,3 +33,11 @@ foreach nf : l25gc_nfs
         install_dir: onvm_output_dir + '/nf/' + nf
     )
 endforeach
+
+executable(
+    'l25gc_nrdc_selftest',
+    files('nrdc_selftest.c'),
+    include_directories: [onvm_includes],
+    dependencies: [onvm_l25gc_dep, rt_dep],
+    install: false
+)

@@ -165,6 +165,53 @@ const UpfDlPathEntry *UpfSessionGetDlPathByHash(const UpfSession *session, uint3
     return &session->dl_paths.entries[hash % session->dl_paths.count];
 }
 
+UpfFAR *UpfSessionSelectDlFarByHash(const UpfSession *session, UpfFAR *base_far,
+                                    uint32_t hash, UpfFAR *far_copy) {
+    const UpfDlPathEntry *selected_path;
+    uint32_t base_far_id;
+    bool copied = false;
+
+    if (!session || !base_far || session->dl_paths.count <= 1) {
+        return base_far;
+    }
+
+    base_far_id = base_far->farId;
+    selected_path = UpfSessionGetDlPathByHash(session, hash);
+    if (!selected_path) {
+        return base_far;
+    }
+
+    if (!(base_far->flags.forwardingParameters &&
+          base_far->forwardingParameters.flags.outerHeaderCreation)) {
+        return base_far;
+    }
+
+    if (base_far->forwardingParameters.outerHeaderCreation.teid != selected_path->teid ||
+        base_far->forwardingParameters.outerHeaderCreation.ipv4.s_addr != selected_path->outer_ip.s_addr) {
+        UTLT_Assert(far_copy, return base_far, "far_copy buffer is required for DL FAR override");
+        memcpy(far_copy, base_far, sizeof(*far_copy));
+        far_copy->forwardingParameters.outerHeaderCreation.teid = selected_path->teid;
+        far_copy->forwardingParameters.outerHeaderCreation.ipv4 = selected_path->outer_ip;
+        base_far = far_copy;
+        copied = true;
+    }
+
+    {
+        char ipbuf[INET_ADDRSTRLEN];
+        UTLT_Info("DL path select: session=%d hash=%u base_far_id=%u selected_far_id=%u outer_dst=%s teid=%u count=%u copied=%s",
+                  session->index,
+                  hash,
+                  base_far_id,
+                  selected_path->far_id,
+                  inet_ntop(AF_INET, &selected_path->outer_ip, ipbuf, sizeof(ipbuf)) ? ipbuf : "invalid",
+                  selected_path->teid,
+                  session->dl_paths.count,
+                  copied ? "yes" : "no");
+    }
+
+    return base_far;
+}
+
 
 void UpfPDRGlobalInit(void) {
     if (!g_all_pdr_list) {

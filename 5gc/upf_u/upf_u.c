@@ -1243,33 +1243,11 @@ packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm_nf_
 
     if (is_dl && DcEnabled) {
         UpfSession *session = UpfSessionFindByUeIP(rte_cpu_to_be_32(iph->dst_addr));
-        if (session && session->dl_paths.count > 1) {
+        if (session) {
             struct rte_ipv4_hdr *inner_iph = rte_pktmbuf_mtod(pkt, struct rte_ipv4_hdr *);
             uint16_t inner_len = pkt->data_len;
             uint32_t path_hash = dc_hash_four_tuple(inner_iph, inner_len);
-            const UpfDlPathEntry *selected_path = UpfSessionGetDlPathByHash(session, path_hash);
-
-            if (selected_path && far->flags.forwardingParameters &&
-                far->forwardingParameters.flags.outerHeaderCreation) {
-                if (far->forwardingParameters.outerHeaderCreation.teid != selected_path->teid ||
-                    far->forwardingParameters.outerHeaderCreation.ipv4.s_addr != selected_path->outer_ip.s_addr) {
-                    memcpy(&dl_far_copy, far, sizeof(UPDK_FAR));
-                    dl_far_copy.forwardingParameters.outerHeaderCreation.teid = selected_path->teid;
-                    dl_far_copy.forwardingParameters.outerHeaderCreation.ipv4 = selected_path->outer_ip;
-                    far = &dl_far_copy;
-                }
-
-                {
-                    char outer_ip_buf[16];
-                    UTLT_Info("DL path select: session=%d hash=%u far_id=%u outer_dst=%s teid=%u count=%u",
-                              session->index,
-                              path_hash,
-                              selected_path->far_id,
-                              ip4_to_buf(selected_path->outer_ip.s_addr, outer_ip_buf),
-                              selected_path->teid,
-                              session->dl_paths.count);
-                }
-            }
+            far = UpfSessionSelectDlFarByHash(session, far, path_hash, &dl_far_copy);
         }
     }
 
