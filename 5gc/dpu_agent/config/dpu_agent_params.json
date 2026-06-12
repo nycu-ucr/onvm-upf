@@ -1,0 +1,79 @@
+{
+  "log-level": 60,
+  "comch-pci": "03:00.0",
+  "rep-pci": "81:00.0",
+  "server-name": "dpu_agent",
+  "n3-pci": "03:00.0",
+  "n6-pci": "03:00.1",
+  "upf-n3-ip": "192.168.2.2",
+  "upf-n6-ip": "192.168.3.2",
+  "gnb-ip":    "192.168.2.1",
+  "dn-gw-ip":  "192.168.3.1",
+  "upf-n3-mac": "CC:40:F3:8F:03:56",
+  "gnb-mac": "02:71:50:41:EC:37",
+  "upf-n6-mac": "CC:40:F3:8F:03:57",
+  "dn-gw-mac": "0A:C1:BD:C0:9D:18",
+  // "max-hw-rules": 4096,
+  // "nr-counters": 4096,
+  // "nr-meters": 4096,
+  // "nr-shared-meters": 4096,
+  // "port-nr-encap": 4096,
+  // "port-nr-decap": 4096,
+  // "port-nr-meter": 4096,
+  // "port-actions-mem": 1048576,
+  // "match-entries-per-bucket": 2048,
+  // "dl-encap-entries": 2048
+  // "max-hw-rules": 200000,
+  // "nr-counters": 4096,
+  // "nr-meters": 4096,
+  // "nr-shared-meters": 4096,
+  // "port-nr-encap": 100000,
+  // "port-nr-decap": 4096,
+  // "port-nr-meter": 4096,
+  // "port-actions-mem": 33554432,
+  // "match-entries-per-bucket": 100000,
+  // "dl-encap-entries": 100000,
+  // "max-hw-rules": 400000,
+  // "nr-counters": 4096,
+  // "nr-meters": 4096,
+  // "nr-shared-meters": 4096,
+  // "port-nr-encap": 200000,
+  // "port-nr-decap": 4096,
+  // "port-nr-meter": 4096,
+  // "port-actions-mem": 67108864,
+  // "match-entries-per-bucket": 200000,
+  // "dl-encap-entries": 200000,
+  "max-hw-rules": 2000000,
+  "nr-counters": 4096,
+  "nr-meters": 4096,
+  "nr-shared-meters": 4096,
+  "port-nr-encap": 1000000,
+  "port-nr-decap": 4096,
+  "port-nr-meter": 4096,
+  "port-actions-mem": 268435456,
+  "match-entries-per-bucket": 1000000,
+  "dl-encap-entries": 1000000,
+  // ARP handling: 0 = fall through to host kernel via catch-all
+  //               1 = BF3 ARM answers ARP itself
+  "enable-arp-responder": 1,
+  // ── BDP buffer allocator (byte-budget + EWMA max-min) ──────────────
+  // m-op-bytes: TOTAL DPU buffering byte budget (operator DDR). 67108864 =
+  //   64 MiB = legacy cap (32768 * 2 KiB). "0xFFFFFFFFFFFFFFFF" = OFF (legacy
+  //   packet caps = eval baseline). default-seed-rate-kbps: cold-start demand
+  //   for a NO-GBR/MBR flow until its EWMA gets a sample. t-hold-ms: horizon
+  //   (U_i = rate*T_hold). tick-ms: recompute interval. ewma-alpha: weight %.
+  //   measure-demand: 1=EWMA (product), 0=static QoS-seed (v1 ablation).
+  "m-op-bytes": "17179869184",
+  "default-seed-rate-kbps": 10000,
+  "t-hold-ms": 1000,
+  "tick-ms": 100,
+  "ewma-alpha": 30,
+  "measure-demand": 1,
+  // ── GBR YELLOW buffered shaper ─────────────────────────────────────
+  // m-shape-bytes: global queued-byte budget for shaped GBR YELLOW (logically
+  //   separate from m-op-bytes; both draw on the same physical mbuf pool).
+  //   "0" = OFF → legacy token-bucket pass/drop policer. Default 1 GiB.
+  // shape-max-delay-ms: per-flow delay target; q_max_bytes = EIR * delay/1000.
+  "m-shape-bytes": "1073741824",
+  "shape-max-delay-ms": 50
+}
