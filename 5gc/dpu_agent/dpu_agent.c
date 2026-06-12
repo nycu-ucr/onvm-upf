@@ -258,20 +258,27 @@ comch_recv_cb(struct doca_comch_event_msg_recv *event,
         if (result == DOCA_SUCCESS) {
             shaper_unregister_flow(&g_shaper, msg->hw_rule_id);
             DOCA_LOG_INFO("Rule deleted hw_rule_id=%u", msg->hw_rule_id);
-            /* Brief delay for NIC DMA pipeline to deliver any packets
-             * matched before the HW commit.  BF3 DMA < 10µs; 50µs is
-             * ample margin and negligible vs. PFCP round-trip.
+            /* begin_close IMMEDIATELY after the HW commit: if the slot is
+             * DRAINING/RETIRING (returns 1), the discard flag must stop
+             * the Rx lcore from draining the dead session's backlog to
+             * the wire — any delay here is more stale packets Tx'd.  The
+             * Rx lcore frees the backlog and closes asynchronously; late
+             * DMA arrivals are freed by the discard/CLOSED branches, so
+             * no settle delay is needed on that path.
              *
-             * begin_close == 1: the slot was DRAINING/RETIRING — the Rx
-             * lcore frees the backlog and closes it asynchronously
-             * (discard flag); quiesce_and_drain must not run. */
-            rte_delay_us_block(50);
-            if (dpu_buffer_begin_close(&g_buffer, msg->hw_rule_id) == 0 &&
-                dpu_buffer_quiesce_and_drain(&g_buffer, msg->hw_rule_id,
-                                             true) < 0)
-                DOCA_LOG_ERR("quiesce timeout hw_rule_id=%u (DELETE) "
-                             "— flow stays CLOSING",
-                             msg->hw_rule_id);
+             * Returns 0 (ACTIVE → CLOSING or no-op): give the NIC DMA
+             * pipeline a brief delay to deliver packets matched before
+             * the HW commit (CLOSING still enqueues them), then quiesce
+             * + discard.  BF3 DMA < 10µs; 50µs is ample margin and
+             * negligible vs. PFCP round-trip. */
+            if (dpu_buffer_begin_close(&g_buffer, msg->hw_rule_id) == 0) {
+                rte_delay_us_block(50);
+                if (dpu_buffer_quiesce_and_drain(&g_buffer, msg->hw_rule_id,
+                                                 true) < 0)
+                    DOCA_LOG_ERR("quiesce timeout hw_rule_id=%u (DELETE) "
+                                 "— flow stays CLOSING",
+                                 msg->hw_rule_id);
+            }
         } else {
             DOCA_LOG_ERR("Rule delete failed hw_rule_id=%u: %s "
                          "— buffer stays ACTIVE",
@@ -482,17 +489,23 @@ comch_recv_cb(struct doca_comch_event_msg_recv *event,
                 /* Flow is now DROP — unregister from shaper so the slot
                  * is freed.  No YELLOW traffic can arrive after DROP.
                  *
-                 * begin_close == 1: the slot was DRAINING/RETIRING — the
-                 * Rx lcore frees the backlog and closes it asynchronously
-                 * (discard flag); quiesce_and_drain must not run. */
+                 * begin_close IMMEDIATELY after the HW commit (see the
+                 * DELETE handler): returns 1 for DRAINING/RETIRING — the
+                 * discard flag stops the Rx lcore draining the dead
+                 * session's backlog to the wire, and it closes the slot
+                 * asynchronously (no delay, no quiesce).  Returns 0 for
+                 * ACTIVE → CLOSING: 50µs DMA-settle delay, then quiesce
+                 * + discard. */
                 shaper_unregister_flow(&g_shaper, msg->hw_rule_id);
-                rte_delay_us_block(50);
-                if (dpu_buffer_begin_close(&g_buffer, msg->hw_rule_id) == 0 &&
-                    dpu_buffer_quiesce_and_drain(&g_buffer, msg->hw_rule_id,
-                                                 true) < 0)
-                    DOCA_LOG_ERR("quiesce timeout hw_rule_id=%u (DROP) "
-                                 "— flow stays CLOSING",
-                                 msg->hw_rule_id);
+                if (dpu_buffer_begin_close(&g_buffer, msg->hw_rule_id) == 0) {
+                    rte_delay_us_block(50);
+                    if (dpu_buffer_quiesce_and_drain(&g_buffer,
+                                                     msg->hw_rule_id,
+                                                     true) < 0)
+                        DOCA_LOG_ERR("quiesce timeout hw_rule_id=%u (DROP) "
+                                     "— flow stays CLOSING",
+                                     msg->hw_rule_id);
+                }
             } else {
                 DOCA_LOG_ERR("update_far(DROP) failed hw_rule_id=%u: %s "
                              "— buffer stays ACTIVE",

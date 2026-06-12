@@ -507,12 +507,15 @@ dpu_buffer_rollback_register(dpu_buffer_ctx_t *ctx, uint32_t hw_rule_id)
     }
 
     /* ACTIVE → CLOSED.  No override was ever installed, so no packet for
-     * this flow is in flight; the flush below is a defensive no-op except
-     * for a stale enqueue-after-close race remnant from a previous cycle.
-     * The hash binding and ring persist (slot-lifecycle invariant). */
-    __atomic_store_n(&flow->state, DPU_BUF_CLOSED, __ATOMIC_RELEASE);
-    __atomic_fetch_sub(&ctx->nr_buffering, 1, __ATOMIC_RELEASE);
+     * this flow is in flight; the flush is a defensive no-op except for a
+     * stale enqueue-after-close race remnant from a previous cycle.  The
+     * hash binding and ring persist (slot-lifecycle invariant).  CLOSED is
+     * published LAST — not racy here (register and rollback both run on
+     * the control thread), but every close path keeps the same invariant
+     * so reuse-safety never depends on which thread closed the slot. */
     ring_flush(ctx, flow);
+    __atomic_fetch_sub(&ctx->nr_buffering, 1, __ATOMIC_RELEASE);
+    __atomic_store_n(&flow->state, DPU_BUF_CLOSED, __ATOMIC_RELEASE);
 
     DOCA_LOG_INFO("rollback_register: hw_rule_id=%u ACTIVE → CLOSED "
                   "(override install failed)", hw_rule_id);
@@ -1033,13 +1036,15 @@ dpu_buffer_rx_loop(void *arg)
                  * and would otherwise never be visited again. */
                 if (__atomic_load_n(&fl->discard, __ATOMIC_ACQUIRE)) {
                     uint32_t freed = ring_flush(ctx, fl);
-                    __atomic_store_n(&fl->state, DPU_BUF_CLOSED,
-                                     __ATOMIC_RELEASE);
                     /* DRAINING is still in the buffering set: release both
                      * counts (mirrors quiesce_and_drain's CLOSING close +
-                     * begin_drain's nr_draining increment). */
+                     * begin_drain's nr_draining increment).  The CLOSED
+                     * store-RELEASE is the LAST write — a re-BUFF reuses the
+                     * slot the instant it observes CLOSED. */
                     __atomic_fetch_sub(&ctx->nr_draining,  1, __ATOMIC_RELEASE);
                     __atomic_fetch_sub(&ctx->nr_buffering, 1, __ATOMIC_RELEASE);
+                    __atomic_store_n(&fl->state, DPU_BUF_CLOSED,
+                                     __ATOMIC_RELEASE);
                     DOCA_LOG_INFO("buffer rx: hw_rule_id=%u DRAINING → CLOSED "
                                   "(discard, freed=%u)", fl->hw_rule_id, freed);
                     continue;
@@ -1311,10 +1316,16 @@ dpu_buffer_rx_loop(void *arg)
 
                 /* RETIRING → CLOSED.  Keep the hash binding + ring (slot-
                  * lifecycle invariant); only nr_retiring is decremented —
-                 * begin_retire already released nr_draining/nr_buffering. */
-                __atomic_store_n(&fl->state, DPU_BUF_CLOSED, __ATOMIC_RELEASE);
-                __atomic_fetch_sub(&ctx->nr_retiring, 1, __ATOMIC_RELEASE);
+                 * begin_retire already released nr_draining/nr_buffering.
+                 *
+                 * The CLOSED store-RELEASE is the LAST write: register_flow's
+                 * RETIRING grace spins on state and reuses the slot (ring
+                 * flush + reset) the instant it observes CLOSED, so every
+                 * cleanup write here must be ordered before that store or
+                 * the control thread races our residual flush. */
                 uint32_t residual = ring_flush(ctx, fl);
+                __atomic_fetch_sub(&ctx->nr_retiring, 1, __ATOMIC_RELEASE);
+                __atomic_store_n(&fl->state, DPU_BUF_CLOSED, __ATOMIC_RELEASE);
 
                 DOCA_LOG_INFO("buffer rx: hw_rule_id=%u RETIRING → CLOSED "
                               "(%s, enq=%lu requeued=%lu drop=%lu drain=%lu "
