@@ -50,22 +50,23 @@
  *                                       discard flag set]
  *   DRAINING → RETIRING (begin_retire) [FORW: after override removed]
  *   DRAINING → CLOSED   (Rx lcore)     [DROP/DELETE: discard flag set]
- *   RETIRING → CLOSED   (Rx lcore)     [observed quiescence OR discard]
- *   CLOSING  → CLOSED   (Rx lcore)     [end-of-poll discard close]
+ *   RETIRING → CLOSED   (Rx lcore)     [idle fence; discard frees not reinjects]
+ *   CLOSING  → CLOSED   (Rx lcore)     [discard close behind the idle fence]
  *
  *   ACTIVE:   Rx lcore enqueues into per-flow ring.
  *   DRAINING: Rx lcore bounded-drains ring; re-enqueues new pkts while
  *             ring non-empty, then pass-through reinjects once empty.
  *             If the discard flag is set (DROP/DELETE arrived while
- *             DRAINING), the Rx lcore frees the backlog and closes the
- *             slot instead.
+ *             DRAINING), the Rx lcore frees the backlog instead and
+ *             closes the slot once the observed-idle fence holds.
  *   RETIRING: override gone (HW fast path live); ring empty; Rx pass-through
- *             reinjects late in-flight DMA packets, stamps retire-evidence,
- *             and closes the slot itself at end-of-poll once old-path
- *             quiescence holds (K empty epochs + tail idle), or immediately
- *             when the discard flag is set.
- *   CLOSING:  HW source cut, discard pending; Rx frees new arrivals and
- *             closes the slot (flush backlog → CLOSED) at end-of-poll.
+ *             reinjects late in-flight DMA packets (frees them instead when
+ *             the discard flag is set), stamps fence evidence either way,
+ *             and closes the slot itself at end-of-poll once the
+ *             observed-idle fence holds (K empty epochs + tail idle).
+ *   CLOSING:  HW source cut, discard pending; Rx frees new arrivals,
+ *             flushes the backlog at once, and closes the slot at
+ *             end-of-poll once the observed-idle fence holds.
  *   CLOSED:   Rx rejects; safe to reuse slot.
  *   INACTIVE: Slot available.
  *
@@ -100,18 +101,22 @@ extern "C" {
                                        * seed for this many idle ticks, then
                                        * hands off to measurement (~0).        */
 
-/* ── Observed-retire (BUFF→FORW close timing; replaces a fixed 50 µs delay) ─ *
- * After the override is removed the flow enters RETIRING; the Rx lcore
- * declares quiescence only after K empty Rx poll epochs AND tail_idle_us of
- * silence, both measured from the later of {RETIRING entry, last late packet}. */
+/* ── Observed-idle close fence (one fence, two uses) ─────────────────── *
+ * Every Rx-owned close — the FORW retire (RETIRING) AND every DROP/DELETE
+ * discard teardown (CLOSING/DRAINING/RETIRING) — publishes CLOSED only
+ * after K empty Rx poll epochs AND tail_idle_us of silence, both measured
+ * from the later of {fence floor (begin_retire/begin_close stamp), last
+ * late-packet evidence}.  Beyond close timing this is the REUSE GUARD:
+ * a slot cannot re-enter ACTIVE while the NIC residual DMA tail of the
+ * previous cycle may still deliver packets, so a fast same-hw_rule_id
+ * re-BUFF cannot capture an old session's packet into the new cycle. */
 #define DPU_BUFFER_RETIRE_K_EPOCHS  5         /* K consecutive empty Rx epochs   */
 #define DPU_BUFFER_TAIL_IDLE_US     1000      /* tail-idle floor (1 ms)          */
 #define DPU_BUFFER_REGISTER_WAIT_US 5000      /* register_flow grace for a slot
                                                * still RETIRING or CLOSING from a
                                                * previous cycle (the Rx lcore
-                                               * closes both asynchronously:
-                                               * CLOSING ~one poll, RETIRING
-                                               * typically ~1 ms)               */
+                                               * closes both asynchronously
+                                               * behind the ~1 ms idle fence)   */
 
 /* ── Per-flow buffer state machine ─────────────────────────────────── */
 enum dpu_buffer_state {
@@ -119,13 +124,14 @@ enum dpu_buffer_state {
     DPU_BUF_ACTIVE   = 1,  /* Actively buffering; Rx lcore enqueues            */
     DPU_BUF_DRAINING = 2,  /* FORW transition: Rx drains ring + pass-through   */
     DPU_BUF_CLOSING  = 3,  /* DROP/DELETE: HW source cut, discard pending;
-                            * Rx frees new arrivals and closes at end-of-poll  */
+                            * Rx frees new arrivals, flushes the backlog, and
+                            * closes once the observed-idle fence holds        */
     DPU_BUF_CLOSED   = 4,  /* Quiesced + drained; Rx rejects; safe to reuse    */
     DPU_BUF_RETIRING = 5,  /* FORW: override removed, HW fast path live, SW
-                            * path still accepts late in-flight DMA packets;
-                            * the Rx lcore closes the slot itself once it
-                            * observes old-path quiescence (or immediately on
-                            * discard).  Replaces the old 50 µs delay.        */
+                            * path still handles late in-flight DMA packets
+                            * (reinject; freed when discard is set); the Rx
+                            * lcore closes the slot itself once the observed-
+                            * idle fence holds.  Replaces the old 50 µs delay. */
 };
 
 /* ── BDP byte-budget allocator config (passed to dpu_buffer_init) ─────── *
@@ -194,12 +200,13 @@ typedef struct {
     uint64_t U_i_bytes;                /* demand = rate_est * T_hold (or seed) */
     uint64_t last_offered_bytes;       /* snapshot for per-tick offered delta */
 
-    /* ── Observed-retire evidence (RETIRING state, FORW path) ─────────────── *
-     * Written by the Rx lcore in Phase 2's RETIRING branch and read by the
-     * Rx lcore at end-of-poll (which now also performs the RETIRING→CLOSED
-     * transition itself); the *_entry_* floor is written by the control
-     * thread in begin_retire (published via the state store-RELEASE).  The
-     * floor makes "K epochs + tail_idle" measure from RETIRING entry, not
+    /* ── Observed-idle fence evidence (RETIRING + every discard teardown) ─── *
+     * The *_entry_* floor is stamped by the control thread (begin_retire,
+     * and begin_close for teardowns); the last_* evidence is stamped by
+     * the Rx lcore — Phase 2's RETIRING reinject branch and every
+     * discard-free branch (CLOSING/DRAINING/RETIRING).  The Rx lcore
+     * evaluates the fence at its close sites (close_fence_holds): the
+     * floor makes "K epochs + tail_idle" measure from fence entry, not
      * from epoch/tsc 0.  All atomic-relaxed unless noted. */
     uint64_t retire_entry_tsc;         /* TSC at begin_retire (idle floor)     */
     uint64_t retire_entry_epoch;       /* epoch at begin_retire (epoch floor)  */
@@ -396,13 +403,16 @@ int dpu_buffer_begin_retire(dpu_buffer_ctx_t *ctx,
  * Begin closing a buffered flow (DROP/DELETE paths; HW source cut FIRST).
  *
  * Sole teardown entry point, and the control thread's ONLY involvement:
- * it declares intent (sets the discard flag; ACTIVE flows additionally
- * transition to CLOSING) and returns immediately.  The Rx lcore — the
- * ring's sole owner once the flag is up — frees the backlog and any
- * late in-flight arrival and closes the slot at end-of-poll, whatever
- * state the flow was in (CLOSING, DRAINING, or RETIRING).  No quiesce,
- * no delay, no blocking: a removed session's packets are freed, never
- * transmitted, and the slot always converges to CLOSED.
+ * it stamps the idle-fence floor, declares intent (sets the discard
+ * flag; ACTIVE flows additionally transition to CLOSING) and returns
+ * immediately.  The Rx lcore — the ring's sole owner once the flag is
+ * up — frees the backlog and any late in-flight arrival, and closes the
+ * slot once the observed-idle fence holds (~1 ms), whatever state the
+ * flow was in (CLOSING, DRAINING, or RETIRING).  No quiesce, no
+ * blocking: a removed session's packets are freed, never transmitted,
+ * the slot always converges to CLOSED, and the fence keeps the slot
+ * unavailable for same-hw_rule_id reuse until the residual NIC tail
+ * has gone quiet.
  *
  * For BUFF→FORW transitions, use begin_drain + wait_drain_done +
  * begin_retire instead.

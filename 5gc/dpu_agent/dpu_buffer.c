@@ -157,6 +157,18 @@ buf_account_enqueued(dpu_buffer_ctx_t *ctx, dpu_buffer_flow_t *flow, uint32_t pk
     __atomic_fetch_add(&ctx->global_count, 1, __ATOMIC_RELAXED);
 }
 
+/** Stamp discard-teardown evidence for a freed late arrival: pushes the
+ *  observed-idle close fence forward (same evidence fields the retire
+ *  fence reads, so one fence formula serves both close families). */
+static inline void
+stamp_discard_arrival(dpu_buffer_flow_t *flow, uint64_t epoch_now)
+{
+    uint64_t now = rte_get_tsc_cycles();
+    __atomic_store_n(&flow->last_old_path_rx_tsc,   now,       __ATOMIC_RELAXED);
+    __atomic_store_n(&flow->last_old_path_done_tsc, now,       __ATOMIC_RELAXED);
+    __atomic_store_n(&flow->last_old_path_rx_epoch, epoch_now, __ATOMIC_RELAXED);
+}
+
 /** Flush all remaining packets from a flow's ring. */
 static uint32_t
 ring_flush(dpu_buffer_ctx_t *ctx, dpu_buffer_flow_t *flow)
@@ -669,6 +681,22 @@ dpu_buffer_begin_close(dpu_buffer_ctx_t *ctx,
     if (st == DPU_BUF_CLOSED || st == DPU_BUF_CLOSING)
         return 0;  /* idempotent — CLOSING already carries the discard flag */
 
+    /* Stamp the idle-fence floor BEFORE publishing the discard flag (the
+     * RELEASE below orders it): every teardown close waits for the same
+     * observed-idle fence as the FORW retire (K empty epochs + tail idle,
+     * measured from max(this floor, last freed late arrival)).  The fence
+     * is the REUSE GUARD: it keeps the slot out of CLOSED until the NIC
+     * residual DMA tail has demonstrably gone quiet, so a fast re-BUFF of
+     * the same hw_rule_id cannot capture an old session's packet into the
+     * new cycle.  For RETIRING this re-stamps (extends) the begin_retire
+     * floor — harmless and uniform. */
+    __atomic_store_n(&flow->retire_entry_tsc, rte_get_tsc_cycles(),
+                     __ATOMIC_RELAXED);
+    __atomic_store_n(&flow->retire_entry_epoch,
+                     __atomic_load_n(&ctx->current_rx_poll_epoch,
+                                     __ATOMIC_RELAXED),
+                     __ATOMIC_RELAXED);
+
     if (st == DPU_BUF_DRAINING || st == DPU_BUF_RETIRING) {
         /* DROP/DELETE while the flow is leaving via the FORW path (a
          * drain-timeout remnant, or a retire still in flight).  The Rx
@@ -691,9 +719,10 @@ dpu_buffer_begin_close(dpu_buffer_ctx_t *ctx,
 
     /* ACTIVE → CLOSING with the discard flag up.  The HW source is
      * already cut by the caller; the Rx lcore frees any late in-flight
-     * arrival (Phase 2) and flushes + closes the slot at end-of-poll.
-     * Publish discard BEFORE the state store-RELEASE so a thread that
-     * observes CLOSING is guaranteed to observe the flag too. */
+     * arrival (Phase 2) and flushes the backlog, then closes the slot
+     * once the idle fence holds.  Publish discard BEFORE the state
+     * store-RELEASE so a thread that observes CLOSING is guaranteed to
+     * observe the flag (and the floor stamped above) too. */
     __atomic_store_n(&flow->discard, 1, __ATOMIC_RELEASE);
     __atomic_store_n(&flow->state, DPU_BUF_CLOSING, __ATOMIC_RELEASE);
     __atomic_fetch_add(&ctx->nr_closing, 1, __ATOMIC_RELEASE);
@@ -840,6 +869,46 @@ buffer_measure_tick(dpu_buffer_ctx_t *ctx, uint64_t tsc_hz, uint64_t delta_cycle
     }
 }
 
+/**
+ * Observed-idle close fence: ring empty ∧ no reinject in flight ∧ K empty
+ * Rx epochs ∧ tail_idle_us of silence, the windows measured from the later
+ * of {fence floor, last late-packet evidence}.  Shared by the RETIRING
+ * retire close and every discard teardown close (CLOSING / DRAINING).
+ * The fence is the REUSE GUARD: it keeps a slot out of CLOSED — and thus
+ * out of register_flow reuse — until the NIC residual DMA tail for the
+ * old cycle has demonstrably gone quiet, so a fast same-hw_rule_id
+ * re-BUFF cannot capture an old session's packet into the new cycle.
+ * Bounded idle confidence, not deterministic (no HW retire barrier). */
+static inline bool
+close_fence_holds(dpu_buffer_flow_t *fl, uint64_t epoch_now,
+                  uint64_t now, uint64_t tail_idle_cycles)
+{
+    uint32_t ring_count = fl->ring ? rte_ring_count(fl->ring) : 0;
+    uint32_t inflight =
+        __atomic_load_n(&fl->old_path_inflight, __ATOMIC_ACQUIRE);
+
+    /* Reference = later of {floor, last sighting}.  The last_* fields are
+     * zeroed at register/begin_retire, so with no late packet the max()
+     * collapses to the floor and the fence waits exactly K epochs +
+     * tail_idle from the floor stamp. */
+    uint64_t ref_epoch =
+        __atomic_load_n(&fl->retire_entry_epoch, __ATOMIC_RELAXED);
+    uint64_t last_epoch =
+        __atomic_load_n(&fl->last_old_path_rx_epoch, __ATOMIC_RELAXED);
+    if (last_epoch > ref_epoch) ref_epoch = last_epoch;
+
+    uint64_t ref_tsc =
+        __atomic_load_n(&fl->retire_entry_tsc, __ATOMIC_RELAXED);
+    uint64_t last_done =
+        __atomic_load_n(&fl->last_old_path_done_tsc, __ATOMIC_RELAXED);
+    if (last_done > ref_tsc) ref_tsc = last_done;
+
+    bool epochs_ok = (epoch_now - ref_epoch) >= DPU_BUFFER_RETIRE_K_EPOCHS;
+    bool idle_ok   = (now - ref_tsc) >= tail_idle_cycles;
+
+    return ring_count == 0 && inflight == 0 && epochs_ok && idle_ok;
+}
+
 int
 dpu_buffer_rx_loop(void *arg)
 {
@@ -913,13 +982,20 @@ dpu_buffer_rx_loop(void *arg)
 
                 /* DROP/DELETE arrived while DRAINING (discard flag): the
                  * HW rule is gone, so free the backlog instead of
-                 * reinjecting it and close the slot here — the Rx lcore
-                 * owns the ring in DRAINING.  Checked BEFORE drain_done:
-                 * a flow whose drain completed but whose FORW aborted
-                 * (begin_retire never ran) sits here with drain_done=1
-                 * and would otherwise never be visited again. */
+                 * reinjecting it — the Rx lcore owns the ring in DRAINING.
+                 * The close itself waits for the observed-idle fence (the
+                 * reuse guard); the flush is idempotent across revisits.
+                 * Checked BEFORE drain_done: a flow whose drain completed
+                 * but whose FORW aborted (begin_retire never ran) sits
+                 * here with drain_done=1 and would otherwise never be
+                 * visited again. */
                 if (__atomic_load_n(&fl->discard, __ATOMIC_ACQUIRE)) {
                     uint32_t freed = ring_flush(ctx, fl);
+                    uint64_t hz = rte_get_tsc_hz();
+                    if (!close_fence_holds(fl, epoch_now,
+                            rte_get_tsc_cycles(),
+                            (uint64_t)DPU_BUFFER_TAIL_IDLE_US * hz / 1000000))
+                        continue;  /* backlog freed; close next poll(s) */
                     /* DRAINING is still in the buffering set: release both
                      * counts (begin_drain's nr_draining increment + the
                      * registration's nr_buffering).  The CLOSED store-
@@ -1002,9 +1078,11 @@ dpu_buffer_rx_loop(void *arg)
                  */
                 if (st == DPU_BUF_DRAINING) {
                     /* DROP/DELETE pending (discard): the HW rule is gone,
-                     * this is a late in-flight DMA — free it.  Phase 1
-                     * frees the backlog and closes the slot. */
+                     * this is a late in-flight DMA — free it and push the
+                     * idle fence forward.  Phase 1 frees the backlog and
+                     * closes the slot once the fence holds. */
                     if (__atomic_load_n(&flow->discard, __ATOMIC_ACQUIRE)) {
+                        stamp_discard_arrival(flow, epoch_now);
                         flow->dropped++;
                         rte_pktmbuf_free(rx_bufs[i]);
                         continue;
@@ -1071,6 +1149,7 @@ dpu_buffer_rx_loop(void *arg)
                  */
                 if (st == DPU_BUF_RETIRING) {
                     if (__atomic_load_n(&flow->discard, __ATOMIC_ACQUIRE)) {
+                        stamp_discard_arrival(flow, epoch_now);
                         flow->dropped++;
                         rte_pktmbuf_free(rx_bufs[i]);
                         continue;
@@ -1095,9 +1174,11 @@ dpu_buffer_rx_loop(void *arg)
 
                 /* CLOSING: teardown pending (discard is up) — the rule's
                  * HW entry is gone and this is a late in-flight DMA; free
-                 * it.  The end-of-poll discard-close scan flushes the
-                 * backlog and closes the slot. */
+                 * it and push the idle fence forward.  The end-of-poll
+                 * discard-close scan flushes the backlog and closes the
+                 * slot once the fence holds. */
                 if (st == DPU_BUF_CLOSING) {
+                    stamp_discard_arrival(flow, epoch_now);
                     flow->dropped++;
                     rte_pktmbuf_free(rx_bufs[i]);
                     continue;
@@ -1135,17 +1216,20 @@ dpu_buffer_rx_loop(void *arg)
 
         /*
          * ── End-of-poll retire close (Rx-owned) ────────────────────────
-         * For each RETIRING flow, evaluate the multi-condition quiescence
-         * fence and close the slot (RETIRING → CLOSED) the moment it
-         * holds — or immediately if a DROP/DELETE set the discard flag.
-         * The close runs on this lcore, the only producer AND (in
-         * RETIRING) only consumer of the ring, so there is no close-
-         * boundary race: a late packet processed earlier this poll
-         * already pushed the quiescence reference forward.  This replaces
-         * the old control-thread wait_retire_done/close_flow loop, which
-         * blocked the Comch thread ≥1 ms per FORW and leaked the slot on
-         * timeout.  Gated on nr_retiring so the scan is skipped entirely
-         * when no retire is pending.
+         * For each RETIRING flow, evaluate the observed-idle fence and
+         * close the slot (RETIRING → CLOSED) the moment it holds.  A
+         * pending DROP/DELETE (discard flag) changes what Phase 2 does
+         * with late packets (free instead of reinject) but NOT the fence:
+         * the close never lands before the residual NIC tail has gone
+         * quiet, which is what makes same-hw_rule_id reuse safe.  The
+         * close runs on this lcore, the only producer AND (in RETIRING)
+         * only consumer of the ring, so there is no close-boundary race:
+         * a late packet processed earlier this poll already pushed the
+         * fence reference forward.  This replaces the old control-thread
+         * wait_retire_done/close_flow loop, which blocked the Comch
+         * thread ≥1 ms per FORW and leaked the slot on timeout.  Gated on
+         * nr_retiring so the scan is skipped entirely when no retire is
+         * pending.
          */
         if (__atomic_load_n(&ctx->nr_retiring, __ATOMIC_RELAXED) > 0) {
             uint64_t hz = rte_get_tsc_hz();
@@ -1165,43 +1249,14 @@ dpu_buffer_rx_loop(void *arg)
                 bool discard =
                     __atomic_load_n(&fl->discard, __ATOMIC_ACQUIRE) != 0;
 
-                if (!discard) {
-                    uint32_t ring_count =
-                        fl->ring ? rte_ring_count(fl->ring) : 0;
-                    uint32_t inflight =
-                        __atomic_load_n(&fl->old_path_inflight,
-                                        __ATOMIC_ACQUIRE);
-
-                    /* Reference = later of {RETIRING entry, last sighting}.
-                     * The last_* fields were reset to 0 in begin_retire, so
-                     * when no late packet is ever seen the max() collapses to
-                     * the entry floor and we wait exactly K epochs +
-                     * tail_idle from entry. */
-                    uint64_t ref_epoch =
-                        __atomic_load_n(&fl->retire_entry_epoch,
-                                        __ATOMIC_RELAXED);
-                    uint64_t last_epoch =
-                        __atomic_load_n(&fl->last_old_path_rx_epoch,
-                                        __ATOMIC_RELAXED);
-                    if (last_epoch > ref_epoch) ref_epoch = last_epoch;
-
-                    uint64_t ref_tsc =
-                        __atomic_load_n(&fl->retire_entry_tsc,
-                                        __ATOMIC_RELAXED);
-                    uint64_t last_done =
-                        __atomic_load_n(&fl->last_old_path_done_tsc,
-                                        __ATOMIC_RELAXED);
-                    if (last_done > ref_tsc) ref_tsc = last_done;
-
-                    bool epochs_ok =
-                        (epoch_now - ref_epoch) >= DPU_BUFFER_RETIRE_K_EPOCHS;
-                    bool idle_ok =
-                        (now - ref_tsc) >= tail_idle_cycles;
-
-                    if (!(ring_count == 0 && inflight == 0 &&
-                          epochs_ok && idle_ok))
-                        continue;  /* not quiescent yet — re-check next poll */
-                }
+                /* One fence for both close reasons.  With discard, Phase 2
+                 * freed (rather than reinjected) any late arrival and
+                 * stamped the same evidence fields, so the fence still
+                 * measures real old-path silence — the close may not land
+                 * before the residual NIC tail has gone quiet (reuse
+                 * guard). */
+                if (!close_fence_holds(fl, epoch_now, now, tail_idle_cycles))
+                    continue;  /* not quiescent yet — re-check next poll */
 
                 /* RETIRING → CLOSED.  Keep the hash binding + ring (slot-
                  * lifecycle invariant); only nr_retiring is decremented —
@@ -1234,14 +1289,19 @@ dpu_buffer_rx_loop(void *arg)
          * ── End-of-poll discard close (CLOSING slots, Rx-owned) ────────
          * begin_close (DROP/DELETE on an ACTIVE flow) moves the slot to
          * CLOSING with the discard flag up and returns immediately; this
-         * scan frees the backlog and closes the slot.  It runs on the
-         * only thread that touches the ring, so by end-of-poll there is
-         * no in-flight packet by construction — no quiesce is needed.
-         * Every CLOSING slot carries the discard flag (the only path in
-         * sets it).  Gated on nr_closing so the scan is skipped when no
-         * teardown is pending.
+         * scan frees the backlog at once and closes the slot when the
+         * observed-idle fence holds (the reuse guard — see
+         * close_fence_holds).  It runs on the only thread that touches
+         * the ring, so by end-of-poll there is no in-flight packet by
+         * construction — no quiesce is needed.  Every CLOSING slot
+         * carries the discard flag (the only path in sets it).  Gated on
+         * nr_closing so the scan is skipped when no teardown is pending.
          */
         if (__atomic_load_n(&ctx->nr_closing, __ATOMIC_RELAXED) > 0) {
+            uint64_t hz = rte_get_tsc_hz();
+            uint64_t tail_idle_cycles =
+                (uint64_t)DPU_BUFFER_TAIL_IDLE_US * hz / 1000000;
+            uint64_t now = rte_get_tsc_cycles();
             uint32_t remaining = __atomic_load_n(&ctx->nr_closing,
                                                  __ATOMIC_RELAXED);
             for (uint32_t f = 0; f < ctx->max_flows && remaining > 0; f++) {
@@ -1252,6 +1312,9 @@ dpu_buffer_rx_loop(void *arg)
                 remaining--;
 
                 uint32_t freed = ring_flush(ctx, fl);
+                if (!close_fence_holds(fl, epoch_now, now, tail_idle_cycles))
+                    continue;  /* backlog freed; close once the tail is quiet */
+
                 /* CLOSING is still in the buffering set: release both
                  * counts.  The CLOSED store-RELEASE is the LAST write
                  * (uniform close invariant: cleanup → counter releases →
