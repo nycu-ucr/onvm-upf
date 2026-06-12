@@ -76,9 +76,13 @@ alloc_record(dpu_pipeline_ctx_t *ctx, uint32_t hw_rule_id) {
 
 static void
 free_record(dpu_pipeline_ctx_t *ctx, dpu_rule_record_t *rec) {
+        /* Delete the hash key BEFORE clearing the record: the buffer and
+         * shaper lcores look records up concurrently (e.g. the SW-encap
+         * ohc_* accessor), and zeroing first would let a lookup that wins
+         * the race read a torn/empty record while the key still maps. */
         uint32_t id = rec->hw_rule_id;
-        memset(rec, 0, sizeof(*rec));
         rte_hash_del_key(ctx->rule_id_map, &id);
+        memset(rec, 0, sizeof(*rec));
 }
 
 /* Return the DOCA Flow port that owns the *MATCH* pipes for the given
@@ -1826,6 +1830,11 @@ dpu_pipeline_insert_rule(dpu_pipeline_ctx_t *ctx, const hw_offload_msg_t *msg) {
                 rec->meter_id = meter_id;
                 rec->is_gbr_flow = ul_is_gbr;
 
+                /* Cache the match for the QER-reinsert fallback (see
+                 * cached_match comment in dpu_pipeline.h).  Exactly the
+                 * values passed to doca_flow_pipe_basic_add_entry above. */
+                rec->cached_match = match;
+
                 struct in_addr ul_match_src = { .s_addr = ul_inner_src_ip };
                 DOCA_LOG_INFO(
                     "UL rule: hw_rule=%u teid=0x%x qfi=%u bucket=P%d "
@@ -1931,10 +1940,11 @@ dpu_pipeline_insert_rule(dpu_pipeline_ctx_t *ctx, const hw_offload_msg_t *msg) {
                 rec->is_gbr_flow = dl_is_gbr;
                 rec->is_dl_sdf_match = dl_use_sdf_pipe;
 
-                /* Cache the match for FORW reinsert (see cached_dl_match
-                 * comment in dpu_pipeline.h).  Exactly the values passed to
+                /* Cache the match for the QER-reinsert fallback and the
+                 * BUFF override (see cached_match comment in
+                 * dpu_pipeline.h).  Exactly the values passed to
                  * doca_flow_pipe_basic_add_entry above. */
-                rec->cached_dl_match = dl_match;
+                rec->cached_match = dl_match;
 
                 /* DL_ENCAP entry: pkt_meta → GTP encap (actions built by the
                  * shared helper — see build_dl_encap_actions). */
@@ -2117,47 +2127,57 @@ rebuild_match_entry_actions_monitor(const dpu_rule_record_t *rec,
         }
 }
 
-/* Reinsert the DL_MATCH (or DL_SDF_MATCH) entry on its current pipe with
- * a new fwd target.
+/* Reinsert a rule's base match entry (UL_MATCH or DL_(SDF_)MATCH) on its
+ * current pipe with a new shared-meter attachment and fwd target.
  *
- * Currently unused — BUFF/FORW transitions no longer touch the base
- * entry's fwd (they add/remove an entry on DL_BUFF_OVERRIDE instead).
- * Retained for the latent repeated-QER-update path: HWS allows exactly
- * one update_entry per entry lifetime, so the SECOND time update_qer is
- * called on the same DL match entry, update_entry returns EBUSY.  The
- * fix at that point will be to call this helper instead, which removes
- * and re-adds the entry to obtain a fresh update slot.
- * (reinsert_dl_encap_with_new_params below is the wired-in twin of this
- * pattern for the DL_ENCAP entry.)
+ * Fallback for the repeated-QER-update path: HWS allows exactly one
+ * update_entry per entry lifetime, so the SECOND time update_qer touches
+ * the same match entry, update_entry returns DOCA_ERROR_IN_USE.  This
+ * helper removes and re-adds the entry (match = rec->cached_match) to
+ * obtain a fresh update slot — update and reinsert then alternate across
+ * repeated QER changes with no extra state.
+ * (reinsert_dl_encap_with_new_params below is the same pattern for the
+ * DL_ENCAP entry.)
  *
- * Caveat (still applies if this is ever wired in for QER): there is a
- * ~100µs HW commit window between remove and add during which DL packets
- * matching this rule fall through the bucket chain to DROP.  For an
- * always-on rule (no BUFF in progress, no override coverage) this means
- * a brief drop window during the meter swap.  Acceptable for QER rate
- * changes (rare, signaled events) but document at the call site.
+ * @p new_meter_id is taken explicitly (not from rec->meter_id) because
+ * the caller swaps meters: at reinsert time rec still holds the OLD
+ * meter, which stays alive until the caller confirms success.
  *
- * On success, *rec->dl_entry is updated to the new entry handle.  On
- * failure after the remove succeeded, rec->dl_entry is set to NULL —
- * the rule is effectively deleted from HW and the caller must treat
- * this as a non-recoverable rule loss.
+ * Caveat: there is a ~100µs HW commit window between remove and add
+ * during which packets matching this rule fall through the bucket chain
+ * unmatched.  For a DL rule in BUFF the override still covers the flow
+ * (window is traffic-free); a FAST-mode rule pays a brief drop window
+ * during the meter swap.  Acceptable for QER rate changes (rare,
+ * signaled events).
+ *
+ * On success, the record's entry handle (ul_entry or dl_entry) is
+ * updated.  On failure after the remove succeeded, that handle is set
+ * to NULL — the rule is effectively deleted from HW and the caller must
+ * treat this as a non-recoverable rule loss.
  */
-__attribute__((unused))
 static doca_error_t
-reinsert_dl_match_with_new_fwd(dpu_pipeline_ctx_t *ctx,
-                               dpu_rule_record_t *rec,
-                               struct doca_flow_pipe *new_fwd_target) {
-        struct doca_flow_pipe *pipe = dl_pipe_for_record(ctx, rec);
+reinsert_match_with_new_fwd(dpu_pipeline_ctx_t *ctx,
+                            dpu_rule_record_t *rec,
+                            uint32_t new_meter_id,
+                            struct doca_flow_pipe *new_fwd_target) {
+        bool is_ul = (rec->direction == HW_DIR_UPLINK);
+        struct doca_flow_pipe *pipe =
+            is_ul ? ctx->ul_match_pipes[rec->pipe_bucket]
+                  : dl_pipe_for_record(ctx, rec);
+        struct doca_flow_port *port = port_for_direction(ctx, rec->direction);
+        struct doca_flow_pipe_entry **entry_slot =
+            is_ul ? &rec->ul_entry : &rec->dl_entry;
 
-        /* Build the same actions + monitor that add_entry used at insert. */
+        /* Build the same actions + monitor shape that add_entry used at
+         * insert, but with the caller's (new) meter. */
         struct doca_flow_actions actions = {};
         actions.meta.pkt_meta = htonl(rec->hw_rule_id);
 
         struct doca_flow_monitor monitor = {};
         monitor.counter_type = DOCA_FLOW_RESOURCE_TYPE_NON_SHARED;
-        if (rec->meter_id != NO_METER_ID) {
+        if (new_meter_id != NO_METER_ID) {
                 monitor.meter_type = DOCA_FLOW_RESOURCE_TYPE_SHARED;
-                monitor.shared_meter.shared_meter_id = rec->meter_id;
+                monitor.shared_meter.shared_meter_id = new_meter_id;
         }
 
         struct doca_flow_fwd fwd = {
@@ -2180,19 +2200,19 @@ reinsert_dl_match_with_new_fwd(dpu_pipeline_ctx_t *ctx,
          * delete_rule(), which itself always processes the port. */
         doca_error_t result = DOCA_ERROR_AGAIN;
         for (uint32_t attempt = 0; attempt <= UPDATE_PDR_DELETE_RETRIES; attempt++) {
-                result = doca_flow_pipe_remove_entry(0, DOCA_FLOW_NO_WAIT, rec->dl_entry);
-                doca_flow_entries_process(ctx->n6_port, 0, 0, 0);
+                result = doca_flow_pipe_remove_entry(0, DOCA_FLOW_NO_WAIT, *entry_slot);
+                doca_flow_entries_process(port, 0, 0, 0);
 
                 if (result == DOCA_SUCCESS)
                         break;
 
                 if (attempt == UPDATE_PDR_DELETE_RETRIES) {
-                        DOCA_LOG_ERR("reinsert_dl_match: remove_entry failed hw_rule_id=%u after %u retries: %s",
+                        DOCA_LOG_ERR("reinsert_match: remove_entry failed hw_rule_id=%u after %u retries: %s",
                                      rec->hw_rule_id, UPDATE_PDR_DELETE_RETRIES, doca_error_get_descr(result));
                         return result;
                 }
 
-                DOCA_LOG_WARN("reinsert_dl_match: remove_entry busy hw_rule_id=%u: %s; "
+                DOCA_LOG_WARN("reinsert_match: remove_entry busy hw_rule_id=%u: %s; "
                               "retrying in %uus (%u/%u)",
                               rec->hw_rule_id, doca_error_get_descr(result), UPDATE_PDR_DELETE_RETRY_DELAY_US,
                               attempt + 1, UPDATE_PDR_DELETE_RETRIES);
@@ -2200,19 +2220,19 @@ reinsert_dl_match_with_new_fwd(dpu_pipeline_ctx_t *ctx,
         }
         rte_delay_us_block(UPDATE_PDR_REINSERT_DELAY_US);
 
-        /* Add new entry with the new fwd target. */
+        /* Add new entry with the new monitor + fwd target. */
         struct doca_flow_pipe_entry *new_entry = NULL;
-        result = doca_flow_pipe_basic_add_entry(0, pipe, &rec->cached_dl_match, 0, &actions, &monitor, &fwd, 0, NULL,
+        result = doca_flow_pipe_basic_add_entry(0, pipe, &rec->cached_match, 0, &actions, &monitor, &fwd, 0, NULL,
                                                 &new_entry);
         if (result != DOCA_SUCCESS) {
-                DOCA_LOG_ERR("reinsert_dl_match: add_entry failed hw_rule_id=%u: %s — rule has been deleted from HW",
+                DOCA_LOG_ERR("reinsert_match: add_entry failed hw_rule_id=%u: %s — rule has been deleted from HW",
                              rec->hw_rule_id, doca_error_get_descr(result));
-                rec->dl_entry = NULL;
+                *entry_slot = NULL;
                 return result;
         }
-        doca_flow_entries_process(ctx->n6_port, 0, 0, 0);
+        doca_flow_entries_process(port, 0, 0, 0);
 
-        rec->dl_entry = new_entry;
+        *entry_slot = new_entry;
         return DOCA_SUCCESS;
 }
 
@@ -2237,7 +2257,7 @@ reinsert_dl_match_with_new_fwd(dpu_pipeline_ctx_t *ctx,
  * On add failure after a successful remove, rec->dl_encap_entry is NULL:
  * the rule has lost HW encap (un-encapped egress; buffer drain refuses via
  * get_dl_encap_params) until the next UPDATE_PDR/CREATE — same
- * non-recoverable contract as reinsert_dl_match_with_new_fwd. */
+ * non-recoverable contract as reinsert_match_with_new_fwd. */
 static doca_error_t
 reinsert_dl_encap_with_new_params(dpu_pipeline_ctx_t *ctx,
                                   dpu_rule_record_t *rec,
@@ -2331,6 +2351,10 @@ dpu_pipeline_update_far(dpu_pipeline_ctx_t *ctx, const hw_offload_msg_t *msg) {
 
         /* ── DROP: remove HW rule entirely ───────────────────────────── */
         if (msg->apply_action & HW_ACTION_DROP) {
+                /* Destructive on purpose.  CP contract (confirmed): UPF-C
+                 * re-CREATEs the rule on a later DROP→FORW transition, so a
+                 * subsequent Update FAR never references this hw_rule_id
+                 * without a fresh CREATE arriving first. */
                 DOCA_LOG_INFO(
                     "update_far: DROP for hw_rule_id=%u — removing HW rule "
                     "(traffic falls to SW path)",
@@ -2385,7 +2409,7 @@ dpu_pipeline_update_far(dpu_pipeline_ctx_t *ctx, const hw_offload_msg_t *msg) {
                  * precedence: a BUFF on hw_rule_id X only intercepts
                  * packets that would have matched hw_rule_id X on the
                  * fast path. */
-                struct doca_flow_match override_match = rec->cached_dl_match;
+                struct doca_flow_match override_match = rec->cached_match;
                 const char *override_pipe_name =
                     rec->is_dl_sdf_match ? "DL_SDF_BUFF_OVERRIDE" : "DL_BUFF_OVERRIDE";
 
@@ -2447,7 +2471,7 @@ dpu_pipeline_update_far(dpu_pipeline_ctx_t *ctx, const hw_offload_msg_t *msg) {
                         }
 
                         /* Remove the override entry.  Retry mirrors
-                         * reinsert_dl_match_with_new_fwd's pattern: an
+                         * reinsert_match_with_new_fwd's pattern: an
                          * override entry that was just added may transiently
                          * return EBUSY on remove until HWS retires the prior
                          * op — entries_process between attempts drains the
@@ -2573,68 +2597,83 @@ dpu_pipeline_update_qer(dpu_pipeline_ctx_t *ctx, const hw_offload_msg_t *msg) {
         bool now_gbr = (gbr_kbps > 0) && ((rec->direction == HW_DIR_UPLINK) ? (ctx->ul_color_gate_shaped_pipe != NULL)
                                                                             : (ctx->dl_color_gate_shaped_pipe != NULL));
 
+        /* Resolve the gate the base entry must point at under the NEW
+         * meter/GBR state.  Computed unconditionally: update_entry only
+         * needs it on a mode transition (fwd_ptr below), but the reinsert
+         * fallback re-adds the entry from scratch and must always supply
+         * the correct per-entry fwd.
+         *
+         * Under the DL_BUFF_OVERRIDE design, the base match entry's
+         * fwd is NEVER swapped to TO_DPU_ARM — the override pipe
+         * carries the BUFF redirect.  So whether or not current_mode
+         * is BUFFER, the base entry always represents the intended
+         * fast-path target and must be kept consistent with the new
+         * meter/GBR state.  If we skipped this update while in BUFF,
+         * the eventual update_far(FORW) would expose a base entry
+         * pointing at the previous (now-wrong) gate. */
+        struct doca_flow_pipe *next_pipe;
+        if (rec->direction == HW_DIR_UPLINK) {
+                if (!now_metered)
+                        next_pipe = ctx->ul_decap_pipe;
+                else
+                        next_pipe =
+                            now_gbr ? ctx->ul_color_gate_shaped_pipe : ctx->ul_color_gate_policed_pipe;
+        } else {
+                if (!now_metered)
+                        next_pipe = ctx->dl_encap_pipe;
+                else
+                        next_pipe =
+                            now_gbr ? ctx->dl_color_gate_shaped_pipe : ctx->dl_color_gate_policed_pipe;
+        }
+
         struct doca_flow_fwd *fwd_ptr = NULL;
         struct doca_flow_fwd gate_fwd = {};
         if ((was_metered != now_metered) || (was_gbr != now_gbr)) {
-                /* Under the DL_BUFF_OVERRIDE design, the base match entry's
-                 * fwd is NEVER swapped to TO_DPU_ARM — the override pipe
-                 * carries the BUFF redirect.  So whether or not current_mode
-                 * is BUFFER, the base entry always represents the intended
-                 * fast-path target and must be kept consistent with the new
-                 * meter/GBR state.  If we skipped this update while in BUFF,
-                 * the eventual update_far(FORW) would expose a base entry
-                 * pointing at the previous (now-wrong) gate. */
-                struct doca_flow_pipe *next_pipe;
-                if (rec->direction == HW_DIR_UPLINK) {
-                        if (!now_metered)
-                                next_pipe = ctx->ul_decap_pipe;
-                        else
-                                next_pipe =
-                                    now_gbr ? ctx->ul_color_gate_shaped_pipe : ctx->ul_color_gate_policed_pipe;
-                } else {
-                        if (!now_metered)
-                                next_pipe = ctx->dl_encap_pipe;
-                        else
-                                next_pipe =
-                                    now_gbr ? ctx->dl_color_gate_shaped_pipe : ctx->dl_color_gate_policed_pipe;
-                }
-
                 gate_fwd.type = DOCA_FLOW_FWD_PIPE;
                 gate_fwd.next_pipe = next_pipe;
                 fwd_ptr = &gate_fwd;
         }
 
-        /* Re-supply pkt_meta so HWS can regen the action descriptor.
-         * NOTE: this is the entry's FIRST update_entry after add_entry
-         * for typical flows (a single QER refresh on a fresh rule).  If
-         * an update_qer is repeated on the same entry it WILL hit the
-         * "2nd update_entry returns EBUSY" HWS limit — at that point
-         * this site needs the try-update-else-reinsert fallback that
-         * update_dlencap_only uses (reinsert_dl_match_with_new_fwd is
-         * the ready-made helper).  Not exercised in current scope;
-         * left as-is for minimal blast radius. */
+        /* Re-supply pkt_meta so HWS can regen the action descriptor. */
         struct doca_flow_actions ent_actions = {};
         ent_actions.meta.pkt_meta = htonl(rec->hw_rule_id);
 
         /* Single update_entry call: updates meter AND fwd atomically when
          * a GBR mode transition occurs, eliminating the window where the
          * meter generates YELLOW but the fwd still points to the wrong gate. */
+        bool reinserted = false;
         result = doca_flow_pipe_basic_update_entry(0, pipe, 0,
                                                    &ent_actions,     /* actions: pkt_meta = hw_rule_id */
                                                    &mon,             /* monitor: new meter (or detach) */
                                                    fwd_ptr,          /* fwd: new gate or NULL */
                                                    DOCA_FLOW_NO_WAIT, entry);
-        if (result != DOCA_SUCCESS) {
-                DOCA_LOG_ERR("update_qer: update_entry failed hw_rule_id=%u: %s", msg->hw_rule_id,
-                             doca_error_get_descr(result));
-                /* Release the new meter we just created; old meter is still intact */
-                if (new_meter_id != NO_METER_ID)
-                        doca_flow_port_shared_resource_put(port_for_direction(ctx, rec->direction), DOCA_FLOW_SHARED_RESOURCE_METER,
-                                                           new_meter_id);
-                return result;
+        if (result == DOCA_SUCCESS) {
+                doca_flow_entries_process(port_for_direction(ctx, rec->direction), 0, 0, 0);
+        } else {
+                /* Expected from the 2nd QER change on this entry onwards —
+                 * HWS grants ONE live update per entry lifetime (IN_USE; see
+                 * invariant #9 in CLAUDE.md).  Fall back to remove+re-add
+                 * with the new meter and gate, same pattern as
+                 * update_dlencap_only.  A FAST-mode rule pays the ~100µs
+                 * remove→add drop window; a BUFF-mode DL rule is covered by
+                 * the override (window traffic-free). */
+                DOCA_LOG_WARN(
+                    "update_qer: update_entry refused hw_rule_id=%u (%s) "
+                    "— falling back to remove+re-add",
+                    msg->hw_rule_id, doca_error_get_descr(result));
+                result = reinsert_match_with_new_fwd(ctx, rec, new_meter_id, next_pipe);
+                if (result != DOCA_SUCCESS) {
+                        /* Release the new meter; it never got attached.  The
+                         * old meter stays in rec — if the reinsert lost the
+                         * entry (add failed after remove), delete_rule's
+                         * record teardown releases it. */
+                        if (new_meter_id != NO_METER_ID)
+                                doca_flow_port_shared_resource_put(port_for_direction(ctx, rec->direction), DOCA_FLOW_SHARED_RESOURCE_METER,
+                                                                   new_meter_id);
+                        return result;
+                }
+                reinserted = true;
         }
-
-        doca_flow_entries_process(port_for_direction(ctx, rec->direction), 0, 0, 0);
 
         /* Entry update succeeded — now safe to release the old meter */
         if (old_meter_id != NO_METER_ID) {
@@ -2644,9 +2683,11 @@ dpu_pipeline_update_qer(dpu_pipeline_ctx_t *ctx, const hw_offload_msg_t *msg) {
         rec->is_gbr_flow = now_gbr;
 
         DOCA_LOG_INFO(
-            "update_qer: hw_rule_id=%u meter=%u→%u "
+            "update_qer: hw_rule_id=%u meter=%u→%u%s "
             "mbr=%lu gbr=%lu kbps%s",
-            msg->hw_rule_id, old_meter_id, new_meter_id, (unsigned long)mbr_kbps, (unsigned long)gbr_kbps,
+            msg->hw_rule_id, old_meter_id, new_meter_id,
+            reinserted ? " [reinserted]" : "",
+            (unsigned long)mbr_kbps, (unsigned long)gbr_kbps,
             (was_gbr != now_gbr) ? (now_gbr ? " [policed→shaped]" : " [shaped→policed]") : "");
         return DOCA_SUCCESS;
 }

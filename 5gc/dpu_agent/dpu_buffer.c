@@ -238,8 +238,14 @@ reinject_burst(dpu_buffer_ctx_t *ctx, dpu_buffer_flow_t *flow,
         return 0;
 
     uint16_t sent = rte_eth_tx_burst(ctx->tx_port_id, ctx->tx_queue_id, pkts, built);
-    for (uint16_t i = sent; i < built; i++)
-        rte_pktmbuf_free(pkts[i]);
+    if (sent < built) {
+        /* Tx-queue backpressure: these packets are lost, not deferred.
+         * Counted per flow so a saturated N3 Tx queue is visible in the
+         * SIGUSR1 dump instead of silently shrinking "drained". */
+        flow->tx_dropped += (uint64_t)(built - sent);
+        for (uint16_t i = sent; i < built; i++)
+            rte_pktmbuf_free(pkts[i]);
+    }
 
     return sent;
 }
@@ -343,9 +349,12 @@ dpu_buffer_register_flow(dpu_buffer_ctx_t *ctx,
     if (flow) {
         uint32_t st = __atomic_load_n(&flow->state, __ATOMIC_ACQUIRE);
         if (st == DPU_BUF_ACTIVE) {
+            /* Idempotent re-BUFF.  Distinguished from a fresh registration
+             * (return 0) so the caller's override-failure rollback never
+             * tears down a flow that was already live before this call. */
             DOCA_LOG_DBG("buffer: flow hw_rule_id=%u already ACTIVE",
                          hw_rule_id);
-            return 0;
+            return 1;
         }
         if (st == DPU_BUF_DRAINING) {
             DOCA_LOG_WARN("buffer: flow hw_rule_id=%u still DRAINING "
@@ -360,14 +369,27 @@ dpu_buffer_register_flow(dpu_buffer_ctx_t *ctx,
             return -1;
         }
         if (st == DPU_BUF_RETIRING) {
-            /* A previous FORW cycle is still retiring (e.g. a leaked-after-
-             * timeout slot, or a very fast BUFF->FORW->BUFF).  The Rx lcore
-             * may still be pass-through-Txing into this slot; only CLOSED
-             * is a safe reuse source. */
-            DOCA_LOG_WARN("buffer: flow hw_rule_id=%u still RETIRING from "
-                          "previous FORW cycle — refusing registration",
-                          hw_rule_id);
-            return -1;
+            /* A previous FORW cycle is still retiring; the Rx lcore may
+             * still be pass-through-Txing into this slot, so only CLOSED
+             * is a safe reuse source.  The close is Rx-lcore-owned and
+             * lands asynchronously (typically ~1 ms: K empty epochs +
+             * tail idle), so a fast BUFF→FORW→BUFF would race it — give
+             * it a bounded grace before refusing. */
+            uint64_t deadline = rte_get_timer_cycles() +
+                (uint64_t)DPU_BUFFER_REGISTER_WAIT_US *
+                    rte_get_timer_hz() / 1000000;
+            while ((st = __atomic_load_n(&flow->state, __ATOMIC_ACQUIRE))
+                       == DPU_BUF_RETIRING) {
+                if (rte_get_timer_cycles() > deadline)
+                    break;
+                rte_pause();
+            }
+            if (st != DPU_BUF_CLOSED) {
+                DOCA_LOG_WARN("buffer: flow hw_rule_id=%u still RETIRING "
+                              "after %u us grace — refusing registration",
+                              hw_rule_id, DPU_BUFFER_REGISTER_WAIT_US);
+                return -1;
+            }
         }
         /* CLOSED: reuse this slot — fall through to re-initialise */
     } else {
@@ -407,6 +429,8 @@ dpu_buffer_register_flow(dpu_buffer_ctx_t *ctx,
     flow->drained     = 0;
     flow->passthrough = 0;
     flow->requeued    = 0;
+    flow->tx_dropped  = 0;
+    __atomic_store_n(&flow->discard, 0, __ATOMIC_RELAXED);
 
     /* ── BDP allocator state (reset for fresh + reused CLOSED slots) ──── */
     __atomic_store_n(&flow->queued_bytes, 0, __ATOMIC_RELAXED);
@@ -448,7 +472,6 @@ dpu_buffer_register_flow(dpu_buffer_ctx_t *ctx,
     __atomic_store_n(&flow->last_old_path_done_tsc, 0, __ATOMIC_RELAXED);
     __atomic_store_n(&flow->last_old_path_rx_epoch, 0, __ATOMIC_RELAXED);
     __atomic_store_n(&flow->old_path_inflight,      0, __ATOMIC_RELAXED);
-    __atomic_store_n(&flow->retire_done,            0, __ATOMIC_RELAXED);
 
     /* Publish state=ACTIVE last (release semantics) so the Rx lcore
      * sees a fully initialised flow when it observes state==ACTIVE. */
@@ -463,8 +486,41 @@ dpu_buffer_register_flow(dpu_buffer_ctx_t *ctx,
     return 0;
 }
 
+int
+dpu_buffer_rollback_register(dpu_buffer_ctx_t *ctx, uint32_t hw_rule_id)
+{
+    dpu_buffer_flow_t *flow = find_flow(ctx, hw_rule_id);
+    if (!flow) {
+        DOCA_LOG_WARN("rollback_register: hw_rule_id=%u not found",
+                      hw_rule_id);
+        return -1;
+    }
+
+    uint32_t st = __atomic_load_n(&flow->state, __ATOMIC_ACQUIRE);
+    if (st != DPU_BUF_ACTIVE) {
+        /* Only a registration made this control-thread turn (override
+         * never installed) is rollback-eligible — anything else means
+         * the caller violated the contract; leave the slot alone. */
+        DOCA_LOG_WARN("rollback_register: hw_rule_id=%u unexpected state=%u "
+                      "— not rolling back", hw_rule_id, st);
+        return -1;
+    }
+
+    /* ACTIVE → CLOSED.  No override was ever installed, so no packet for
+     * this flow is in flight; the flush below is a defensive no-op except
+     * for a stale enqueue-after-close race remnant from a previous cycle.
+     * The hash binding and ring persist (slot-lifecycle invariant). */
+    __atomic_store_n(&flow->state, DPU_BUF_CLOSED, __ATOMIC_RELEASE);
+    __atomic_fetch_sub(&ctx->nr_buffering, 1, __ATOMIC_RELEASE);
+    ring_flush(ctx, flow);
+
+    DOCA_LOG_INFO("rollback_register: hw_rule_id=%u ACTIVE → CLOSED "
+                  "(override install failed)", hw_rule_id);
+    return 0;
+}
+
 /* ═══════════════════════════════════════════════════════════════════════
- *  Rx-owned drain API (FORW path: begin_drain / wait_drain_done / close)
+ *  Rx-owned drain API (FORW path: begin_drain / wait_drain_done / retire)
  * ═══════════════════════════════════════════════════════════════════════ */
 
 int
@@ -538,61 +594,6 @@ dpu_buffer_wait_drain_done(dpu_buffer_ctx_t *ctx,
 }
 
 int
-dpu_buffer_close_flow(dpu_buffer_ctx_t *ctx,
-                      uint32_t hw_rule_id)
-{
-    dpu_buffer_flow_t *flow = find_flow(ctx, hw_rule_id);
-    if (!flow)
-        return -1;
-
-    uint32_t st = __atomic_load_n(&flow->state, __ATOMIC_ACQUIRE);
-    if (st != DPU_BUF_RETIRING) {
-        DOCA_LOG_WARN("close_flow: hw_rule_id=%u not RETIRING (state=%u)",
-                      hw_rule_id, st);
-        return -1;
-    }
-
-    /* Re-validate retire_done at the instant of close.  The Rx lcore clears
-     * retire_done whenever a late RETIRING packet arrives (Phase 2); if one
-     * slipped in between wait_retire_done returning and this call, refuse so
-     * the caller re-waits.  This narrows the normal close to a flow observed
-     * quiescent at the re-check instant (it does NOT remove the few-instruction
-     * window between this load and the CLOSED store below). */
-    if (!__atomic_load_n(&flow->retire_done, __ATOMIC_ACQUIRE)) {
-        DOCA_LOG_WARN("close_flow: hw_rule_id=%u RETIRING but retire_done=0 "
-                      "(late packet at close boundary) — refusing", hw_rule_id);
-        return -1;
-    }
-
-    /* RETIRING → CLOSED: Rx lcore stops accepting packets for this flow.
-     * Keep the hash binding so a subsequent BUFF for the same hw_rule_id
-     * finds this slot via find_flow() and reuses the persistent ring
-     * (CLOSED branch in register_flow).  Bindings are never released at
-     * runtime — the table is bounded by max_hw_rules distinct rules. */
-    __atomic_store_n(&flow->state, DPU_BUF_CLOSED, __ATOMIC_RELEASE);
-    /* Only nr_retiring here: begin_retire already released this flow from
-     * nr_draining AND nr_buffering at the DRAINING->RETIRING edge, so a
-     * second decrement of either would corrupt the control-tick scan bound. */
-    __atomic_fetch_sub(&ctx->nr_retiring, 1, __ATOMIC_RELEASE);
-
-    /* Safety net: flush any residual packets that may have slipped
-     * into the ring between the last drain and the CLOSED transition. */
-    uint32_t residual = ring_flush(ctx, flow);
-
-    DOCA_LOG_INFO("close_flow: hw_rule_id=%u RETIRING \u2192 CLOSED "
-                  "(enq=%lu requeued=%lu drop=%lu drain=%lu "
-                  "passthrough=%lu residual=%u)",
-                  hw_rule_id,
-                  (unsigned long)flow->enqueued,
-                  (unsigned long)flow->requeued,
-                  (unsigned long)flow->dropped,
-                  (unsigned long)flow->drained,
-                  (unsigned long)flow->passthrough,
-                  residual);
-    return 0;
-}
-
-int
 dpu_buffer_begin_retire(dpu_buffer_ctx_t *ctx, uint32_t hw_rule_id)
 {
     dpu_buffer_flow_t *flow = find_flow(ctx, hw_rule_id);
@@ -637,7 +638,6 @@ dpu_buffer_begin_retire(dpu_buffer_ctx_t *ctx, uint32_t hw_rule_id)
     __atomic_store_n(&flow->last_old_path_done_tsc, 0, __ATOMIC_RELAXED);
     __atomic_store_n(&flow->last_old_path_rx_epoch, 0, __ATOMIC_RELAXED);
     __atomic_store_n(&flow->old_path_inflight,      0, __ATOMIC_RELAXED);
-    __atomic_store_n(&flow->retire_done,            0, __ATOMIC_RELAXED);
 
     __atomic_store_n(&flow->state, DPU_BUF_RETIRING, __ATOMIC_RELEASE);
 
@@ -646,62 +646,13 @@ dpu_buffer_begin_retire(dpu_buffer_ctx_t *ctx, uint32_t hw_rule_id)
      * the flow holds no byte grant, so the BDP control tick must ignore it.
      * Decrement AFTER the state store above so a concurrent control-tick scan
      * never observes state==DRAINING with nr_buffering already decremented.
-     * close_flow therefore must NOT decrement nr_buffering again. */
+     * The Rx lcore's RETIRING→CLOSED close decrements only nr_retiring. */
     __atomic_fetch_sub(&ctx->nr_draining,  1, __ATOMIC_RELEASE);
     __atomic_fetch_sub(&ctx->nr_buffering, 1, __ATOMIC_RELEASE);
     __atomic_fetch_add(&ctx->nr_retiring,  1, __ATOMIC_RELEASE);
 
     DOCA_LOG_INFO("begin_retire: hw_rule_id=%u DRAINING → RETIRING "
                   "(entry_epoch=%lu)", hw_rule_id, (unsigned long)epoch);
-    return 0;
-}
-
-int
-dpu_buffer_wait_retire_done(dpu_buffer_ctx_t *ctx,
-                            uint32_t hw_rule_id,
-                            uint64_t max_retire_us)
-{
-    dpu_buffer_flow_t *flow = find_flow(ctx, hw_rule_id);
-    if (!flow)
-        return -1;
-
-    uint32_t st = __atomic_load_n(&flow->state, __ATOMIC_ACQUIRE);
-    if (st != DPU_BUF_RETIRING) {
-        DOCA_LOG_WARN("wait_retire_done: hw_rule_id=%u not RETIRING (state=%u)",
-                      hw_rule_id, st);
-        return -1;
-    }
-
-    /* Single clock throughout: the retire-evidence stamps use
-     * rte_get_tsc_cycles(); use the same clock here so the deadline and the
-     * "ago" diagnostics are consistent. */
-    uint64_t hz = rte_get_tsc_hz();
-    uint64_t entry_tsc = rte_get_tsc_cycles();
-    uint64_t deadline = entry_tsc + max_retire_us * hz / 1000000;
-
-    while (!__atomic_load_n(&flow->retire_done, __ATOMIC_ACQUIRE)) {
-        if (rte_get_tsc_cycles() > deadline) {
-            __atomic_fetch_add(&ctx->retire_timeouts, 1, __ATOMIC_RELAXED);
-            uint64_t last_done = __atomic_load_n(
-                &flow->last_old_path_done_tsc, __ATOMIC_RELAXED);
-            uint32_t inflight = __atomic_load_n(
-                &flow->old_path_inflight, __ATOMIC_RELAXED);
-            DOCA_LOG_WARN("wait_retire_done: timeout hw_rule_id=%u "
-                          "(inflight=%u, last_done %lu us ago) — flow stays "
-                          "RETIRING, slot leaks until shutdown",
-                          hw_rule_id, inflight,
-                          last_done == 0 ? 0UL :
-                            (unsigned long)((rte_get_tsc_cycles() - last_done)
-                                            * 1000000 / hz));
-            return -1;
-        }
-        rte_pause();
-    }
-
-    DOCA_LOG_INFO("wait_retire_done: hw_rule_id=%u retire observed "
-                  "(waited %lu us)", hw_rule_id,
-                  (unsigned long)((rte_get_tsc_cycles() - entry_tsc)
-                                  * 1000000 / hz));
     return 0;
 }
 
@@ -721,6 +672,22 @@ dpu_buffer_begin_close(dpu_buffer_ctx_t *ctx,
     uint32_t st = __atomic_load_n(&flow->state, __ATOMIC_ACQUIRE);
     if (st == DPU_BUF_CLOSING || st == DPU_BUF_CLOSED)
         return 0;  /* idempotent */
+
+    if (st == DPU_BUF_DRAINING || st == DPU_BUF_RETIRING) {
+        /* DROP/DELETE while the flow is leaving via the FORW path (a
+         * drain-timeout remnant, or a retire still in flight).  The Rx
+         * lcore is the ring's consumer in both states, so hand it the
+         * close: the discard flag makes it free the backlog (instead of
+         * reinjecting packets for a rule whose HW entry is gone) and
+         * transition the slot to CLOSED itself.  Previously this case
+         * was silently skipped and the slot wedged forever. */
+        __atomic_store_n(&flow->discard, 1, __ATOMIC_RELEASE);
+        DOCA_LOG_INFO("begin_close: hw_rule_id=%u %s — discard requested "
+                      "(Rx lcore will free backlog and close)",
+                      hw_rule_id,
+                      st == DPU_BUF_DRAINING ? "DRAINING" : "RETIRING");
+        return 1;
+    }
 
     if (st != DPU_BUF_ACTIVE) {
         DOCA_LOG_WARN("begin_close: hw_rule_id=%u unexpected state=%u",
@@ -786,20 +753,14 @@ dpu_buffer_quiesce_and_drain(dpu_buffer_ctx_t *ctx,
     uint32_t st = __atomic_load_n(&flow->state, __ATOMIC_ACQUIRE);
     if (st == DPU_BUF_INACTIVE || st == DPU_BUF_CLOSED)
         return 0;  /* nothing to do */
-    if (st == DPU_BUF_DRAINING) {
-        DOCA_LOG_WARN("quiesce_and_drain: hw_rule_id=%u is DRAINING "
-                      "(use wait_drain_done + close_flow instead)",
-                      hw_rule_id);
-        return -1;
-    }
-    if (st == DPU_BUF_RETIRING) {
-        /* FORW close is in progress; the override is already gone (HW is
-         * FAST) and observed-retire owns the close.  Force-closing a
-         * non-quiescent RETIRING flow is a deferred separate API, so refuse
-         * here.  A DELETE/DROP HW commit still proceeded upstream; the slot
-         * stays RETIRING (leaked until shutdown or a future force_close). */
-        DOCA_LOG_WARN("quiesce_and_drain: hw_rule_id=%u is RETIRING "
-                      "(observed-retire owns close) — refusing", hw_rule_id);
+    if (st == DPU_BUF_DRAINING || st == DPU_BUF_RETIRING) {
+        /* The Rx lcore owns these states.  Callers must use begin_close,
+         * which hands the discard close to the Rx lcore (return 1) and
+         * never routes DRAINING/RETIRING here.  Defensive refusal only. */
+        DOCA_LOG_WARN("quiesce_and_drain: hw_rule_id=%u is %s — refusing "
+                      "(begin_close routes this to the Rx-owned discard close)",
+                      hw_rule_id,
+                      st == DPU_BUF_DRAINING ? "DRAINING" : "RETIRING");
         return -1;
     }
 
@@ -1063,6 +1024,27 @@ dpu_buffer_rx_loop(void *arg)
                     continue;
                 nr_drain--;
 
+                /* DROP/DELETE arrived while DRAINING (discard flag): the
+                 * HW rule is gone, so free the backlog instead of
+                 * reinjecting it and close the slot here — the Rx lcore
+                 * owns the ring in DRAINING.  Checked BEFORE drain_done:
+                 * a flow whose drain completed but whose FORW aborted
+                 * (begin_retire never ran) sits here with drain_done=1
+                 * and would otherwise never be visited again. */
+                if (__atomic_load_n(&fl->discard, __ATOMIC_ACQUIRE)) {
+                    uint32_t freed = ring_flush(ctx, fl);
+                    __atomic_store_n(&fl->state, DPU_BUF_CLOSED,
+                                     __ATOMIC_RELEASE);
+                    /* DRAINING is still in the buffering set: release both
+                     * counts (mirrors quiesce_and_drain's CLOSING close +
+                     * begin_drain's nr_draining increment). */
+                    __atomic_fetch_sub(&ctx->nr_draining,  1, __ATOMIC_RELEASE);
+                    __atomic_fetch_sub(&ctx->nr_buffering, 1, __ATOMIC_RELEASE);
+                    DOCA_LOG_INFO("buffer rx: hw_rule_id=%u DRAINING → CLOSED "
+                                  "(discard, freed=%u)", fl->hw_rule_id, freed);
+                    continue;
+                }
+
                 if (__atomic_load_n(&fl->drain_done, __ATOMIC_RELAXED))
                     continue;
 
@@ -1130,6 +1112,14 @@ dpu_buffer_rx_loop(void *arg)
                  * Rx queue packets).
                  */
                 if (st == DPU_BUF_DRAINING) {
+                    /* DROP/DELETE pending (discard): the HW rule is gone,
+                     * this is a late in-flight DMA — free it.  Phase 1
+                     * frees the backlog and closes the slot. */
+                    if (__atomic_load_n(&flow->discard, __ATOMIC_ACQUIRE)) {
+                        flow->dropped++;
+                        rte_pktmbuf_free(rx_bufs[i]);
+                        continue;
+                    }
                     if (!__atomic_load_n(&flow->drain_done,
                                          __ATOMIC_RELAXED)) {
                         /* Bounded drain: pull at most 32 old packets. */
@@ -1183,14 +1173,19 @@ dpu_buffer_rx_loop(void *arg)
                  * RETIRING: override is gone, ring is empty (precondition).
                  * Any packet here is a late in-flight DMA from before the
                  * override removal.  Pass-through SW-encap + Tx on N3, and
-                 * stamp retire-evidence so the end-of-poll check sees
-                 * "in-flight right now" and "just completed" precisely.
-                 * Clear retire_done FIRST so this late packet invalidates any
-                 * stale "done" a previous end-of-poll set before the control
-                 * thread read it (defers the close past this packet).
+                 * stamp retire-evidence so the end-of-poll close sees
+                 * "in-flight right now" and "just completed" precisely —
+                 * a late packet pushes the quiescence reference forward,
+                 * deferring the close past it.  With a pending discard
+                 * (DROP/DELETE), free instead of reinjecting: the rule's
+                 * HW entry is gone, the packet must not reach the wire.
                  */
                 if (st == DPU_BUF_RETIRING) {
-                    __atomic_store_n(&flow->retire_done, 0, __ATOMIC_RELAXED);
+                    if (__atomic_load_n(&flow->discard, __ATOMIC_ACQUIRE)) {
+                        flow->dropped++;
+                        rte_pktmbuf_free(rx_bufs[i]);
+                        continue;
+                    }
 
                     __atomic_store_n(&flow->last_old_path_rx_tsc,
                                      rte_get_tsc_cycles(), __ATOMIC_RELAXED);
@@ -1245,12 +1240,18 @@ dpu_buffer_rx_loop(void *arg)
         }
 
         /*
-         * ── End-of-poll retire check ───────────────────────────────────
+         * ── End-of-poll retire close (Rx-owned) ────────────────────────
          * For each RETIRING flow, evaluate the multi-condition quiescence
-         * fence and set retire_done when it holds.  This is the ONLY place
-         * that sets retire_done = 1.  Gated on nr_retiring so the scan is
-         * skipped entirely when no retire is pending (nr_draining, used by
-         * Phase 1, is left untouched).
+         * fence and close the slot (RETIRING → CLOSED) the moment it
+         * holds — or immediately if a DROP/DELETE set the discard flag.
+         * The close runs on this lcore, the only producer AND (in
+         * RETIRING) only consumer of the ring, so there is no close-
+         * boundary race: a late packet processed earlier this poll
+         * already pushed the quiescence reference forward.  This replaces
+         * the old control-thread wait_retire_done/close_flow loop, which
+         * blocked the Comch thread ≥1 ms per FORW and leaked the slot on
+         * timeout.  Gated on nr_retiring so the scan is skipped entirely
+         * when no retire is pending.
          */
         if (__atomic_load_n(&ctx->nr_retiring, __ATOMIC_RELAXED) > 0) {
             uint64_t hz = rte_get_tsc_hz();
@@ -1266,36 +1267,66 @@ dpu_buffer_rx_loop(void *arg)
                 if (fst != DPU_BUF_RETIRING)
                     continue;
                 remaining--;
-                if (__atomic_load_n(&fl->retire_done, __ATOMIC_RELAXED))
-                    continue;
 
-                uint32_t ring_count = fl->ring ? rte_ring_count(fl->ring) : 0;
-                uint32_t inflight =
-                    __atomic_load_n(&fl->old_path_inflight, __ATOMIC_ACQUIRE);
+                bool discard =
+                    __atomic_load_n(&fl->discard, __ATOMIC_ACQUIRE) != 0;
 
-                /* Reference = later of {RETIRING entry, last sighting}.  The
-                 * last_* fields were reset to 0 in begin_retire, so when no
-                 * late packet is ever seen the max() collapses to the entry
-                 * floor and we wait exactly K epochs + tail_idle from entry. */
-                uint64_t ref_epoch =
-                    __atomic_load_n(&fl->retire_entry_epoch, __ATOMIC_RELAXED);
-                uint64_t last_epoch =
-                    __atomic_load_n(&fl->last_old_path_rx_epoch, __ATOMIC_RELAXED);
-                if (last_epoch > ref_epoch) ref_epoch = last_epoch;
+                if (!discard) {
+                    uint32_t ring_count =
+                        fl->ring ? rte_ring_count(fl->ring) : 0;
+                    uint32_t inflight =
+                        __atomic_load_n(&fl->old_path_inflight,
+                                        __ATOMIC_ACQUIRE);
 
-                uint64_t ref_tsc =
-                    __atomic_load_n(&fl->retire_entry_tsc, __ATOMIC_RELAXED);
-                uint64_t last_done =
-                    __atomic_load_n(&fl->last_old_path_done_tsc, __ATOMIC_RELAXED);
-                if (last_done > ref_tsc) ref_tsc = last_done;
+                    /* Reference = later of {RETIRING entry, last sighting}.
+                     * The last_* fields were reset to 0 in begin_retire, so
+                     * when no late packet is ever seen the max() collapses to
+                     * the entry floor and we wait exactly K epochs +
+                     * tail_idle from entry. */
+                    uint64_t ref_epoch =
+                        __atomic_load_n(&fl->retire_entry_epoch,
+                                        __ATOMIC_RELAXED);
+                    uint64_t last_epoch =
+                        __atomic_load_n(&fl->last_old_path_rx_epoch,
+                                        __ATOMIC_RELAXED);
+                    if (last_epoch > ref_epoch) ref_epoch = last_epoch;
 
-                bool epochs_ok =
-                    (epoch_now - ref_epoch) >= DPU_BUFFER_RETIRE_K_EPOCHS;
-                bool idle_ok =
-                    (now - ref_tsc) >= tail_idle_cycles;
+                    uint64_t ref_tsc =
+                        __atomic_load_n(&fl->retire_entry_tsc,
+                                        __ATOMIC_RELAXED);
+                    uint64_t last_done =
+                        __atomic_load_n(&fl->last_old_path_done_tsc,
+                                        __ATOMIC_RELAXED);
+                    if (last_done > ref_tsc) ref_tsc = last_done;
 
-                if (ring_count == 0 && inflight == 0 && epochs_ok && idle_ok)
-                    __atomic_store_n(&fl->retire_done, 1, __ATOMIC_RELEASE);
+                    bool epochs_ok =
+                        (epoch_now - ref_epoch) >= DPU_BUFFER_RETIRE_K_EPOCHS;
+                    bool idle_ok =
+                        (now - ref_tsc) >= tail_idle_cycles;
+
+                    if (!(ring_count == 0 && inflight == 0 &&
+                          epochs_ok && idle_ok))
+                        continue;  /* not quiescent yet — re-check next poll */
+                }
+
+                /* RETIRING → CLOSED.  Keep the hash binding + ring (slot-
+                 * lifecycle invariant); only nr_retiring is decremented —
+                 * begin_retire already released nr_draining/nr_buffering. */
+                __atomic_store_n(&fl->state, DPU_BUF_CLOSED, __ATOMIC_RELEASE);
+                __atomic_fetch_sub(&ctx->nr_retiring, 1, __ATOMIC_RELEASE);
+                uint32_t residual = ring_flush(ctx, fl);
+
+                DOCA_LOG_INFO("buffer rx: hw_rule_id=%u RETIRING → CLOSED "
+                              "(%s, enq=%lu requeued=%lu drop=%lu drain=%lu "
+                              "passthrough=%lu residual=%u)",
+                              fl->hw_rule_id,
+                              discard ? "discard" : "observed quiescence",
+                              (unsigned long)fl->enqueued,
+                              (unsigned long)fl->requeued,
+                              (unsigned long)fl->dropped,
+                              (unsigned long)fl->drained,
+                              (unsigned long)fl->passthrough,
+                              residual);
             }
         }
     }
@@ -1361,7 +1392,7 @@ dpu_buffer_dump_stats(const dpu_buffer_ctx_t *ctx)
     uint32_t nr_active = 0, nr_drain = 0, nr_closing = 0, nr_closed = 0;
     uint32_t nr_retire = 0;
     uint64_t tot_enq = 0, tot_drop = 0, tot_drained = 0;
-    uint64_t tot_passthrough = 0, tot_requeued = 0;
+    uint64_t tot_passthrough = 0, tot_requeued = 0, tot_tx_dropped = 0;
 
     for (uint32_t i = 0; i < ctx->max_flows; i++) {
         const dpu_buffer_flow_t *fl = &ctx->flows[i];
@@ -1389,19 +1420,22 @@ dpu_buffer_dump_stats(const dpu_buffer_ctx_t *ctx)
         uint64_t enq_seq = __atomic_load_n(&fl->enq_seq, __ATOMIC_RELAXED);
         uint64_t deq_seq = __atomic_load_n(&fl->deq_seq, __ATOMIC_RELAXED);
         uint32_t drain_done = __atomic_load_n(&fl->drain_done, __ATOMIC_RELAXED);
+        uint32_t discard = __atomic_load_n(&fl->discard, __ATOMIC_RELAXED);
 
         DOCA_LOG_INFO("  flow hw_rule_id=%u dir=%s state=%s ring=%u "
-                      "drain_done=%u enq_seq=%lu deq_seq=%lu | "
-                      "enq=%lu drop=%lu drained=%lu passthrough=%lu requeued=%lu",
+                      "drain_done=%u discard=%u enq_seq=%lu deq_seq=%lu | "
+                      "enq=%lu drop=%lu drained=%lu passthrough=%lu "
+                      "requeued=%lu tx_drop=%lu",
                       fl->hw_rule_id,
                       fl->direction == HW_DIR_UPLINK ? "UL" : "DL",
-                      state_str, ring_count, drain_done,
+                      state_str, ring_count, drain_done, discard,
                       (unsigned long)enq_seq, (unsigned long)deq_seq,
                       (unsigned long)fl->enqueued,
                       (unsigned long)fl->dropped,
                       (unsigned long)fl->drained,
                       (unsigned long)fl->passthrough,
-                      (unsigned long)fl->requeued);
+                      (unsigned long)fl->requeued,
+                      (unsigned long)fl->tx_dropped);
 
         if (ctx->m_op_bytes != UINT64_MAX) {
             uint64_t qb = __atomic_load_n(&fl->queued_bytes, __ATOMIC_RELAXED);
@@ -1428,11 +1462,10 @@ dpu_buffer_dump_stats(const dpu_buffer_ctx_t *ctx)
             uint64_t entry_ep   = __atomic_load_n(&fl->retire_entry_epoch,     __ATOMIC_RELAXED);
             uint64_t last_ep    = __atomic_load_n(&fl->last_old_path_rx_epoch, __ATOMIC_RELAXED);
             uint64_t cur_ep     = __atomic_load_n(&ctx->current_rx_poll_epoch, __ATOMIC_RELAXED);
-            uint32_t retire_done= __atomic_load_n(&fl->retire_done,            __ATOMIC_RELAXED);
             uint64_t ref_ep     = last_ep > entry_ep ? last_ep : entry_ep;
-            DOCA_LOG_INFO("       RETIRING: inflight=%u retire_done=%u "
+            DOCA_LOG_INFO("       RETIRING: inflight=%u "
                           "epoch_gap=%lu last_rx=%lu ms_ago last_done=%lu ms_ago",
-                          inflight, retire_done,
+                          inflight,
                           (unsigned long)(cur_ep - ref_ep),
                           last_rx   == 0 ? 0UL : (unsigned long)((now - last_rx)   * 1000 / hz),
                           last_done == 0 ? 0UL : (unsigned long)((now - last_done) * 1000 / hz));
@@ -1443,18 +1476,18 @@ dpu_buffer_dump_stats(const dpu_buffer_ctx_t *ctx)
         tot_drained     += fl->drained;
         tot_passthrough += fl->passthrough;
         tot_requeued    += fl->requeued;
+        tot_tx_dropped  += fl->tx_dropped;
     }
 
     DOCA_LOG_INFO("Buffer stats (slots): active=%u draining=%u retiring=%u "
                   "closing=%u closed=%u",
                   nr_active, nr_drain, nr_retire, nr_closing, nr_closed);
     DOCA_LOG_INFO("Buffer stats (totals): enq=%lu drop=%lu drained=%lu "
-                  "passthrough=%lu requeued=%lu retire_timeouts=%lu",
+                  "passthrough=%lu requeued=%lu tx_dropped=%lu",
                   (unsigned long)tot_enq,
                   (unsigned long)tot_drop,
                   (unsigned long)tot_drained,
                   (unsigned long)tot_passthrough,
                   (unsigned long)tot_requeued,
-                  (unsigned long)__atomic_load_n(&ctx->retire_timeouts,
-                                                 __ATOMIC_RELAXED));
+                  (unsigned long)tot_tx_dropped);
 }

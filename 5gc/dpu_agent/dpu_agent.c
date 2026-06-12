@@ -260,11 +260,15 @@ comch_recv_cb(struct doca_comch_event_msg_recv *event,
             DOCA_LOG_INFO("Rule deleted hw_rule_id=%u", msg->hw_rule_id);
             /* Brief delay for NIC DMA pipeline to deliver any packets
              * matched before the HW commit.  BF3 DMA < 10µs; 50µs is
-             * ample margin and negligible vs. PFCP round-trip. */
+             * ample margin and negligible vs. PFCP round-trip.
+             *
+             * begin_close == 1: the slot was DRAINING/RETIRING — the Rx
+             * lcore frees the backlog and closes it asynchronously
+             * (discard flag); quiesce_and_drain must not run. */
             rte_delay_us_block(50);
-            dpu_buffer_begin_close(&g_buffer, msg->hw_rule_id);
-            if (dpu_buffer_quiesce_and_drain(&g_buffer, msg->hw_rule_id,
-                                              true) < 0)
+            if (dpu_buffer_begin_close(&g_buffer, msg->hw_rule_id) == 0 &&
+                dpu_buffer_quiesce_and_drain(&g_buffer, msg->hw_rule_id,
+                                             true) < 0)
                 DOCA_LOG_ERR("quiesce timeout hw_rule_id=%u (DELETE) "
                              "— flow stays CLOSING",
                              msg->hw_rule_id);
@@ -286,51 +290,57 @@ comch_recv_cb(struct doca_comch_event_msg_recv *event,
         }
 
         /* State-machine lifecycle for buffer transitions:
-         * FAST→BUFF: swap fwd to TO_DPU_ARM, register for buffering.
-         * BUFF→FORW: update_dlencap_only → begin_drain → wait_drain_done → HW commit → close.
-         * BUFF→DROP: HW commit → CLOSING → quiesce → discard → CLOSED. */
+         * FAST→BUFF: register for buffering, then add the override (register-first).
+         * BUFF→FORW: update_dlencap_only → begin_drain → wait_drain_done →
+         *            HW commit → begin_retire (Rx lcore closes async).
+         * BUFF→DROP: HW commit → begin_close → quiesce+discard (ACTIVE) or
+         *            Rx-owned discard close (DRAINING/RETIRING). */
         if (msg->apply_action & HW_ACTION_BUFF) {
-            /* Enter BUFFER mode: swap fwd, then register for buffering.
-             * If register fails, rollback the fwd swap to prevent
-             * a black-hole (packets sent to ARM with no buffer). */
+            /* Enter BUFFER mode: register the buffer slot FIRST, then
+             * install the override.  With the old swap-then-register
+             * order, packets redirected between the override commit and
+             * ring creation hit "no flow" on the Rx lcore and were freed
+             * (onset drop window) — exactly the paging packets BUFF must
+             * hold.  Register-first costs nothing: an ACTIVE slot with no
+             * override simply receives no traffic.
+             *
+             * Cold-start seed source: DL QoS carried on the BUFF message
+             * (upf_c populates mbr/gbr on UPDATE_FAR).  Convert wire kbps →
+             * bytes/s (×125); 0 → buffer falls back to the default seed. */
+            int reg = dpu_buffer_register_flow(&g_buffer, msg->hw_rule_id,
+                                               msg->direction,
+                                               msg->mbr_dl * 125,
+                                               msg->gbr_dl * 125);
+            if (reg < 0) {
+                DOCA_LOG_ERR("buffer register failed hw_rule_id=%u "
+                             "— BUFF not applied (HW untouched, flow "
+                             "stays on fast path)", msg->hw_rule_id);
+                break;
+            }
+
             doca_error_t result = dpu_pipeline_update_far(&g_pipeline, msg);
             if (result == DOCA_SUCCESS) {
-                /* Cold-start seed source: DL QoS carried on the BUFF message
-                 * (upf_c populates mbr/gbr on UPDATE_FAR).  Convert wire kbps →
-                 * bytes/s (×125); 0 → buffer falls back to the default seed. */
-                if (dpu_buffer_register_flow(&g_buffer, msg->hw_rule_id,
-                                             msg->direction,
-                                             msg->mbr_dl * 125,
-                                             msg->gbr_dl * 125) != 0) {
-                    DOCA_LOG_ERR("buffer register failed hw_rule_id=%u "
-                                 "— rolling back fwd swap",
-                                 msg->hw_rule_id);
-                    hw_offload_msg_t rollback = *msg;
-                    rollback.apply_action = HW_ACTION_FORW;
-                    dpu_pipeline_update_far(&g_pipeline, &rollback);
-                    /* Rollback restores COLOR_GATE; mode stays FAST
-                     * (update_far(BUFF) set BUFFER, but the BUFF failed,
-                     *  so revert to FAST). */
-                    dpu_pipeline_set_mode(&g_pipeline, msg->hw_rule_id,
-                                          DPU_MODE_FAST);
-                } else {
-                    /* BUFF active for a DL flow: drop any stale YELLOW
-                     * backlog sitting in the shaper for this rule, so it
-                     * does not keep draining to N3 while the FAR says
-                     * "hold".  Future DL packets are intercepted by the
-                     * PFCP-BUFF override.  No-op for non-GBR flows. */
-                    shaper_request_flush(&g_shaper, msg->hw_rule_id);
-                }
-            } else if (result == DOCA_ERROR_NOT_SUPPORTED) {
-                /* UL BUFF declined by the pipeline guard.  HW is
-                 * untouched and the rule stays on the UL fast path;
-                 * skip dpu_buffer_register_flow so we don't leak a
-                 * buffer slot that would never be closed. */
-                DOCA_LOG_DBG("update_far(BUFF) declined hw_rule_id=%u "
-                             "(UL not supported)", msg->hw_rule_id);
+                /* BUFF active for a DL flow: drop any stale YELLOW
+                 * backlog sitting in the shaper for this rule, so it
+                 * does not keep draining to N3 while the FAR says
+                 * "hold".  Future DL packets are intercepted by the
+                 * PFCP-BUFF override.  No-op for non-GBR flows. */
+                shaper_request_flush(&g_shaper, msg->hw_rule_id);
             } else {
-                DOCA_LOG_ERR("update_far(BUFF) failed hw_rule_id=%u: %s",
-                             msg->hw_rule_id, doca_error_get_descr(result));
+                /* Override install failed: undo the registration so the
+                 * slot doesn't sit ACTIVE (holding a byte grant) with no
+                 * traffic source.  Gated on reg==0 — an already-ACTIVE
+                 * slot (idempotent re-BUFF, reg==1) belongs to the live
+                 * BUFF cycle and must not be torn down. */
+                if (reg == 0)
+                    dpu_buffer_rollback_register(&g_buffer, msg->hw_rule_id);
+                if (result == DOCA_ERROR_NOT_SUPPORTED)
+                    DOCA_LOG_DBG("update_far(BUFF) declined hw_rule_id=%u "
+                                 "(UL not supported)", msg->hw_rule_id);
+                else
+                    DOCA_LOG_ERR("update_far(BUFF) failed hw_rule_id=%u: %s",
+                                 msg->hw_rule_id,
+                                 doca_error_get_descr(result));
             }
         } else if (msg->apply_action & HW_ACTION_FORW) {
             uint8_t cur_mode = dpu_pipeline_get_mode(&g_pipeline,
@@ -399,15 +409,14 @@ comch_recv_cb(struct doca_comch_event_msg_recv *event,
              *    HW is already FAST once the override is gone, so reflect it
              *    without waiting for the SW slot to retire.
              *
-             * 6. begin_retire:     DRAINING → RETIRING
+             * 6. begin_retire:     DRAINING → RETIRING — and DONE.
              *    The Rx lcore keeps pass-through reinjecting late in-flight
-             *    DMA packets and, at end-of-poll, declares old-path
-             *    quiescence (K empty Rx epochs + tail-idle from RETIRING
-             *    entry).  Replaces the old fixed 50µs cutover delay.
-             *
-             * 7. wait_retire_done -> close_flow (RETIRING → CLOSED), retried
-             *    under one budget: close_flow re-checks retire_done, so a late
-             *    boundary packet just makes the handler re-wait, not drop.
+             *    DMA packets and, at end-of-poll, closes the slot itself
+             *    (RETIRING → CLOSED) once it observes old-path quiescence
+             *    (K empty Rx epochs + tail-idle from RETIRING entry).
+             *    The control thread does not wait: the close is Rx-owned,
+             *    so the Comch thread stays responsive and a persistent
+             *    late tail defers the close instead of leaking the slot.
              */
 
             /* Step 1: update DL_ENCAP before drain so reinjected packets
@@ -445,48 +454,19 @@ comch_recv_cb(struct doca_comch_event_msg_recv *event,
                 dpu_pipeline_set_mode(&g_pipeline, msg->hw_rule_id,
                                       DPU_MODE_FAST);
 
-                /* Observed-retire: DRAINING → RETIRING, then wait for the Rx
-                 * lcore to declare quiescence (ring empty, no in-flight, K
-                 * empty Rx epochs + tail-idle measured from RETIRING entry).
-                 * Replaces the previous rte_delay_us_block(50) heuristic. */
-                if (dpu_buffer_begin_retire(&g_buffer, msg->hw_rule_id) == 0) {
-                    /* wait → close, retrying if a boundary-race late packet
-                     * cleared retire_done between the two (close_flow
-                     * re-checks it).  One budget caps total time so a
-                     * persistent late tail still hits the leak path; the
-                     * shrinking remain_us keeps the retry sequence in it. */
-                    uint64_t hz = rte_get_tsc_hz();
-                    uint64_t deadline = rte_get_tsc_cycles() +
-                        (uint64_t)DPU_BUFFER_RETIRE_MAX_US * hz / 1000000;
-                    bool closed = false;
-                    for (;;) {
-                        /* One clock read per iteration: using it for both the
-                         * budget check and remain_us avoids a now>deadline
-                         * underflow in the (deadline - now) subtraction. */
-                        uint64_t now = rte_get_tsc_cycles();
-                        if (now >= deadline)
-                            break;   /* budget exhausted; leak (HW already FAST) */
-                        uint64_t remain_us = (deadline - now) * 1000000 / hz;
-                        if (dpu_buffer_wait_retire_done(&g_buffer,
-                                msg->hw_rule_id, remain_us) != 0)
-                            break;   /* timeout: retire_timeouts bumped; leak */
-                        if (dpu_buffer_close_flow(&g_buffer,
-                                msg->hw_rule_id) == 0) {
-                            closed = true;
-                            break;   /* RETIRING → CLOSED committed */
-                        }
-                        /* close refused (retire_done re-cleared by a late
-                         * packet) — re-wait for the new tail to quiesce. */
-                    }
-                    if (!closed)
-                        DOCA_LOG_WARN("retire/close did not converge "
-                                      "hw_rule_id=%u — slot stays RETIRING "
-                                      "(HW already FAST)", msg->hw_rule_id);
-                } else {
+                /* Observed-retire, Rx-owned: DRAINING → RETIRING here, then
+                 * return.  The Rx lcore closes the slot itself once it
+                 * observes quiescence (ring empty, no in-flight, K empty Rx
+                 * epochs + tail-idle measured from RETIRING entry), so the
+                 * Comch thread no longer blocks ≥1 ms per FORW and a
+                 * persistent late tail defers the close instead of leaking
+                 * the slot on a wait timeout.  A flow left in DRAINING by a
+                 * begin_retire failure is recovered by DELETE/DROP's
+                 * discard path (begin_close). */
+                if (dpu_buffer_begin_retire(&g_buffer, msg->hw_rule_id) != 0)
                     DOCA_LOG_ERR("begin_retire failed hw_rule_id=%u — leaving "
                                  "buffer slot in DRAINING; HW already FAST",
                                  msg->hw_rule_id);
-                }
             } else {
                 DOCA_LOG_ERR("update_far(FORW) failed hw_rule_id=%u: %s "
                              "— flow stays DRAINING (pass-through)",
@@ -500,12 +480,16 @@ comch_recv_cb(struct doca_comch_event_msg_recv *event,
             doca_error_t result = dpu_pipeline_update_far(&g_pipeline, msg);
             if (result == DOCA_SUCCESS) {
                 /* Flow is now DROP — unregister from shaper so the slot
-                 * is freed.  No YELLOW traffic can arrive after DROP. */
+                 * is freed.  No YELLOW traffic can arrive after DROP.
+                 *
+                 * begin_close == 1: the slot was DRAINING/RETIRING — the
+                 * Rx lcore frees the backlog and closes it asynchronously
+                 * (discard flag); quiesce_and_drain must not run. */
                 shaper_unregister_flow(&g_shaper, msg->hw_rule_id);
                 rte_delay_us_block(50);
-                dpu_buffer_begin_close(&g_buffer, msg->hw_rule_id);
-                if (dpu_buffer_quiesce_and_drain(&g_buffer, msg->hw_rule_id,
-                                                  true) < 0)
+                if (dpu_buffer_begin_close(&g_buffer, msg->hw_rule_id) == 0 &&
+                    dpu_buffer_quiesce_and_drain(&g_buffer, msg->hw_rule_id,
+                                                 true) < 0)
                     DOCA_LOG_ERR("quiesce timeout hw_rule_id=%u (DROP) "
                                  "— flow stays CLOSING",
                                  msg->hw_rule_id);
@@ -1569,6 +1553,15 @@ main(int argc, char *argv[])
      *     TO_DPU_ARM_DL when a DL rule is in BUFFER mode.
      * Tx: N3 PF, queue N3_BUFFER_TX_QUEUE_ID — software-encapped
      *     wire-form GTP-U DL packets are Tx'd here on FORW drain. */
+    /* Buffer/shaper slot tables track flows that are SIMULTANEOUSLY
+     * buffered/shaped on the ARM — bounded by the byte budgets
+     * (m-op-bytes / m-shape-bytes) long before rule count matters, so
+     * don't size them from max-hw-rules: the 2M scale-test profile would
+     * allocate ~800 MB of slot tables (plus eager 2M-entry hashes and an
+     * O(2M) SIGUSR1 walk) that can never fill. */
+    uint32_t arm_max_flows =
+        RTE_MIN((uint32_t)g_cfg.max_hw_rules, (uint32_t)16384);
+
     dpu_buf_alloc_cfg_t buf_alloc_cfg = {
         .m_op_bytes            = g_cfg.m_op_bytes,
         .default_seed_rate_Bps = (uint64_t)g_cfg.default_seed_rate_kbps * 125,
@@ -1581,9 +1574,9 @@ main(int argc, char *argv[])
                         g_n6_dpdk_port, BUFFER_RX_QUEUES,
                         g_n3_dpdk_port, N3_BUFFER_TX_QUEUE_ID,
                         &g_pipeline,
-                        (uint32_t)g_cfg.max_hw_rules,
+                        arm_max_flows,
                         &buf_alloc_cfg) < 0) {
-        DOCA_LOG_ERR("Buffer init failed (max_flows=%d)", g_cfg.max_hw_rules);
+        DOCA_LOG_ERR("Buffer init failed (max_flows=%u)", arm_max_flows);
         dpu_pipeline_destroy(&g_pipeline);
         comch_server_destroy();
         doca_argp_destroy();
@@ -1611,10 +1604,10 @@ main(int argc, char *argv[])
                     /* DL Tx (SW-encap → N3) */
                     g_n3_dpdk_port, N3_SHAPER_TX_QUEUE_ID,
                     &g_pipeline,
-                    (uint32_t)g_cfg.max_hw_rules,
+                    arm_max_flows,
                     g_cfg.m_shape_bytes,
                     (uint32_t)g_cfg.shape_max_delay_ms) < 0) {
-        DOCA_LOG_ERR("Shaper init failed (max_flows=%d)", g_cfg.max_hw_rules);
+        DOCA_LOG_ERR("Shaper init failed (max_flows=%u)", arm_max_flows);
         dpu_buffer_destroy(&g_buffer);
         dpu_pipeline_destroy(&g_pipeline);
         comch_server_destroy();

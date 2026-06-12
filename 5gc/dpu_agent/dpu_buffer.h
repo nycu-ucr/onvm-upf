@@ -13,11 +13,12 @@
  *      (FIFO-preserving).  Once the ring is empty, new arrivals are
  *      pass-through reinjected directly (no enqueue).
  *   3. Main thread waits for drain_done, removes the HW override, sets
- *      pipeline mode FAST, THEN transitions the slot DRAINING → RETIRING
+ *      pipeline mode FAST, transitions the slot DRAINING → RETIRING, and
+ *      RETURNS (the close is Rx-lcore-owned from here)
  *   4. Rx lcore keeps pass-through reinjecting late in-flight DMA packets
- *      and, at end-of-poll, declares old-path quiescence (retire_done)
- *   5. Main thread waits for retire_done, THEN closes RETIRING → CLOSED
- *      (replaces a fixed 50 µs cutover delay with an observed retire)
+ *      and, at end-of-poll, closes RETIRING → CLOSED itself once it
+ *      observes old-path quiescence (replaces both the fixed 50 µs
+ *      cutover delay and the old control-thread wait_retire_done loop)
  *
  * Drain Tx: software GTP-U + PSC encap on the buffer lcore.
  *   In VNF mode, software-Tx'd packets traverse the EGRESS pipeline of
@@ -41,19 +42,25 @@
  *
  * State machine (per-flow):
  *   INACTIVE → ACTIVE (register)
+ *   ACTIVE   → CLOSED   (rollback_register) [override install failed]
  *   ACTIVE   → DRAINING (begin_drain)  [FORW path: Rx-owned drain]
  *   ACTIVE   → CLOSING  (begin_close)  [DROP/DELETE path: HW source cut]
  *   DRAINING → RETIRING (begin_retire) [FORW: after override removed]
- *   RETIRING → CLOSED   (close_flow)   [Rx-lcore-observed quiescence]
+ *   DRAINING → CLOSED   (Rx lcore)     [DROP/DELETE: discard flag set]
+ *   RETIRING → CLOSED   (Rx lcore)     [observed quiescence OR discard]
  *   CLOSING  → CLOSED   (quiesce_and_drain)
  *
  *   ACTIVE:   Rx lcore enqueues into per-flow ring.
  *   DRAINING: Rx lcore bounded-drains ring; re-enqueues new pkts while
  *             ring non-empty, then pass-through reinjects once empty.
+ *             If the discard flag is set (DROP/DELETE arrived while
+ *             DRAINING), the Rx lcore frees the backlog and closes the
+ *             slot instead (fixes the old stuck-DRAINING wedge).
  *   RETIRING: override gone (HW fast path live); ring empty; Rx pass-through
- *             reinjects late in-flight DMA packets and stamps retire-evidence
- *             so the Rx lcore can declare old-path quiescence; close_flow is
- *             gated on that (replaces the old fixed 50 µs cutover delay).
+ *             reinjects late in-flight DMA packets, stamps retire-evidence,
+ *             and closes the slot itself at end-of-poll once old-path
+ *             quiescence holds (K empty epochs + tail idle), or immediately
+ *             when the discard flag is set.
  *   CLOSING:  HW source cut; Rx still enqueues in-flight packets.
  *   CLOSED:   Rx rejects; safe to reuse slot.
  *   INACTIVE: Slot available.
@@ -96,7 +103,10 @@ extern "C" {
  * silence, both measured from the later of {RETIRING entry, last late packet}. */
 #define DPU_BUFFER_RETIRE_K_EPOCHS  5         /* K consecutive empty Rx epochs   */
 #define DPU_BUFFER_TAIL_IDLE_US     1000      /* tail-idle floor (1 ms)          */
-#define DPU_BUFFER_RETIRE_MAX_US    100000    /* total wait+close budget (100ms) */
+#define DPU_BUFFER_REGISTER_WAIT_US 5000      /* register_flow grace for a slot
+                                               * still RETIRING from the previous
+                                               * FORW (the Rx lcore closes it
+                                               * asynchronously, typically ~1 ms) */
 
 /* ── Per-flow buffer state machine ─────────────────────────────────── */
 enum dpu_buffer_state {
@@ -107,8 +117,9 @@ enum dpu_buffer_state {
     DPU_BUF_CLOSED   = 4,  /* Quiesced + drained; Rx rejects; safe to reuse    */
     DPU_BUF_RETIRING = 5,  /* FORW: override removed, HW fast path live, SW
                             * path still accepts late in-flight DMA packets;
-                            * close_flow blocked until the Rx lcore observes
-                            * old-path quiescence (replaces the 50 µs delay).  */
+                            * the Rx lcore closes the slot itself once it
+                            * observes old-path quiescence (or immediately on
+                            * discard).  Replaces the old 50 µs delay.        */
 };
 
 /* ── BDP byte-budget allocator config (passed to dpu_buffer_init) ─────── *
@@ -148,6 +159,13 @@ typedef struct {
      * Polled by main thread via wait_drain_done (acquire). */
     uint32_t drain_done;               /* atomic: 0=pending, 1=complete   */
 
+    /* DROP/DELETE-while-leaving signal (atomic).  Set by the control
+     * thread (begin_close) when the flow is DRAINING or RETIRING: the HW
+     * source is already cut, so the Rx lcore — the ring's consumer in
+     * those states — frees the backlog instead of reinjecting it and
+     * closes the slot itself.  Reset by register_flow on reuse. */
+    uint32_t discard;
+
     /* Statistics (written by Rx lcore, read by main thread for logging) */
     uint64_t enqueued;
     uint64_t dropped;                  /* tail-drop when at per-flow cap  */
@@ -155,6 +173,8 @@ typedef struct {
     uint64_t passthrough;              /* pass-through reinjected (DRAINING) */
     uint64_t requeued;                 /* new pkts re-enqueued at ring tail
                                         * during DRAINING (bounded drain)   */
+    uint64_t tx_dropped;               /* reinject_burst pkts lost to Tx-burst
+                                        * backpressure (freed, not sent)     */
 
     /* ── BDP byte-budget allocator state ─────────────────────────────── *
      * queued_bytes is touched by both the Rx lcore (enqueue/drain) and the
@@ -176,7 +196,8 @@ typedef struct {
 
     /* ── Observed-retire evidence (RETIRING state, FORW path) ─────────────── *
      * Written by the Rx lcore in Phase 2's RETIRING branch and read by the
-     * Rx lcore at end-of-poll; the *_entry_* floor is written by the control
+     * Rx lcore at end-of-poll (which now also performs the RETIRING→CLOSED
+     * transition itself); the *_entry_* floor is written by the control
      * thread in begin_retire (published via the state store-RELEASE).  The
      * floor makes "K epochs + tail_idle" measure from RETIRING entry, not
      * from epoch/tsc 0.  All atomic-relaxed unless noted. */
@@ -186,7 +207,6 @@ typedef struct {
     uint64_t last_old_path_done_tsc;   /* stamped after reinject_burst returns */
     uint64_t last_old_path_rx_epoch;   /* ctx->current_rx_poll_epoch snapshot  */
     uint32_t old_path_inflight;        /* +1 at start, -1 at end of per-pkt    */
-    uint32_t retire_done;              /* 0=pending, 1=Rx lcore observed idle  */
 } dpu_buffer_flow_t;
 
 /* ── Buffer context (single instance on ARM) ────────────────────────── */
@@ -197,8 +217,9 @@ typedef struct {
     uint32_t          global_count;    /* atomic: total pkts across flows */
 
     /* Drain coordination: incremented by begin_drain, decremented by
-     * close_flow.  The Rx loop uses this as a fast check to skip the
-     * DRAINING flow scan when no drains are active. */
+     * begin_retire or the Rx lcore's DRAINING discard close.  The Rx loop
+     * uses this as a fast check to skip the DRAINING flow scan when no
+     * drains are active. */
     uint32_t          nr_draining;     /* atomic: count of DRAINING flows */
     uint32_t          nr_buffering;    /* atomic: count of ACTIVE+DRAINING+
                                         * CLOSING slots; bounds the control-
@@ -213,8 +234,6 @@ typedef struct {
     uint64_t          current_rx_poll_epoch; /* atomic-relaxed; ++ at the top of
                                         * the Rx outer loop; "K empty epochs"
                                         * fence reference                       */
-    uint64_t          retire_timeouts; /* atomic-relaxed; ++ on wait_retire_done
-                                        * timeout (slot leaks until shutdown)   */
 
     /* ── BDP byte-budget allocator (control tick recomputes A_i) ──────── */
     uint64_t          global_bytes;    /* atomic: total payload bytes buffered */
@@ -277,20 +296,43 @@ int dpu_buffer_init(dpu_buffer_ctx_t *ctx,
                     const dpu_buf_alloc_cfg_t *alloc_cfg);
 
 /**
- * Register a flow for buffering (called when BUFF mode is entered).
+ * Register a flow for buffering.  Called BEFORE the HW override is
+ * installed (register-first ordering), so the first redirected packet
+ * always finds a flow — no onset drop window.
+ *
+ * A slot still RETIRING from the previous FORW cycle is given a bounded
+ * grace (DPU_BUFFER_REGISTER_WAIT_US) for the Rx lcore's asynchronous
+ * close to land before the registration is refused.
  *
  * @param ctx          Buffer context
  * @param hw_rule_id   Globally unique rule ID
  * @param direction    HW_DIR_UPLINK or HW_DIR_DOWNLINK
  * @param mbr_dl_Bps   DL MBR in bytes/s (0 if none) — cold-start seed only
  * @param gbr_dl_Bps   DL GBR in bytes/s (0 if none) — cold-start seed only
- * @return             0 on success, -1 if no slots available
+ * @return             0 = newly registered (rollback_register is valid),
+ *                     1 = already ACTIVE (idempotent re-BUFF; never roll back),
+ *                    -1 = refused (no slot / slot still draining or closing)
  */
 int dpu_buffer_register_flow(dpu_buffer_ctx_t *ctx,
                              uint32_t hw_rule_id,
                              uint8_t direction,
                              uint64_t mbr_dl_Bps,
                              uint64_t gbr_dl_Bps);
+
+/**
+ * Roll back a registration made this control-thread turn (ACTIVE → CLOSED).
+ *
+ * Only valid when register_flow returned 0 (newly registered) AND the HW
+ * override was never installed (its add failed) — so no packet for this
+ * flow can be in flight.  Flushes the ring defensively and releases the
+ * slot's nr_buffering count.  Calling it on a slot that register_flow
+ * reported as already ACTIVE (return 1) would tear down a live flow —
+ * the caller must gate on register_flow's return value.
+ *
+ * @return             0 on rollback, -1 if the slot is not ACTIVE
+ */
+int dpu_buffer_rollback_register(dpu_buffer_ctx_t *ctx,
+                                 uint32_t hw_rule_id);
 
 /**
  * Begin Rx-owned drain for a BUFF→FORW transition (ACTIVE → DRAINING).
@@ -334,8 +376,12 @@ int dpu_buffer_wait_drain_done(dpu_buffer_ctx_t *ctx,
  * Requires drain_done==1 and an empty ring (both asserted).  Stamps the
  * retire-entry floor, resets all retire-evidence fields, then publishes
  * state=RETIRING and moves the slot out of nr_buffering/nr_draining into
- * nr_retiring.  The Rx lcore thereafter pass-through reinjects any late
- * in-flight DMA packet and declares quiescence at end-of-poll.
+ * nr_retiring.  This is the control thread's LAST involvement in the FORW
+ * close: the Rx lcore pass-through reinjects any late in-flight DMA
+ * packet and, at end-of-poll, closes the slot itself (RETIRING → CLOSED)
+ * once old-path quiescence holds (ring empty, no in-flight, K empty Rx
+ * epochs AND tail_idle_us since the later of {RETIRING entry, last
+ * old-path packet}).
  *
  * @param ctx          Buffer context
  * @param hw_rule_id   Globally unique rule ID
@@ -345,51 +391,24 @@ int dpu_buffer_begin_retire(dpu_buffer_ctx_t *ctx,
                             uint32_t hw_rule_id);
 
 /**
- * Spin until the Rx lcore declares retire_done = 1 (multi-condition fence:
- * ring empty, no in-flight, K empty Rx epochs AND tail_idle_us since the
- * later of {RETIRING entry, last old-path packet}).
+ * Begin closing a buffered flow (DROP/DELETE paths; HW source cut FIRST).
  *
- * @param ctx           Buffer context
- * @param hw_rule_id    Globally unique rule ID
- * @param max_retire_us Total wait budget in µs
- * @return  0 once retire_done observed; -1 on timeout (flow stays RETIRING,
- *          ctx->retire_timeouts incremented; caller MUST NOT close_flow).
- */
-int dpu_buffer_wait_retire_done(dpu_buffer_ctx_t *ctx,
-                                uint32_t hw_rule_id,
-                                uint64_t max_retire_us);
-
-/**
- * Close a retired flow (RETIRING → CLOSED).
- *
- * Called from the FORW handler's wait→close loop after wait_retire_done
- * succeeds.  RETIRING-only and gated on retire_done==1, re-checked at the
- * instant of close: if a late packet cleared retire_done between the wait
- * returning and this call, the close refuses (-1) and the caller re-waits.
- * Flushes residual packets (safety net), transitions to CLOSED, and
- * decrements nr_retiring (NOT nr_buffering — begin_retire already released
- * it).  Force-closing a non-quiescent flow is a deferred separate API.
- *
- * @param ctx          Buffer context
- * @param hw_rule_id   Globally unique rule ID
- * @return             0 on success, -1 if not found / not RETIRING / retire_done==0
- */
-int dpu_buffer_close_flow(dpu_buffer_ctx_t *ctx,
-                          uint32_t hw_rule_id);
-
-/**
- * Begin closing a buffered flow (ACTIVE → CLOSING).
- * Used for DROP/DELETE paths where HW source is cut FIRST.
- * The Rx lcore continues accepting in-flight packets during CLOSING,
- * but the HW source should already be cut (fwd swapped / rule deleted)
- * before calling this.
+ * ACTIVE flows transition to CLOSING and the caller must follow with
+ * quiesce_and_drain (synchronous close, return 0).  DRAINING/RETIRING
+ * flows get the discard flag instead (return 1): the Rx lcore — the
+ * ring's consumer in those states — frees the backlog and closes the
+ * slot asynchronously, so the caller must NOT call quiesce_and_drain.
+ * This replaces the old behaviour where a DRAINING flow was silently
+ * skipped (begin_close returned 0 having done nothing) and then
+ * quiesce_and_drain refused it — wedging the slot forever.
  *
  * For BUFF→FORW transitions, use begin_drain + wait_drain_done +
- * close_flow instead.
+ * begin_retire instead.
  *
  * @param ctx          Buffer context
  * @param hw_rule_id   Globally unique rule ID
- * @return             0 on success or if flow not found / already closing
+ * @return             0 = CLOSING (caller runs quiesce_and_drain) or no-op,
+ *                     1 = async discard close requested (Rx lcore owns it)
  */
 int dpu_buffer_begin_close(dpu_buffer_ctx_t *ctx,
                            uint32_t hw_rule_id);

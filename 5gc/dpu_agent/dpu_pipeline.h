@@ -305,11 +305,13 @@ typedef struct {
         uint32_t ohc_teid;   /* gNB TEID (host order; 0 if no DL encap)    */
         uint8_t  encap_qfi;  /* QFI for GTP-PSC ext header                 */
 
-        /* Match captured at insert time.  Used by the latent
-         * repeated-QER-update reinsert helper and by the buffering
-         * override path so the BUFF entry can mirror the base rule's
-         * original match specificity (dst-only vs src+dst). */
-        struct doca_flow_match cached_dl_match;
+        /* Match captured at insert time (UL_MATCH or DL_(SDF_)MATCH —
+         * records are direction-exclusive).  Used by the repeated-QER
+         * reinsert fallback (HWS grants one update per entry lifetime;
+         * the 2nd+ update_qer must delete+re-add with this match) and by
+         * the DL buffering override path so the BUFF entry can mirror the
+         * base rule's original match specificity (dst-only vs src+dst). */
+        struct doca_flow_match cached_match;
 } dpu_rule_record_t;
 
 typedef struct {
