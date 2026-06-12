@@ -804,9 +804,16 @@ dpu_buffer_quiesce_and_drain(dpu_buffer_ctx_t *ctx,
      * (e.g. DROP→BUFF) finds this slot via find_flow() and reuses the
      * persistent ring (CLOSED branch in register_flow).  Bindings are
      * never released at runtime — deleting the key would orphan the named
-     * ring and break the next rte_ring_create("buf_<id>"). */
-    __atomic_store_n(&flow->state, DPU_BUF_CLOSED, __ATOMIC_RELEASE);
+     * ring and break the next rte_ring_create("buf_<id>").
+     *
+     * CLOSED is published LAST (uniform close invariant: cleanup →
+     * counter releases → state).  Not reuse-racy here (control-thread
+     * close, registers are serialized with it); the cost is a transient
+     * where the Rx control tick sees CLOSING with nr_buffering already
+     * released and may under-scan by one flow for a single tick —
+     * self-healing and preferable to a per-thread ordering rule. */
     __atomic_fetch_sub(&ctx->nr_buffering, 1, __ATOMIC_RELEASE);
+    __atomic_store_n(&flow->state, DPU_BUF_CLOSED, __ATOMIC_RELEASE);
 
     DOCA_LOG_INFO("quiesce_and_drain: hw_rule_id=%u %s %d pkts "
                   "(enq=%lu drop=%lu drain=%lu) → CLOSED",
