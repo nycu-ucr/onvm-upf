@@ -245,9 +245,12 @@ comch_recv_cb(struct doca_comch_event_msg_recv *event,
         break;
     }
     case HW_OP_DELETE: {
-        /* HW commit first (cut packet source), then quiesce + discard.
-         * Order: delete HW rule → NIC drain delay → begin_close →
-         *        quiesce_and_drain(discard)
+        /* HW commit first (cut packet source), then declare teardown:
+         * begin_close sets the discard flag and returns — the Rx lcore
+         * frees the backlog and any late in-flight DMA arrival and
+         * closes the slot asynchronously, whatever state the flow was
+         * in.  No settle delay, no quiesce: the Comch thread never
+         * blocks on the data path.
          * Buffer close is ONLY attempted if HW commit succeeds.
          * If delete fails, the HW rule still forwards to ARM, so the
          * buffer must stay ACTIVE to avoid black-holing packets.
@@ -258,27 +261,7 @@ comch_recv_cb(struct doca_comch_event_msg_recv *event,
         if (result == DOCA_SUCCESS) {
             shaper_unregister_flow(&g_shaper, msg->hw_rule_id);
             DOCA_LOG_INFO("Rule deleted hw_rule_id=%u", msg->hw_rule_id);
-            /* begin_close IMMEDIATELY after the HW commit: if the slot is
-             * DRAINING/RETIRING (returns 1), the discard flag must stop
-             * the Rx lcore from draining the dead session's backlog to
-             * the wire — any delay here is more stale packets Tx'd.  The
-             * Rx lcore frees the backlog and closes asynchronously; late
-             * DMA arrivals are freed by the discard/CLOSED branches, so
-             * no settle delay is needed on that path.
-             *
-             * Returns 0 (ACTIVE → CLOSING or no-op): give the NIC DMA
-             * pipeline a brief delay to deliver packets matched before
-             * the HW commit (CLOSING still enqueues them), then quiesce
-             * + discard.  BF3 DMA < 10µs; 50µs is ample margin and
-             * negligible vs. PFCP round-trip. */
-            if (dpu_buffer_begin_close(&g_buffer, msg->hw_rule_id) == 0) {
-                rte_delay_us_block(50);
-                if (dpu_buffer_quiesce_and_drain(&g_buffer, msg->hw_rule_id,
-                                                 true) < 0)
-                    DOCA_LOG_ERR("quiesce timeout hw_rule_id=%u (DELETE) "
-                                 "— flow stays CLOSING",
-                                 msg->hw_rule_id);
-            }
+            dpu_buffer_begin_close(&g_buffer, msg->hw_rule_id);
         } else {
             DOCA_LOG_ERR("Rule delete failed hw_rule_id=%u: %s "
                          "— buffer stays ACTIVE",
@@ -300,8 +283,8 @@ comch_recv_cb(struct doca_comch_event_msg_recv *event,
          * FAST→BUFF: register for buffering, then add the override (register-first).
          * BUFF→FORW: update_dlencap_only → begin_drain → wait_drain_done →
          *            HW commit → begin_retire (Rx lcore closes async).
-         * BUFF→DROP: HW commit → begin_close → quiesce+discard (ACTIVE) or
-         *            Rx-owned discard close (DRAINING/RETIRING). */
+         * BUFF→DROP: HW commit → begin_close (discard flag; Rx lcore frees
+         *            backlog and closes async, whatever the state). */
         if (msg->apply_action & HW_ACTION_BUFF) {
             /* Enter BUFFER mode: register the buffer slot FIRST, then
              * install the override.  With the old swap-then-register
@@ -480,7 +463,7 @@ comch_recv_cb(struct doca_comch_event_msg_recv *event,
                              msg->hw_rule_id, doca_error_get_descr(result));
             }
         } else {
-            /* DROP or other: HW commit first, then quiesce + discard.
+            /* DROP or other: HW commit first, then declare teardown.
              * Buffer close is ONLY attempted if HW commit succeeds.
              * If update_far fails, HW still forwards to ARM, so the
              * buffer must stay ACTIVE to avoid black-holing packets. */
@@ -489,23 +472,13 @@ comch_recv_cb(struct doca_comch_event_msg_recv *event,
                 /* Flow is now DROP — unregister from shaper so the slot
                  * is freed.  No YELLOW traffic can arrive after DROP.
                  *
-                 * begin_close IMMEDIATELY after the HW commit (see the
-                 * DELETE handler): returns 1 for DRAINING/RETIRING — the
+                 * begin_close IMMEDIATELY after the HW commit: the
                  * discard flag stops the Rx lcore draining the dead
-                 * session's backlog to the wire, and it closes the slot
-                 * asynchronously (no delay, no quiesce).  Returns 0 for
-                 * ACTIVE → CLOSING: 50µs DMA-settle delay, then quiesce
-                 * + discard. */
+                 * session's backlog to the wire; it frees the backlog
+                 * and any late DMA arrival and closes the slot
+                 * asynchronously (no delay, no quiesce, no blocking). */
                 shaper_unregister_flow(&g_shaper, msg->hw_rule_id);
-                if (dpu_buffer_begin_close(&g_buffer, msg->hw_rule_id) == 0) {
-                    rte_delay_us_block(50);
-                    if (dpu_buffer_quiesce_and_drain(&g_buffer,
-                                                     msg->hw_rule_id,
-                                                     true) < 0)
-                        DOCA_LOG_ERR("quiesce timeout hw_rule_id=%u (DROP) "
-                                     "— flow stays CLOSING",
-                                     msg->hw_rule_id);
-                }
+                dpu_buffer_begin_close(&g_buffer, msg->hw_rule_id);
             } else {
                 DOCA_LOG_ERR("update_far(DROP) failed hw_rule_id=%u: %s "
                              "— buffer stays ACTIVE",

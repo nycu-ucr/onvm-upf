@@ -40,28 +40,32 @@
  *   Comch thread = consumer).  global_count uses __atomic builtins.
  *   flow->state uses atomic store/load for cross-lcore visibility.
  *
- * State machine (per-flow):
+ * State machine (per-flow).  Every close is Rx-lcore-owned: the control
+ * thread only declares intent (rollback, drain, retire, discard) and
+ * never blocks on the data path.
  *   INACTIVE → ACTIVE (register)
  *   ACTIVE   → CLOSED   (rollback_register) [override install failed]
  *   ACTIVE   → DRAINING (begin_drain)  [FORW path: Rx-owned drain]
- *   ACTIVE   → CLOSING  (begin_close)  [DROP/DELETE path: HW source cut]
+ *   ACTIVE   → CLOSING  (begin_close)  [DROP/DELETE: HW source cut,
+ *                                       discard flag set]
  *   DRAINING → RETIRING (begin_retire) [FORW: after override removed]
  *   DRAINING → CLOSED   (Rx lcore)     [DROP/DELETE: discard flag set]
  *   RETIRING → CLOSED   (Rx lcore)     [observed quiescence OR discard]
- *   CLOSING  → CLOSED   (quiesce_and_drain)
+ *   CLOSING  → CLOSED   (Rx lcore)     [end-of-poll discard close]
  *
  *   ACTIVE:   Rx lcore enqueues into per-flow ring.
  *   DRAINING: Rx lcore bounded-drains ring; re-enqueues new pkts while
  *             ring non-empty, then pass-through reinjects once empty.
  *             If the discard flag is set (DROP/DELETE arrived while
  *             DRAINING), the Rx lcore frees the backlog and closes the
- *             slot instead (fixes the old stuck-DRAINING wedge).
+ *             slot instead.
  *   RETIRING: override gone (HW fast path live); ring empty; Rx pass-through
  *             reinjects late in-flight DMA packets, stamps retire-evidence,
  *             and closes the slot itself at end-of-poll once old-path
  *             quiescence holds (K empty epochs + tail idle), or immediately
  *             when the discard flag is set.
- *   CLOSING:  HW source cut; Rx still enqueues in-flight packets.
+ *   CLOSING:  HW source cut, discard pending; Rx frees new arrivals and
+ *             closes the slot (flush backlog → CLOSED) at end-of-poll.
  *   CLOSED:   Rx rejects; safe to reuse slot.
  *   INACTIVE: Slot available.
  *
@@ -87,11 +91,10 @@ extern "C" {
 /* ── Per-flow buffer queue limits ───────────────────────────────────── */
 #define DPU_BUFFER_PER_FLOW    8192     /* rte_ring capacity per flow       */
 #define DPU_BUFFER_GLOBAL_CAP  32768  /* max pkts queued across all flows */
-#define DPU_BUFFER_QUIESCE_US  100000 /* spin-loop safety timeout in µs (100ms)
-                                       * Used by wait_drain_done (FORW path)
-                                       * and quiesce_and_drain (DROP/DELETE).
-                                       * Not an intentional delay — both loops
-                                       * converge in microseconds normally.   */
+#define DPU_BUFFER_QUIESCE_US  100000 /* wait_drain_done spin-loop safety
+                                       * timeout in µs (100ms).  Not an
+                                       * intentional delay — the drain wait
+                                       * converges in microseconds normally. */
 #define SEED_WARMUP_TICKS      3      /* cold-start seed grace, in control ticks:
                                        * a flow with no arrivals keeps its QoS
                                        * seed for this many idle ticks, then
@@ -104,16 +107,19 @@ extern "C" {
 #define DPU_BUFFER_RETIRE_K_EPOCHS  5         /* K consecutive empty Rx epochs   */
 #define DPU_BUFFER_TAIL_IDLE_US     1000      /* tail-idle floor (1 ms)          */
 #define DPU_BUFFER_REGISTER_WAIT_US 5000      /* register_flow grace for a slot
-                                               * still RETIRING from the previous
-                                               * FORW (the Rx lcore closes it
-                                               * asynchronously, typically ~1 ms) */
+                                               * still RETIRING or CLOSING from a
+                                               * previous cycle (the Rx lcore
+                                               * closes both asynchronously:
+                                               * CLOSING ~one poll, RETIRING
+                                               * typically ~1 ms)               */
 
 /* ── Per-flow buffer state machine ─────────────────────────────────── */
 enum dpu_buffer_state {
     DPU_BUF_INACTIVE = 0,  /* Slot never used (initial state only)             */
     DPU_BUF_ACTIVE   = 1,  /* Actively buffering; Rx lcore enqueues            */
     DPU_BUF_DRAINING = 2,  /* FORW transition: Rx drains ring + pass-through   */
-    DPU_BUF_CLOSING  = 3,  /* DROP/DELETE: HW source cut; Rx accepts in-flight */
+    DPU_BUF_CLOSING  = 3,  /* DROP/DELETE: HW source cut, discard pending;
+                            * Rx frees new arrivals and closes at end-of-poll  */
     DPU_BUF_CLOSED   = 4,  /* Quiesced + drained; Rx rejects; safe to reuse    */
     DPU_BUF_RETIRING = 5,  /* FORW: override removed, HW fast path live, SW
                             * path still accepts late in-flight DMA packets;
@@ -146,24 +152,17 @@ typedef struct {
 
     struct rte_ring *ring;             /* SPSC lockless ring (or NULL)     */
 
-    /* Quiesce sequence counters (atomic, written by Rx lcore).
-     * enq_seq: incremented BEFORE Rx processes a packet for this flow.
-     * deq_seq: incremented AFTER Rx finishes (enqueue/drop/free).
-     * Quiesce waits for enq_seq == deq_seq to prove no in-flight pkts.
-     * Used by CLOSING (DROP/DELETE) path only. */
-    uint64_t enq_seq;
-    uint64_t deq_seq;
-
     /* Rx-owned drain signalling (DRAINING state, FORW path).
      * Set to 1 by Rx lcore when ring drain completes (release).
      * Polled by main thread via wait_drain_done (acquire). */
     uint32_t drain_done;               /* atomic: 0=pending, 1=complete   */
 
-    /* DROP/DELETE-while-leaving signal (atomic).  Set by the control
-     * thread (begin_close) when the flow is DRAINING or RETIRING: the HW
-     * source is already cut, so the Rx lcore — the ring's consumer in
-     * those states — frees the backlog instead of reinjecting it and
-     * closes the slot itself.  Reset by register_flow on reuse. */
+    /* DROP/DELETE teardown signal (atomic).  Set by the control thread
+     * (begin_close) — the HW source is already cut, so the Rx lcore (the
+     * ring's sole owner once the flag is up) frees the backlog instead
+     * of reinjecting it and closes the slot itself, whatever state the
+     * flow was in (CLOSING/DRAINING/RETIRING).  Reset by register_flow
+     * on reuse. */
     uint32_t discard;
 
     /* Statistics (written by Rx lcore, read by main thread for logging) */
@@ -177,10 +176,11 @@ typedef struct {
                                         * backpressure (freed, not sent)     */
 
     /* ── BDP byte-budget allocator state ─────────────────────────────── *
-     * queued_bytes is touched by both the Rx lcore (enqueue/drain) and the
-     * main thread (flush/drain/quiesce) — atomic, like global_count.
-     * The remaining fields are written only by the buffer lcore (enqueue
-     * site + control tick) and read for stats — plain, like enqueued/dropped. */
+     * queued_bytes is touched by both the Rx lcore (enqueue/drain/close
+     * flushes) and the control thread (register-reuse + rollback flush) —
+     * atomic, like global_count.  The remaining fields are written only
+     * by the buffer lcore (enqueue site + control tick) and read for
+     * stats — plain, like enqueued/dropped. */
     uint64_t queued_bytes;             /* atomic: payload bytes now in ring  */
     uint64_t byte_dropped;             /* bytes dropped (per-flow+global+ring
                                         * -full) — the unmet-demand signal   */
@@ -231,6 +231,8 @@ typedef struct {
      * of nr_buffering and into nr_retiring). */
     uint32_t          nr_retiring;     /* atomic: count of RETIRING flows; gates
                                         * the end-of-poll retire scan          */
+    uint32_t          nr_closing;      /* atomic: count of CLOSING flows; gates
+                                        * the end-of-poll discard-close scan   */
     uint64_t          current_rx_poll_epoch; /* atomic-relaxed; ++ at the top of
                                         * the Rx outer loop; "K empty epochs"
                                         * fence reference                       */
@@ -393,53 +395,29 @@ int dpu_buffer_begin_retire(dpu_buffer_ctx_t *ctx,
 /**
  * Begin closing a buffered flow (DROP/DELETE paths; HW source cut FIRST).
  *
- * ACTIVE flows transition to CLOSING and the caller must follow with
- * quiesce_and_drain (synchronous close, return 0).  DRAINING/RETIRING
- * flows get the discard flag instead (return 1): the Rx lcore — the
- * ring's consumer in those states — frees the backlog and closes the
- * slot asynchronously, so the caller must NOT call quiesce_and_drain.
- * This replaces the old behaviour where a DRAINING flow was silently
- * skipped (begin_close returned 0 having done nothing) and then
- * quiesce_and_drain refused it — wedging the slot forever.
+ * Sole teardown entry point, and the control thread's ONLY involvement:
+ * it declares intent (sets the discard flag; ACTIVE flows additionally
+ * transition to CLOSING) and returns immediately.  The Rx lcore — the
+ * ring's sole owner once the flag is up — frees the backlog and any
+ * late in-flight arrival and closes the slot at end-of-poll, whatever
+ * state the flow was in (CLOSING, DRAINING, or RETIRING).  No quiesce,
+ * no delay, no blocking: a removed session's packets are freed, never
+ * transmitted, and the slot always converges to CLOSED.
  *
  * For BUFF→FORW transitions, use begin_drain + wait_drain_done +
  * begin_retire instead.
  *
  * @param ctx          Buffer context
  * @param hw_rule_id   Globally unique rule ID
- * @return             0 = CLOSING (caller runs quiesce_and_drain) or no-op,
- *                     1 = async discard close requested (Rx lcore owns it)
+ * @return             0 always (idempotent; no-op if not registered)
  */
 int dpu_buffer_begin_close(dpu_buffer_ctx_t *ctx,
                            uint32_t hw_rule_id);
 
 /**
- * Quiesce, drain (or discard), and mark a flow CLOSED.
- * Used for DROP/DELETE paths (begin_close → quiesce_and_drain).
- *
- * Spins until the Rx lcore's in-flight sequence counters converge
- * (enq_seq == deq_seq, stability-checked), then drains the ring.
- *
- * If @p discard is false, drained DL packets are SW-encapped and Tx'd
- * on N3 (the same path used for the FORW handover).  If @p discard is
- * true, drained packets are freed (DROP / DELETE).
- *
- * On quiesce timeout (100 ms), returns -1 and leaves the flow in
- * CLOSING state — the caller must NOT free or reuse the flow.
- *
- * @param ctx          Buffer context
- * @param hw_rule_id   Globally unique rule ID
- * @param discard      true = free drained packets; false = SW-encap + Tx
- * @return             Number of packets drained, or -1 on timeout / error
- */
-int dpu_buffer_quiesce_and_drain(dpu_buffer_ctx_t *ctx,
-                                 uint32_t hw_rule_id,
-                                 bool discard);
-
-/**
  * Buffer Rx loop — runs on a dedicated lcore.
  * Receives packets from ARM Rx queues, identifies the flow via pkt_meta,
- * and enqueues into per-flow bounded ring buffers (ACTIVE/CLOSING state).
+ * and enqueues into per-flow bounded ring buffers (ACTIVE state).
  *
  * For DRAINING flows (BUFF→FORW), the loop:
  *   Phase 1: drains old ring packets in bounded chunks (no-traffic path)
