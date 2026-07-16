@@ -62,6 +62,7 @@
 /* Used for buffering */
 #define INLINE_DRAIN_BATCH       8    /* pkts drained per INLINE (FORW)  */
 #define DRAIN_CHUNK             64    /* max pkts dequeued per drain call */
+#define FAR_ACTION_MASK          0x07
 
 uint64_t seid = 0;
 uint16_t pdrId = 0;
@@ -281,6 +282,50 @@ GetPdrByTeid(struct rte_mbuf *pkt, const gtp_parse_result_t *gtp_info) {
     return pdr;
 }
 
+static inline UPDK_PDR *
+GetPdrByPlainDlIp(struct rte_mbuf *pkt, int32_t sess_idx) {
+    if (rte_pktmbuf_data_len(pkt) < sizeof(struct rte_ipv4_hdr))
+        return NULL;
+
+    struct rte_ipv4_hdr *ip = rte_pktmbuf_mtod(pkt, struct rte_ipv4_hdr *);
+    if ((ip->version_ihl >> 4) != 4)
+        return NULL;
+
+    uint8_t ihl = (ip->version_ihl & 0x0F) * 4;
+    if (ihl < sizeof(struct rte_ipv4_hdr) || rte_pktmbuf_data_len(pkt) < ihl)
+        return NULL;
+
+    uint16_t sp = 0, dp = 0;
+    if ((ip->next_proto_id == IPPROTO_UDP || ip->next_proto_id == IPPROTO_TCP) &&
+        rte_pktmbuf_data_len(pkt) >= ihl + sizeof(struct rte_udp_hdr)) {
+        struct rte_udp_hdr *l4 =
+            rte_pktmbuf_mtod_offset(pkt, struct rte_udp_hdr *, ihl);
+        sp = rte_be_to_cpu_16(l4->src_port);
+        dp = rte_be_to_cpu_16(l4->dst_port);
+    }
+
+    ps_packet_t key = {0};
+    key.src_ip    = rte_be_to_cpu_32(ip->src_addr);
+    key.dst_ip    = rte_be_to_cpu_32(ip->dst_addr);
+    key.ue_ip     = key.dst_ip;
+    key.src_port  = sp;
+    key.dst_port  = dp;
+    key.proto     = ip->next_proto_id;
+    key.tos_tc    = ip->type_of_service;
+    key.teid      = 0;
+    key.qfi       = 0;
+    key.ni_hash   = 0;
+    key.source_if = SRC_IF_CORE;
+    key.is_uplink = false;
+
+    UPDK_PDR *pdr = (UPDK_PDR *)UpfClassifyGetPdrPtr(&key);
+    if (!pdr || pdr->session_index != sess_idx)
+        return NULL;
+
+    ConfigureQerFlows(pdr, false);
+    return pdr;
+}
+
 /* Populate UE table using the already-classified UPDK_PDR (no session/pdr_list scan)*/
 static inline int
 GetQerByUEIpAddressFromPdr(uint32_t ue_ip, const UPDK_PDR *pdr, const char *ip_str)
@@ -384,7 +429,6 @@ static int
 HandlePacketWithFar(struct rte_mbuf *pkt, UPDK_FAR *far, UPDK_QER *qer, 
                     uint16_t out_port, struct onvm_pkt_meta *meta) {
     int buff = 0;
-#define FAR_ACTION_MASK 0x07
     if (far->flags.applyAction) {
         switch (far->applyAction & FAR_ACTION_MASK) {
             case UPDK_FAR_APPLY_ACTION_DROP:
@@ -452,31 +496,75 @@ drain_session_batch(int sess_idx, uint32_t max_pkts, struct onvm_nf *nf) {
 
     struct onvm_configuration *onvm_config = onvm_nflib_get_onvm_config();
     struct rte_mbuf *drain_buf[DRAIN_CHUNK];
-    uint32_t total = 0;
+    uint32_t processed = 0;
+    uint32_t sent = 0;
 
-    while (total < max_pkts) {
-        uint32_t want = max_pkts - total;
+    while (processed < max_pkts) {
+        uint32_t want = max_pkts - processed;
         if (want > DRAIN_CHUNK) want = DRAIN_CHUNK;
         uint32_t n = rte_ring_sc_dequeue_burst(sb->ring,
                         (void **)drain_buf, want, NULL);
         if (n == 0) break;
+        processed += n;
 
-        /* Restore action to OUT so onvm_pkt_process_tx_batch sends them */
+        uint32_t tx_count = 0;
         for (uint32_t j = 0; j < n; j++) {
+            struct rte_mbuf *pkt = drain_buf[j];
             struct onvm_pkt_meta *m =
-                onvm_get_pkt_meta(drain_buf[j],
-                                  onvm_config->dynfield_offset);
+                onvm_get_pkt_meta(pkt, onvm_config->dynfield_offset);
+
+            UPDK_PDR *pdr = GetPdrByPlainDlIp(pkt, sess_idx);
+            UPDK_FAR *far = pdr ? pdr->far : NULL;
+            if (!far || ((far->applyAction & FAR_ACTION_MASK) != UPDK_FAR_APPLY_ACTION_FORW)) {
+                UTLT_Warning("sess %d drain: no current FORW FAR for buffered pkt", sess_idx);
+                rte_pktmbuf_free(pkt);
+                continue;
+            }
+
+            if (!far->flags.forwardingParameters ||
+                !far->forwardingParameters.flags.outerHeaderCreation) {
+                UTLT_Error("sess %d drain: FORW FAR has no outer header creation", sess_idx);
+                rte_pktmbuf_free(pkt);
+                continue;
+            }
+
+            UPDK_OuterHeaderCreation *ohc =
+                &far->forwardingParameters.outerHeaderCreation;
+            if (ohc->description !=
+                UPDK_OUTER_HEADER_CREATION_DESCRIPTION_GTPU_UDP_IPV4) {
+                UTLT_Error("sess %d drain: unsupported outer header creation %u",
+                           sess_idx, ohc->description);
+                rte_pktmbuf_free(pkt);
+                continue;
+            }
+
+            Encap(pkt, far, pdr->qer);
+
+            uint32_t gnb_n3_ip_be = g_nat_enabled
+                ? g_an_peer_n3_ip_be
+                : ohc->ipv4.s_addr;
+
+            if (attach_l2_or_arp(pkt, g_n3_port, g_n3_ip_be, gnb_n3_ip_be, nf) < 0) {
+                m->action = ONVM_NF_ACTION_DROP;
+                rte_pktmbuf_free(pkt);
+                continue;
+            }
+
+            m->destination = g_n3_port;
             m->action = ONVM_NF_ACTION_OUT;
+            drain_buf[tx_count++] = pkt;
         }
 
-        onvm_pkt_process_tx_batch(nf->nf_tx_mgr, drain_buf,
-                                  onvm_config->dynfield_offset, n, nf);
-        onvm_pkt_flush_all_nfs(nf->nf_tx_mgr, nf);
-        total += n;
+        if (tx_count > 0) {
+            onvm_pkt_process_tx_batch(nf->nf_tx_mgr, drain_buf,
+                                      onvm_config->dynfield_offset, tx_count, nf);
+            onvm_pkt_flush_all_nfs(nf->nf_tx_mgr, nf);
+            sent += tx_count;
+        }
     }
     if (rte_ring_count(sb->ring) == 0)
         sb->touched = 0;
-    return total;
+    return sent;
 }
 
 static int
@@ -633,6 +721,27 @@ packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm_nf_
             goto dl_nocp;
         }
 
+        if (far_action == UPDK_FAR_APPLY_ACTION_BUFF) {
+            /* Buffer plain inner-IP packet; GTP-U/L2 are rebuilt after drain
+             * with the latest FAR, which is required during handover. */
+            sb->is_buffering = 1;
+
+            /* Enqueue into session ring.
+             * Bump refcnt so the framework's rte_pktmbuf_free (DROP below)
+             * only decrements 2→1 — the ring holds the other reference. */
+            rte_mbuf_refcnt_update(pkt, 1);
+            int enqueue_rc = rte_ring_sp_enqueue(sb->ring, pkt);
+            if (enqueue_rc != 0) {
+                rte_mbuf_refcnt_update(pkt, -1);
+                meta->action = ONVM_NF_ACTION_DROP;
+                goto dl_nocp;
+            }
+
+            sb->touched = 1;
+            meta->action = ONVM_NF_ACTION_DROP;
+            goto dl_nocp;
+        }
+
         /* Encap (GTP-U outer header) */
         if (far->flags.forwardingParameters &&
             far->forwardingParameters.flags.outerHeaderCreation) {
@@ -643,38 +752,18 @@ packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm_nf_
                 Encap(pkt, far, pdr->qer);
         }
 
-        uint32_t gnb_n3_ip_be = g_nat_enabled 
+        uint32_t gnb_n3_ip_be = g_nat_enabled
             ? g_an_peer_n3_ip_be
             : far->forwardingParameters.outerHeaderCreation.ipv4.s_addr;
         UTLT_Trace("gNB N3 IP: %s\n", convertToIpAddressString(gnb_n3_ip_be));
 
-        // Regardless of BUFF vs FORW, we need to attach L2 (or ARP) header
-        // before sending to N3 port.
+        // Attach L2 (or ARP) header before sending to N3 port.
         if (attach_l2_or_arp(pkt, g_n3_port, g_n3_ip_be, gnb_n3_ip_be,
                             nf_local_ctx->nf) < 0) {
-            meta->action = ONVM_NF_ACTION_DROP;   /* or buffer */
+            meta->action = ONVM_NF_ACTION_DROP;
             return 0;
         }
         meta->destination = g_n3_port; // DL always goes to N3 port after FAR processing (may be modified by QoS policing below)
-
-        if (far_action == UPDK_FAR_APPLY_ACTION_BUFF) {
-            /* Buffer-only: prepare packet for later TX, enqueue, then DROP */
-            sb->is_buffering = 1;
-
-            /* Enqueue into session ring.
-             * Bump refcnt so the framework's rte_pktmbuf_free (DROP below)
-             * only decrements 2→1 — the ring holds the other reference. */
-            rte_mbuf_refcnt_update(pkt, 1);
-            if (rte_ring_sp_enqueue(sb->ring, pkt) != 0) {
-                rte_mbuf_refcnt_update(pkt, -1);
-                meta->action = ONVM_NF_ACTION_DROP;
-                goto dl_nocp;
-            }
-
-            sb->touched = 1;
-            meta->action = ONVM_NF_ACTION_DROP;
-            goto dl_nocp;
-        }
 
         /* QoS policing — FORW only */
         if (far_action == UPDK_FAR_APPLY_ACTION_FORW) {
