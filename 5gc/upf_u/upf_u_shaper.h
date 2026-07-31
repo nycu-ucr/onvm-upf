@@ -62,9 +62,10 @@ upf_u_shaper_build_dl_flow_key(struct rte_mbuf *pkt, const UPDK_PDR *pdr,
                                uint32_t ue_ip, bool is_qos,
                                struct upf_u_shaper_flow_key *key);
 
-uint32_t
+bool
 upf_u_shaper_dl_packet_len(struct rte_mbuf *pkt,
-                           const struct rte_ipv4_hdr *iph);
+                           const struct rte_ipv4_hdr *iph,
+                           uint32_t *metered_len);
 
 enum upf_u_shaper_decision
 upf_u_shaper_shape_or_enqueue(int ue_idx,

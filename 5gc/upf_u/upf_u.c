@@ -568,6 +568,7 @@ packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm_nf_
     }
 
     uint32_t cal_pktlen = 0;
+    bool cal_pktlen_valid = false;
     UTLT_Trace("Get packet\n");
     UTLT_Info("Handle PKT from port: %d [len: %d]", pkt->port, pkt->pkt_len);
 
@@ -580,7 +581,8 @@ packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm_nf_
         UTLT_Info("Not IP packet, ignore it\n");
         return 0;
     }
-    cal_pktlen = upf_u_shaper_dl_packet_len(pkt, iph);
+    cal_pktlen_valid =
+        upf_u_shaper_dl_packet_len(pkt, iph, &cal_pktlen);
 
     // Flip to a newly published snapshot if a REQ was received
     UpfClsMaybeFlipAndAck();
@@ -644,6 +646,13 @@ packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm_nf_
 
     if (is_dl) {
         ue_key = rte_cpu_to_be_32(iph->dst_addr);
+        if (!cal_pktlen_valid) {
+            UTLT_Warning("Invalid DL IPv4/L4 length for UE %s, drop",
+                         convertToIpAddressString(iph->dst_addr));
+            meta->action = ONVM_NF_ACTION_DROP;
+            return 0;
+        }
+        owner_session = UpfSessionFindByUeIP(ue_key);
         ue_idx = findIndexByUeIpAddress(ue_key);
         if (ue_idx < 0) {
             ue_idx = GetQerByUEIpAddressFromPdr(ue_key, owner_session, pdr,
@@ -979,9 +988,15 @@ static uint64_t last_p = 0;
 
 static int
 callback_handler(struct onvm_nf_local_ctx *nf_local_ctx) {
+    struct onvm_nf *nf;
+    uint64_t cur_p;
+
+    if (unlikely(nf_local_ctx == NULL || nf_local_ctx->nf == NULL))
+        return 0;
+
+    nf = nf_local_ctx->nf;
     if (unlikely(!last_p)) last_p = rte_get_tsc_cycles();
-    uint64_t cur_p = rte_get_tsc_cycles();
-    struct onvm_nf *nf = nf_local_ctx->nf;
+    cur_p = rte_get_tsc_cycles();
 
     upf_u_shaper_drain(nf);
 
