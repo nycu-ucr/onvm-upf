@@ -293,7 +293,10 @@ trtcm_bucket_depth(uint32_t rate_kbps) {
 static inline void
 shaper_update_bucket_tokens(struct tb_config *tb, uint64_t cur_cycles) {
     uint64_t elapsed_cycles;
+    uint64_t cycles_used;
+    uint64_t tsc_hz;
     uint64_t tokens_produced;
+    __uint128_t byte_rate;
     __uint128_t produced;
 
     if (tb->tb_rate == 0 || tb->tb_depth == 0) {
@@ -309,17 +312,26 @@ shaper_update_bucket_tokens(struct tb_config *tb, uint64_t cur_cycles) {
     }
 
     elapsed_cycles = cur_cycles - tb->last_cycle;
-    produced = ((__uint128_t)elapsed_cycles * tb->tb_rate * 125) /
-               rte_get_tsc_hz();
+    tsc_hz = rte_get_tsc_hz();
+    byte_rate = (__uint128_t)tb->tb_rate * 125;
+    produced = ((__uint128_t)elapsed_cycles * byte_rate) / tsc_hz;
     tokens_produced = produced > UINT64_MAX ? UINT64_MAX :
                       (uint64_t)produced;
     if (tokens_produced == 0)
         return;
 
-    tb->tb_tokens += tokens_produced;
-    if (tb->tb_tokens > tb->tb_depth)
+    if (tokens_produced >= tb->tb_depth - tb->tb_tokens) {
         tb->tb_tokens = tb->tb_depth;
-    tb->last_cycle = cur_cycles;
+        tb->last_cycle = cur_cycles;
+        return;
+    }
+
+    tb->tb_tokens += tokens_produced;
+    cycles_used = (uint64_t)(((__uint128_t)tokens_produced * tsc_hz) /
+                             byte_rate);
+    if (cycles_used == 0)
+        cycles_used = 1;
+    tb->last_cycle += cycles_used;
 }
 
 static inline bool
