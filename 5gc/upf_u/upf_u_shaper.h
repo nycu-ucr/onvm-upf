@@ -22,6 +22,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+#include <rte_ip.h>
 #include <rte_mbuf.h>
 
 #include "onvm_nflib.h"
@@ -60,6 +61,10 @@ bool
 upf_u_shaper_build_dl_flow_key(struct rte_mbuf *pkt, const UPDK_PDR *pdr,
                                uint32_t ue_ip, bool is_qos,
                                struct upf_u_shaper_flow_key *key);
+
+uint32_t
+upf_u_shaper_dl_packet_len(struct rte_mbuf *pkt,
+                           const struct rte_ipv4_hdr *iph);
 
 enum upf_u_shaper_decision
 upf_u_shaper_shape_or_enqueue(int ue_idx,

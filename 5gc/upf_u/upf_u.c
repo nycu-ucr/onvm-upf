@@ -516,7 +516,6 @@ packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm_nf_
     uint32_t cal_pktlen = 0;
     UTLT_Trace("Get packet\n");
     UTLT_Info("Handle PKT from port: %d [len: %d]", pkt->port, pkt->pkt_len);
-    cal_pktlen = pkt->pkt_len - sizeof(struct rte_ether_hdr) - sizeof(struct rte_ipv4_hdr) - sizeof(struct rte_udp_hdr);
 
     bool is_dl = false;
     meta->action = ONVM_NF_ACTION_DROP;
@@ -527,6 +526,7 @@ packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm_nf_
         UTLT_Info("Not IP packet, ignore it\n");
         return 0;
     }
+    cal_pktlen = upf_u_shaper_dl_packet_len(pkt, iph);
 
     // Flip to a newly published snapshot if a REQ was received
     UpfClsMaybeFlipAndAck();

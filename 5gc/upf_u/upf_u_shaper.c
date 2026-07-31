@@ -810,6 +810,61 @@ upf_u_shaper_build_dl_flow_key(struct rte_mbuf *pkt, const UPDK_PDR *pdr,
     return true;
 }
 
+uint32_t
+upf_u_shaper_dl_packet_len(struct rte_mbuf *pkt,
+                           const struct rte_ipv4_hdr *iph) {
+    uint16_t ip_total_len;
+    uint16_t ip_hdr_len;
+    uint16_t l4_payload_len;
+    uint16_t l4_off;
+    uint32_t pkt_len;
+
+    if (pkt == NULL || iph == NULL)
+        return 0;
+
+    ip_hdr_len = (uint16_t)((iph->version_ihl & 0x0f) * 4);
+    ip_total_len = rte_be_to_cpu_16(iph->total_length);
+    pkt_len = rte_pktmbuf_pkt_len(pkt);
+
+    if (ip_hdr_len < sizeof(struct rte_ipv4_hdr) ||
+        ip_total_len < ip_hdr_len ||
+        pkt_len < sizeof(struct rte_ether_hdr) + ip_hdr_len)
+        return 0;
+
+    l4_payload_len = ip_total_len - ip_hdr_len;
+    l4_off = sizeof(struct rte_ether_hdr) + ip_hdr_len;
+
+    if (iph->next_proto_id == IPPROTO_UDP) {
+        if (l4_payload_len >= sizeof(struct rte_udp_hdr) &&
+            pkt_len >= l4_off + sizeof(struct rte_udp_hdr))
+            return l4_payload_len - sizeof(struct rte_udp_hdr);
+        return l4_payload_len;
+    }
+
+    if (iph->next_proto_id == IPPROTO_TCP) {
+        struct rte_tcp_hdr tcp_hdr;
+        const struct rte_tcp_hdr *th;
+        uint16_t tcp_hdr_len;
+
+        if (l4_payload_len < sizeof(struct rte_tcp_hdr) ||
+            pkt_len < l4_off + sizeof(struct rte_tcp_hdr))
+            return l4_payload_len;
+
+        th = rte_pktmbuf_read(pkt, l4_off, sizeof(tcp_hdr), &tcp_hdr);
+        if (th == NULL)
+            return l4_payload_len;
+
+        tcp_hdr_len = (uint16_t)((th->data_off >> 4) * 4);
+        if (tcp_hdr_len < sizeof(struct rte_tcp_hdr) ||
+            tcp_hdr_len > l4_payload_len)
+            return l4_payload_len;
+
+        return l4_payload_len - tcp_hdr_len;
+    }
+
+    return l4_payload_len;
+}
+
 void
 upf_u_shaper_log_stats(void) {
     UTLT_Debug("shaper queued: %" PRIu64,
