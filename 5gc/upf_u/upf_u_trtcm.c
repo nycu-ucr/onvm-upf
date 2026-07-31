@@ -36,8 +36,9 @@ uint32_t iPFlowsLen = 0;
 uint32_t trTCMidx = 0;
 
 struct rte_meter_trtcm_profile app_trtcm_profile;
-struct rte_meter_trtcm_profile app_flow_trtcm_profile;
+struct rte_meter_trtcm_profile app_flow_trtcm_profiles[APP_FLOWS_MAX];
 struct rte_meter_trtcm app_flows[APP_FLOWS_MAX];
+static bool app_flow_has_gbr[APP_FLOWS_MAX];
 
 static struct ue_hash_entry ue_hash[MAX_UE];
 struct ue_tb ue_table[MAX_UE];
@@ -67,7 +68,10 @@ trtcmConfigFlowTables(void) {
 
     // config flow meters with trtcm profiles
     for (i = 0; i < APP_FLOWS_MAX; i++){
-        rtn = rte_meter_trtcm_config(&app_flows[i], &app_trtcm_profile);
+        app_flow_trtcm_profiles[i] = app_trtcm_profile;
+        app_flow_has_gbr[i] = true;
+        rtn = rte_meter_trtcm_config(&app_flows[i],
+                                     &app_flow_trtcm_profiles[i]);
         if (rtn)
             return rtn;
     }
@@ -77,22 +81,37 @@ trtcmConfigFlowTables(void) {
 }
 
 int
-trtcmColorHandle(uint32_t pkt_len, uint64_t time, uint8_t qfi, struct rte_meter_trtcm_profile *target_profile) {
+trtcmColorHandle(uint32_t pkt_len, uint64_t time, int flow_idx, struct rte_meter_trtcm_profile *target_profile) {
     uint8_t out_color = 0;
     // check configured flow
-    if (unlikely(app_trtcm_profile.cir_period == 0)) {
+    if (unlikely(flow_idx < 0 || flow_idx >= (int)APP_FLOWS_MAX ||
+                 target_profile == NULL)) {
+        UTLT_Info("flow index/profile set err");
+        return -1;
+    }
+    if (unlikely(target_profile->cir_period == 0)) {
         UTLT_Info("flow cir_period set err");
         return -1;
     }
-    if (unlikely(app_trtcm_profile.pir_period == 0)) {
+    if (unlikely(target_profile->pir_period == 0)) {
         UTLT_Info("flow pir_period set err");
         return -1;
     }
-    out_color = (uint8_t) rte_meter_trtcm_color_blind_check(&app_flows[qfi],
+    out_color = (uint8_t) rte_meter_trtcm_color_blind_check(&app_flows[flow_idx],
         target_profile,
         time,
         pkt_len);
+    if (!app_flow_has_gbr[flow_idx] && out_color == RTE_COLOR_GREEN)
+        out_color = RTE_COLOR_YELLOW;
     return out_color;
+}
+
+struct rte_meter_trtcm_profile *
+trtcmProfileForFlow(int flow_idx) {
+    if (unlikely(flow_idx < 0 || flow_idx >= (int)APP_FLOWS_MAX))
+        return NULL;
+
+    return &app_flow_trtcm_profiles[flow_idx];
 }
 
 int
@@ -342,35 +361,45 @@ ConfigureQerFlows(const UPDK_PDR *pdr, bool is_uplink) {
 
     /* Only add on first miss — subsequent packets for the same key are a no-op */
     if (ftSearch(key) >= 0) return;
+    if (unlikely(trTCMidx >= APP_FLOWS_MAX)) {
+        UTLT_Warning("TRTCM flow table full; cannot add key %u", key);
+        return;
+    }
 
     UTLT_Info("QER ID: %u key: %u", qer->qerId, key);
 
     struct rte_meter_trtcm_params trtcm_params = app_trtcm_params;
+    bool has_gbr = qer->flags.guaranteedBitrate;
 
     uint32_t mbr = is_uplink ? qer->maximumBitrate.ul : qer->maximumBitrate.dl;
     trtcm_params.pir = mbr * 1000 / 8;
 
-    if (qer->flags.guaranteedBitrate) {
+    if (has_gbr) {
         uint32_t gbr = is_uplink ? qer->guaranteedBitrate.ul : qer->guaranteedBitrate.dl;
         trtcm_params.cir = gbr * 1000 / 8;
     } else {
         trtcm_params.cir = 1;
     }
 
+    int rtn = rte_meter_trtcm_profile_config(&app_flow_trtcm_profiles[trTCMidx],
+                                             &trtcm_params);
+    if (rtn) {
+        UTLT_Warning("TRTCM profile config failed for key %u: %d", key, rtn);
+        return;
+    }
+    rtn = rte_meter_trtcm_config(&app_flows[trTCMidx],
+                                 &app_flow_trtcm_profiles[trTCMidx]);
+    if (rtn) {
+        UTLT_Warning("TRTCM flow config failed for key %u: %d", key, rtn);
+        return;
+    }
+    app_flow_has_gbr[trTCMidx] = has_gbr;
+
     if (!ftAddEntry(key, trTCMidx)) {
         UTLT_Warning("FT add failed");
+        return;
     }
     UTLT_Info("Successfully add %u(%d) %u", key, hashFunc(key), trTCMidx);
-
-    // Match config profile to what color-check later uses:
-    // SDF present (has_fd) → app_flow_trtcm_profile; else app_trtcm_profile
-    if (has_fd) {
-        rte_meter_trtcm_profile_config(&app_flow_trtcm_profile, &trtcm_params);
-        rte_meter_trtcm_config(&app_flows[trTCMidx], &app_flow_trtcm_profile);
-    } else {
-        rte_meter_trtcm_profile_config(&app_trtcm_profile, &trtcm_params);
-        rte_meter_trtcm_config(&app_flows[trTCMidx], &app_trtcm_profile);
-    }
 
     if (is_uplink) {
         UTLT_Info("Find MBR (UL: %lu) in QERs", qer->maximumBitrate.ul);

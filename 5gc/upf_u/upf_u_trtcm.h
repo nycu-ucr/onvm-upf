@@ -76,7 +76,7 @@ extern uint32_t iPFlowsLen;
 extern uint32_t trTCMidx;
 
 extern struct rte_meter_trtcm_profile app_trtcm_profile;
-extern struct rte_meter_trtcm_profile app_flow_trtcm_profile;
+extern struct rte_meter_trtcm_profile app_flow_trtcm_profiles[APP_FLOWS_MAX];
 extern struct rte_meter_trtcm app_flows[APP_FLOWS_MAX];
 
 extern struct rte_meter_trtcm_params app_trtcm_params;
@@ -87,7 +87,10 @@ int
 trtcmConfigFlowTables(void);
 
 int
-trtcmColorHandle(uint32_t pkt_len, uint64_t time, uint8_t qfi, struct rte_meter_trtcm_profile *target_profile);
+trtcmColorHandle(uint32_t pkt_len, uint64_t time, int flow_idx, struct rte_meter_trtcm_profile *target_profile);
+
+struct rte_meter_trtcm_profile *
+trtcmProfileForFlow(int flow_idx);
 
 int
 trtcmPolicer(struct onvm_pkt_meta *meta, int color_result);

@@ -700,12 +700,11 @@ packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm_nf_
             int color_result = 0;
             bool isQos = false;
             uint64_t curr_time = rte_get_tsc_cycles();
-            struct rte_meter_trtcm_profile *trtcm_profile = NULL;
 
             if (pdr->has_fd) {
                 isQos = true;
-                trtcm_profile = &app_flow_trtcm_profile;
                 int ft_idx = ftSearch(pdr->meter_key);
+                struct rte_meter_trtcm_profile *trtcm_profile;
                 if (unlikely(ft_idx < 0 || ft_idx >= (int)APP_FLOWS_MAX)) {
                     UTLT_Warning("DL QoS: no trTCM flow for meter_key=%u (ft_idx=%d) pdr=%u seid=%lu; dropping",
                                  pdr->meter_key, ft_idx, pdr->pdrId, seid);
@@ -713,8 +712,21 @@ packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm_nf_
                     meta->action = ONVM_NF_ACTION_DROP;
                     goto dl_nocp;
                 }
+                trtcm_profile = trtcmProfileForFlow(ft_idx);
+                if (unlikely(trtcm_profile == NULL)) {
+                    UTLT_Warning("DL QoS: no trTCM profile for meter_key=%u ft_idx=%d pdr=%u seid=%lu; dropping",
+                                 pdr->meter_key, ft_idx, pdr->pdrId, seid);
+                    meta->flags = RTE_COLOR_RED;
+                    meta->action = ONVM_NF_ACTION_DROP;
+                    goto dl_nocp;
+                }
                 color_result = trtcmColorHandle(cal_pktlen, curr_time,
                                                 ft_idx, trtcm_profile);
+                if (unlikely(color_result < 0)) {
+                    meta->flags = RTE_COLOR_RED;
+                    meta->action = ONVM_NF_ACTION_DROP;
+                    goto dl_nocp;
+                }
                 // set the meta action to out for now, and trtcmPolicer will update it to drop if color is red
                 meta->action = ONVM_NF_ACTION_OUT;
                 if (trtcmPolicer(meta, color_result) > 0)
@@ -826,8 +838,22 @@ packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm_nf_
                     }
 
                     uint64_t curr_time = rte_get_tsc_cycles();
+                    struct rte_meter_trtcm_profile *trtcm_profile =
+                        trtcmProfileForFlow(ft_idx);
+                    if (unlikely(trtcm_profile == NULL)) {
+                        UTLT_Warning("UL QoS: no trTCM profile for meter_key=%u ft_idx=%d pdr=%u seid=%lu; dropping",
+                                    pdr->meter_key, ft_idx, pdr->pdrId, seid);
+                        meta->flags = RTE_COLOR_RED;
+                        meta->action = ONVM_NF_ACTION_DROP;
+                        return 0;
+                    }
                     int color_result = trtcmColorHandle(pkt->pkt_len, curr_time,
-                                                        ft_idx, &app_flow_trtcm_profile);
+                                                        ft_idx, trtcm_profile);
+                    if (unlikely(color_result < 0)) {
+                        meta->flags = RTE_COLOR_RED;
+                        meta->action = ONVM_NF_ACTION_DROP;
+                        return 0;
+                    }
                     if (trtcmPolicer(meta, color_result) > 0)
                         UTLT_Error("UL trTCM Policer error");
 
