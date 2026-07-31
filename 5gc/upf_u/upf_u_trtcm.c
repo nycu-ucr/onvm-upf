@@ -29,7 +29,8 @@
 #include "../classifiers/classifier_wrapper.h"
 
 #define MIN_TOKEN_BUCKET_DEPTH 2048
-#define TOKEN_BUCKET_BURST_MS 10
+#define TOKEN_BUCKET_BURST_MS 100
+#define TRTCM_BURST_MS 100
 
 flow_entry_t iPFlows[APP_FLOWS_MAX];
 uint32_t iPFlowsLen = 0;
@@ -277,6 +278,18 @@ shaper_bucket_depth(uint32_t rate_kbps) {
            MIN_TOKEN_BUCKET_DEPTH : depth_bytes;
 }
 
+static inline uint64_t
+trtcm_bucket_depth(uint32_t rate_kbps) {
+    uint64_t depth_bytes;
+
+    if (rate_kbps == 0)
+        return MIN_TOKEN_BUCKET_DEPTH;
+
+    depth_bytes = ((uint64_t)rate_kbps * TRTCM_BURST_MS + 7) / 8;
+    return depth_bytes < MIN_TOKEN_BUCKET_DEPTH ?
+           MIN_TOKEN_BUCKET_DEPTH : depth_bytes;
+}
+
 static inline void
 shaper_update_bucket_tokens(struct tb_config *tb, uint64_t cur_cycles) {
     uint64_t elapsed_cycles;
@@ -372,13 +385,16 @@ ConfigureQerFlows(const UPDK_PDR *pdr, bool is_uplink) {
     bool has_gbr = qer->flags.guaranteedBitrate;
 
     uint32_t mbr = is_uplink ? qer->maximumBitrate.ul : qer->maximumBitrate.dl;
-    trtcm_params.pir = mbr * 1000 / 8;
+    trtcm_params.pir = (uint64_t)mbr * 1000 / 8;
+    trtcm_params.pbs = trtcm_bucket_depth(mbr);
 
     if (has_gbr) {
         uint32_t gbr = is_uplink ? qer->guaranteedBitrate.ul : qer->guaranteedBitrate.dl;
-        trtcm_params.cir = gbr * 1000 / 8;
+        trtcm_params.cir = (uint64_t)gbr * 1000 / 8;
+        trtcm_params.cbs = trtcm_bucket_depth(gbr);
     } else {
         trtcm_params.cir = 1;
+        trtcm_params.cbs = MIN_TOKEN_BUCKET_DEPTH;
     }
 
     int rtn = rte_meter_trtcm_profile_config(&app_flow_trtcm_profiles[trTCMidx],
@@ -411,9 +427,11 @@ ConfigureQerFlows(const UPDK_PDR *pdr, bool is_uplink) {
             UTLT_Info("Find GBR (DL: %lu) in QERs", qer->guaranteedBitrate.dl);
     }
 
-    UTLT_Info("TRTCM params: %d %d %d %d\n",
-              trtcm_params.cir, trtcm_params.pir,
-              trtcm_params.cbs, trtcm_params.pbs);
+    UTLT_Info("TRTCM params: %lu %lu %lu %lu\n",
+              (unsigned long)trtcm_params.cir,
+              (unsigned long)trtcm_params.pir,
+              (unsigned long)trtcm_params.cbs,
+              (unsigned long)trtcm_params.pbs);
 
     trTCMidx++;
 }

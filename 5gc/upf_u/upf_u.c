@@ -63,7 +63,7 @@
 
 /* Used for buffering */
 #define INLINE_DRAIN_BATCH       8    /* pkts drained per INLINE (FORW)  */
-#define DRAIN_CHUNK             64    /* max pkts dequeued per drain call */
+#define DRAIN_CHUNK             128   /* max pkts dequeued per drain call */
 
 uint64_t seid = 0;
 uint16_t pdrId = 0;
