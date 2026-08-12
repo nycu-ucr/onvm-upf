@@ -273,19 +273,33 @@ sudo rm -rf /mnt/huge/rtemap_*
 # watch out for variable expansion
 # shellcheck disable=SC2086
 
-ALLOW_LIST="${ONVM_ALLOW_LIST:-0000:08:00.0 0000:09:00.0}"
+if [ -n "${ONVM_AF_PACKET_ACCESS_IFACE:-}" ]; then
+    # AF_PACKET mode (kernel ifaces / bridges): used on FABRIC and the
+    # single-node namespace testbed.
+    ACCESS_IFACE="${ONVM_AF_PACKET_ACCESS_IFACE}"
+    CORE_IFACE="${ONVM_AF_PACKET_CORE_IFACE:?ONVM_AF_PACKET_CORE_IFACE must be set with ONVM_AF_PACKET_ACCESS_IFACE}"
+    VDEV_ARGS="--no-pci --vdev=net_af_packet0,iface=${ACCESS_IFACE} --vdev=net_af_packet1,iface=${CORE_IFACE}"
+    echo "INFO: AF_PACKET mode: access=${ACCESS_IFACE} core=${CORE_IFACE}"
+    sudo ./build/onvm/onvm_mgr/onvm_mgr \
+        -l "$cpu" -n 4 --proc-type=primary \
+        ${VDEV_ARGS} \
+        ${virt_addr} \
+        -- -p ${ports} -n ${nf_cores} ${num_srvc} ${def_srvc} ${stats} ${stats_sleep_time} ${verbosity_level} ${ttl} ${packet_limit} ${shared_cpu_flag} ${jumbo_frames_flag}
+else
+    # PCI mode (DPDK PMD / bifurcated mlx5)
+    ALLOW_LIST="${ONVM_ALLOW_LIST:-0000:08:00.0 0000:09:00.0}"
 
-allow_args=()
-for dev in $ALLOW_LIST; do
-    allow_args+=(--allow "$dev")
-done
+    allow_args=()
+    for dev in $ALLOW_LIST; do
+        allow_args+=(--allow "$dev")
+    done
 
-# echo "Using PCI allow list: ${allow_args[*]}"
-sudo ./build/onvm/onvm_mgr/onvm_mgr \
-    -l "$cpu" -n 4 --proc-type=primary \
-    "${allow_args[@]}" \
-    ${virt_addr} \
-    -- -p ${ports} -n ${nf_cores} ${num_srvc} ${def_srvc} ${stats} ${stats_sleep_time} ${verbosity_level} ${ttl} ${packet_limit} ${shared_cpu_flag} ${jumbo_frames_flag}
+    sudo ./build/onvm/onvm_mgr/onvm_mgr \
+        -l "$cpu" -n 4 --proc-type=primary \
+        "${allow_args[@]}" \
+        ${virt_addr} \
+        -- -p ${ports} -n ${nf_cores} ${num_srvc} ${def_srvc} ${stats} ${stats_sleep_time} ${verbosity_level} ${ttl} ${packet_limit} ${shared_cpu_flag} ${jumbo_frames_flag}
+fi
 
 if [ "${stats}" = "-s web" ]
 then

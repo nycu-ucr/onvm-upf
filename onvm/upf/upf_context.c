@@ -47,6 +47,172 @@ upf_cls_ctrl_t *g_upf_cls_ctrl = NULL;
 
 list_t *g_all_pdr_list = NULL;
 
+static int
+UpfSessionFindDlPathSlot(const UpfSession *session, uint32_t far_id) {
+    if (!session) {
+        return -1;
+    }
+
+    for (uint8_t i = 0; i < session->dl_paths.count; i++) {
+        if (session->dl_paths.entries[i].far_id == far_id) {
+            return (int)i;
+        }
+    }
+
+    return -1;
+}
+
+bool UpfFarIsDlAccessCandidate(const UpfFAR *far) {
+    const UPDK_ForwardingParameters *forwarding;
+
+    if (!far) {
+        return false;
+    }
+    if (!far->flags.applyAction || !(far->applyAction & UPDK_FAR_APPLY_ACTION_FORW)) {
+        return false;
+    }
+    if (!far->flags.forwardingParameters) {
+        return false;
+    }
+
+    forwarding = &far->forwardingParameters;
+    if (!forwarding->flags.outerHeaderCreation) {
+        return false;
+    }
+    if (forwarding->flags.destinationInterface &&
+        forwarding->destinationInterface != UPDK_INTERFACE_VALUE_ACCESS) {
+        return false;
+    }
+    if (forwarding->outerHeaderCreation.description !=
+        UPDK_OUTER_HEADER_CREATION_DESCRIPTION_GTPU_UDP_IPV4) {
+        return false;
+    }
+
+    return true;
+}
+
+Status UpfSessionUpsertDlPathFromFar(UpfSession *session, const UpfFAR *far) {
+    int slot;
+    UpfDlPathEntry *entry;
+
+    UTLT_Assert(session, return STATUS_ERROR, "session not found");
+    UTLT_Assert(far, return STATUS_ERROR, "far not found");
+
+    if (!UpfFarIsDlAccessCandidate(far)) {
+        return UpfSessionRemoveDlPathByFarID(session, far->farId);
+    }
+
+    slot = UpfSessionFindDlPathSlot(session, far->farId);
+    if (slot < 0) {
+        if (session->dl_paths.count >= MAX_DL_PATHS) {
+            UTLT_Warning("DL path cache full for session=%d; cannot add FAR ID[%u]",
+                         session->index, far->farId);
+            return STATUS_ERROR;
+        }
+        slot = session->dl_paths.count++;
+    }
+
+    entry = &session->dl_paths.entries[slot];
+    entry->far_id = far->farId;
+    entry->teid = far->forwardingParameters.outerHeaderCreation.teid;
+    entry->outer_ip = far->forwardingParameters.outerHeaderCreation.ipv4;
+
+    {
+        char ipbuf[INET_ADDRSTRLEN];
+        UTLT_Info("DL path upsert: session=%d slot=%d far_id=%u outer_dst=%s teid=%u count=%u",
+                  session->index,
+                  slot,
+                  entry->far_id,
+                  inet_ntop(AF_INET, &entry->outer_ip, ipbuf, sizeof(ipbuf)) ? ipbuf : "invalid",
+                  entry->teid,
+                  session->dl_paths.count);
+    }
+
+    return STATUS_OK;
+}
+
+Status UpfSessionRemoveDlPathByFarID(UpfSession *session, uint32_t far_id) {
+    int slot;
+
+    UTLT_Assert(session, return STATUS_ERROR, "session not found");
+
+    slot = UpfSessionFindDlPathSlot(session, far_id);
+    if (slot < 0) {
+        return STATUS_OK;
+    }
+
+    if ((uint8_t)(slot + 1) < session->dl_paths.count) {
+        memmove(&session->dl_paths.entries[slot],
+                &session->dl_paths.entries[slot + 1],
+                sizeof(session->dl_paths.entries[0]) *
+                    (session->dl_paths.count - (uint8_t)(slot + 1)));
+    }
+
+    session->dl_paths.count--;
+    memset(&session->dl_paths.entries[session->dl_paths.count], 0,
+           sizeof(session->dl_paths.entries[session->dl_paths.count]));
+
+    UTLT_Info("DL path remove: session=%d far_id=%u count=%u",
+              session->index, far_id, session->dl_paths.count);
+
+    return STATUS_OK;
+}
+
+const UpfDlPathEntry *UpfSessionGetDlPathByHash(const UpfSession *session, uint32_t hash) {
+    if (!session || session->dl_paths.count == 0) {
+        return NULL;
+    }
+
+    return &session->dl_paths.entries[hash % session->dl_paths.count];
+}
+
+UpfFAR *UpfSessionSelectDlFarByHash(const UpfSession *session, UpfFAR *base_far,
+                                    uint32_t hash, UpfFAR *far_copy) {
+    const UpfDlPathEntry *selected_path;
+    uint32_t base_far_id;
+    bool copied = false;
+
+    if (!session || !base_far || session->dl_paths.count <= 1) {
+        return base_far;
+    }
+
+    base_far_id = base_far->farId;
+    selected_path = UpfSessionGetDlPathByHash(session, hash);
+    if (!selected_path) {
+        return base_far;
+    }
+
+    if (!(base_far->flags.forwardingParameters &&
+          base_far->forwardingParameters.flags.outerHeaderCreation)) {
+        return base_far;
+    }
+
+    if (base_far->forwardingParameters.outerHeaderCreation.teid != selected_path->teid ||
+        base_far->forwardingParameters.outerHeaderCreation.ipv4.s_addr != selected_path->outer_ip.s_addr) {
+        UTLT_Assert(far_copy, return base_far, "far_copy buffer is required for DL FAR override");
+        memcpy(far_copy, base_far, sizeof(*far_copy));
+        far_copy->forwardingParameters.outerHeaderCreation.teid = selected_path->teid;
+        far_copy->forwardingParameters.outerHeaderCreation.ipv4 = selected_path->outer_ip;
+        base_far = far_copy;
+        copied = true;
+    }
+
+    {
+        char ipbuf[INET_ADDRSTRLEN];
+        UTLT_Info("DL path select: session=%d hash=%u base_far_id=%u selected_far_id=%u outer_dst=%s teid=%u count=%u copied=%s",
+                  session->index,
+                  hash,
+                  base_far_id,
+                  selected_path->far_id,
+                  inet_ntop(AF_INET, &selected_path->outer_ip, ipbuf, sizeof(ipbuf)) ? ipbuf : "invalid",
+                  selected_path->teid,
+                  session->dl_paths.count,
+                  copied ? "yes" : "no");
+    }
+
+    return base_far;
+}
+
 
 void UpfPDRGlobalInit(void) {
     if (!g_all_pdr_list) {
@@ -269,6 +435,34 @@ Status UpfPDRRegisterToSession(UpfSession *session, UpfPDR *pdr) {
     UTLT_Assert(session->pdr_list, return STATUS_ERROR, "PDR list not initialized");
 
     list_rpush(session->pdr_list, list_node_new(pdr));
+
+    if (pdr->pdi.flags.fTeid) {
+        /* pdr->pdi.fTeid.teid is stored in host byte order after PFCP decode,
+           while session->teid_list and the TEID hash map use network byte order. */
+        uint32_t teid = rte_cpu_to_be_32(pdr->pdi.fTeid.teid);
+        UTLT_Info("UpfPDRRegisterToSession: session=%d pdr=%u host_teid=%u net_teid=%u teid_count=%u",
+                  session->index, pdr->pdrId, pdr->pdi.fTeid.teid, teid, session->teid_count);
+
+        /* Check if this TEID is already registered (e.g. during session establishment
+           where UpfSessionAdd already inserted the first PDR's TEID). */
+        bool already_registered = false;
+        for (int i = 0; i < session->teid_count; i++) {
+            if (session->teid_list[i] == teid) {
+                already_registered = true;
+                UTLT_Info("UpfPDRRegisterToSession: TEID already present in session at slot %d", i);
+                break;
+            }
+        }
+
+        if (!already_registered) {
+            UTLT_Info("Registering additional TEID %u for session (count=%d)",
+                      teid, session->teid_count);
+            UTLT_Assert(InsertTEIDtoSessionMap(teid, session) == STATUS_OK,
+                return STATUS_ERROR, "Failed to map TEID %u to session", teid);
+        }
+    }
+
+    return STATUS_OK;
 }
 
 Status UpfFARRegisterToSession(UpfSession *session, UpfFAR * far) {
@@ -276,6 +470,7 @@ Status UpfFARRegisterToSession(UpfSession *session, UpfFAR * far) {
     UTLT_Assert(session->far_list, return STATUS_ERROR, "FAR list not initialized");
 
     list_rpush(session->far_list, list_node_new(far));
+    return STATUS_OK;
 }
 
 Status UpfQERRegisterToSession(UpfSession *session, UpfQER *qer){
@@ -283,6 +478,7 @@ Status UpfQERRegisterToSession(UpfSession *session, UpfQER *qer){
     UTLT_Assert(session->qer_list, return STATUS_ERROR, "QER list not initialized");
 
     list_rpush(session->qer_list, list_node_new(qer));
+    return STATUS_OK;
 }
 
 UpfPDR *UpfPDRFindByID(UpfSession *session, uint16_t id) {
@@ -356,11 +552,16 @@ UpfSession *UpfSessionAdd(PfcpUeIpAddr *ueIp,
     session->pdr_list = list_new();
     session->far_list = list_new();
     session->qer_list = list_new();
+    memset(&session->dl_paths, 0, sizeof(session->dl_paths));
     // DumpUpfSession();
     //use to check srr flag
     session->srr_flag = false;
 
-    session->teid = rte_cpu_to_be_32(teid->teid);
+    session->teid_count = 0;
+    /* The PFCP parser leaves F-TEID in network byte order here. Keep that
+       representation so it matches session->teid_list and the TEID hash map. */
+    uint32_t first_teid = teid->teid;
+    UTLT_Info("UpfSessionAdd: session=%d first_teid_raw=%u", session->index, first_teid);
     session->pdn.paa.pdnType = pdnType;
     if (pdnType == PFCP_PDN_TYPE_IPV4) {
         session->ueIpv4.addr4.s_addr = rte_cpu_to_be_32(ueIp->addr4.s_addr);
@@ -369,8 +570,8 @@ UpfSession *UpfSessionAdd(PfcpUeIpAddr *ueIp,
         UTLT_Assert(0, return NULL, "UnSupported PDN Type(%d)", pdnType);
     }
 
-    UTLT_Assert(InsertTEIDtoSessionMap(session->teid, session) == STATUS_OK,
-                UpfSessionRemove(session); return NULL, "Unable to create Uplink data for TEID (%u)", session->teid);
+    UTLT_Assert(InsertTEIDtoSessionMap(first_teid, session) == STATUS_OK,
+                UpfSessionRemove(session); return NULL, "Unable to create Uplink data for TEID (%u)", first_teid);
     UTLT_Assert(InsertUEIPtoSessionMap(session->ueIpv4.addr4.s_addr, session) == STATUS_OK,
                 UpfSessionRemove(session); return NULL, "Unable to create Downlink data for UE IP (%u)", ueIp->addr4.s_addr);
 
@@ -391,15 +592,26 @@ Status UpfSessionRemove(UpfSession *session) {
         UpfSessBufRingDestroy(session->index);
     }
 
-    if (!session->far_list) {
+    /* NR-DC: clear the session DL-path cache */
+    memset(&session->dl_paths, 0, sizeof(session->dl_paths));
+
+    /* Note: guard polarity fixed (upstream had `!session->far_list`) */
+    if (session->far_list) {
         list_destroy(session->far_list);
     }
 
-    if (!session->pdr_list) {
+    if (session->pdr_list) {
         list_destroy(session->pdr_list);
     }
     UeIpToUpfSessionMapFree(session->ueIpv4.addr4.s_addr);
-    TeidToUpfSessionMapFree(session->teid);
+    /* Remove TEIDs directly from the current session. Using the hash lookup
+       helper here can fail after partial setup/rollback and leave teid_count
+       unchanged, which traps teardown in an infinite loop. */
+    while (session->teid_count > 0) {
+        uint32_t teid = session->teid_list[session->teid_count - 1];
+        session->teid_count--;
+        TeidToUpfSessionMapFree(teid);
+    }
     UpfSessionFree(session);
     return STATUS_OK;
 }

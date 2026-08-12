@@ -68,6 +68,10 @@
 uint64_t seid = 0;
 uint16_t pdrId = 0;
 
+/* --- NR-DC downlink per-flow ECMP config (parsed in upf_u_config.c) --- */
+int      DcEnabled = 0;         /* 1 = DC path selection active */
+uint32_t DcGnbIp   = 0;         /* secondary gNB N3 IP (network byte order) */
+
 
 typedef struct {
     void    *ptr;          // current active snapshot (cls_handle_t*)
@@ -543,6 +547,29 @@ drain_session_batch(int sess_idx, uint32_t max_pkts, struct onvm_nf *nf) {
     return total;
 }
 
+/* --- NR-DC: 4-tuple hash for per-flow DL ECMP --- */
+static inline uint32_t
+dc_hash_four_tuple(const struct rte_ipv4_hdr *iph, uint16_t pkt_len)
+{
+    if (pkt_len < sizeof(struct rte_ipv4_hdr))
+        return 0;
+
+    uint32_t src_ip = rte_be_to_cpu_32(iph->src_addr);
+    uint32_t dst_ip = rte_be_to_cpu_32(iph->dst_addr);
+    uint16_t src_port = 0, dst_port = 0;
+
+    uint8_t ihl = (iph->version_ihl & 0x0F) * 4;
+    uint8_t proto = iph->next_proto_id;
+
+    if ((proto == IPPROTO_TCP || proto == IPPROTO_UDP) && pkt_len >= ihl + 4) {
+        const uint8_t *l4 = (const uint8_t *)iph + ihl;
+        src_port = rte_be_to_cpu_16(*(const uint16_t *)l4);
+        dst_port = rte_be_to_cpu_16(*(const uint16_t *)(l4 + 2));
+    }
+
+    return src_ip ^ dst_ip ^ ((uint32_t)src_port << 16) ^ (uint32_t)dst_port;
+}
+
 static int
 packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm_nf_local_ctx *nf_local_ctx) {
     if (pkt == NULL || meta == NULL) {
@@ -695,6 +722,32 @@ packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm_nf_
     }
 
     if (is_dl) {
+        /* ── NR-DC: per-flow DL path selection via the session DL-path
+         * cache. Swapping `far` here is the entire DC delta: the encap
+         * below reads the selected FAR's outerHeaderCreation, and
+         * attach_l2_or_arp resolves the matching next-hop MAC by ARP. ── */
+        UpfFAR dl_far_copy;
+        if (DcEnabled) {
+            UpfSession *dc_session =
+                UpfSessionFindByUeIP(rte_cpu_to_be_32(iph->dst_addr));
+            if (dc_session) {
+                struct rte_ipv4_hdr *inner_iph =
+                    rte_pktmbuf_mtod(pkt, struct rte_ipv4_hdr *);
+                uint32_t path_hash =
+                    dc_hash_four_tuple(inner_iph, pkt->data_len);
+                far = UpfSessionSelectDlFarByHash(dc_session, far,
+                                                  path_hash, &dl_far_copy);
+                if (far->flags.forwardingParameters &&
+                    far->forwardingParameters.flags.outerHeaderCreation) {
+                    UTLT_Trace("DC final path: %s teid=%u",
+                               (DcGnbIp != 0 &&
+                                far->forwardingParameters.outerHeaderCreation.ipv4.s_addr == DcGnbIp)
+                                   ? "secondary gNB" : "master gNB",
+                               far->forwardingParameters.outerHeaderCreation.teid);
+                }
+            }
+        }
+
         /* ── DL: split BUFF vs FORW ─────────────────────────── */
         uint8_t far_action = far->applyAction & FAR_ACTION_MASK;
         struct onvm_nf *nf = nf_local_ctx->nf;

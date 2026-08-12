@@ -899,14 +899,14 @@ typedef struct _PFCPSessionEstablishmentResponse {
 typedef struct _PFCPSessionModificationRequest {
     unsigned long presence;
     FSEID cPFSEID;
-    RemovePDR removePDR;
-    RemoveFAR removeFAR;
+    RemovePDR removePDR[4];
+    RemoveFAR removeFAR[4];
     RemoveURR removeURR;
     RemoveQER removeQER;
     RemoveBAR removeBAR;
     RemoveTrafficEndpoint removeTrafficEndpoint;
-    CreatePDR createPDR[2];
-    CreateFAR createFAR[2];
+    CreatePDR createPDR[4];
+    CreateFAR createFAR[4];
     CreateURR createURR;
     CreateQER createQER;
     CreateBAR createBAR;
@@ -1023,4 +1023,3 @@ Status PfcpBuildMessage(Bufblk **bufBlkPtr, PfcpMessage *pfcpMessage);
 #endif /* __cplusplus */
 
 #endif /* __PFCP_MESSAGE_H__ */
-

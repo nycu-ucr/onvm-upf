@@ -28,6 +28,9 @@
 
 #include "list.h"
 
+#define MAX_NUM_OF_TEIDS 16
+#define MAX_DL_PATHS 4
+
 #ifdef __cplusplus
 extern "C" {
 #endif /* __cplusplus */
@@ -41,6 +44,17 @@ typedef struct _UpfUeIp      UpfUeIp;
 typedef UPDK_PDR UpfPDR;
 typedef UPDK_FAR UpfFAR;
 typedef UPDK_QER UpfQER;
+
+typedef struct {
+    uint32_t        far_id;
+    uint32_t        teid;       /* host byte order */
+    struct in_addr  outer_ip;   /* network byte order */
+} UpfDlPathEntry;
+
+typedef struct {
+    UpfDlPathEntry  entries[MAX_DL_PATHS];
+    uint8_t         count;
+} UpfDlPathSet;
 
 typedef enum _UpfEvent {
 
@@ -137,7 +151,9 @@ typedef struct _UpfSession {
     Pdn             pdn;
     UpfUeIp         ueIpv4;
     UpfUeIp         ueIpv6;
-    uint32_t        teid;
+
+    uint32_t        teid_list[MAX_NUM_OF_TEIDS];  /* network byte order */
+    uint8_t         teid_count;
 
     /* User location */
     Tai             tai;
@@ -148,6 +164,8 @@ typedef struct _UpfSession {
     list_t          *pdr_list;
     list_t          *far_list;
     list_t          *qer_list;
+
+    UpfDlPathSet    dl_paths;
 
     bool srr_flag;
 } UpfSession;
@@ -217,6 +235,13 @@ UpfSession *UpfSessionFindByUeIP(uint32_t ueip);
 Status UpfPDRRegisterToSession(UpfSession *session, UpfPDR *pdr);
 Status UpfFARRegisterToSession(UpfSession *session, UpfFAR *far);
 Status UpfQERRegisterToSession(UpfSession *session, UpfQER *qer);//implement//upf_context.c//V
+
+bool UpfFarIsDlAccessCandidate(const UpfFAR *far);
+Status UpfSessionUpsertDlPathFromFar(UpfSession *session, const UpfFAR *far);
+Status UpfSessionRemoveDlPathByFarID(UpfSession *session, uint32_t far_id);
+const UpfDlPathEntry *UpfSessionGetDlPathByHash(const UpfSession *session, uint32_t hash);
+UpfFAR *UpfSessionSelectDlFarByHash(const UpfSession *session, UpfFAR *base_far,
+                                    uint32_t hash, UpfFAR *far_copy);
 
 UpfPDR *UpfPDRFindByID(UpfSession *session, uint16_t id);
 UpfFAR *UpfFARFindByID(UpfSession *session, uint16_t id);

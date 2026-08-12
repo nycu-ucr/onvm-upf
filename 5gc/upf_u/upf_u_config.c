@@ -20,6 +20,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
+#include <arpa/inet.h>
 #include <yaml.h>
 
 #include "upf_u_config.h"
@@ -27,6 +28,10 @@
 
 struct rte_ether_addr g_cn_ue_eth;
 struct rte_ether_addr g_cn_dn_eth;
+
+/* NR-DC downlink ECMP (defined in upf_u.c) */
+extern int      DcEnabled;
+extern uint32_t DcGnbIp;
 
 uint16_t g_n3_port = 0;
 uint16_t g_n6_port   = 0;
@@ -203,6 +208,23 @@ do_parse(yaml_document_t *doc) {
             if (v < 0 || v > 255) { fprintf(stderr, "[UPF-U][CONFIG] bad ports.n6_port\n"); return -1; }
             g_n6_port = (uint16_t)v;
             g_sgi_port  = (uint16_t)v;
+        }
+    }
+
+    // nrdc (optional): enables NR-DC downlink per-flow path selection.
+    // Only dc_gnb_ip is needed — TEIDs come from the session FAR list and
+    // next-hop MACs are resolved by ARP.
+    {
+        yaml_node_t *nrdc = map_get(doc, dp, "nrdc");
+        if (nrdc && nrdc->type == YAML_MAPPING_NODE) {
+            yaml_node_t *n = map_get(doc, nrdc, "dc_gnb_ip");
+            const char *s = scalar_str(n);
+            if (!s || parse_ipv4_address(s, &DcGnbIp) != 0) {
+                fprintf(stderr, "[UPF-U][CONFIG] nrdc present but dc_gnb_ip missing/invalid\n");
+                return -1;
+            }
+            DcEnabled = 1;
+            fprintf(stderr, "[UPF-U][CONFIG] NR-DC DL ECMP enabled: dc_gnb_ip=%s\n", s);
         }
     }
 

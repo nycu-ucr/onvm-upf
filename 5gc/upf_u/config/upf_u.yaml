@@ -12,7 +12,14 @@ configuration:
       n3_port: 0                     # NIC port used for N3 interface
       n6_port: 1                     # NIC port used for N6 interface
 
-  # NAT configuration (optional)
+    # NR-DC downlink per-flow ECMP (optional). Presence of dc_gnb_ip enables
+    # DL path selection between the master and secondary gNB N3 endpoints.
+    # Next-hop MACs are resolved by ARP; no MAC configuration is needed.
+    # Enable only after the single-gNB (master) data plane is validated.
+    # nrdc:
+    #   dc_gnb_ip: "192.168.6.3"     # secondary gNB N3 IP
+
+  # NAT configuration (optional; incompatible with nrdc — NAT pins the N3 next hop)
   nat:
     enable: false # true/false or 1/0
     an_peer_n3_ip: "192.168.1.1"    # N3 interface IP address on the UE/RAN node
