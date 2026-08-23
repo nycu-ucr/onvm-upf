@@ -437,6 +437,7 @@ Encap(struct rte_mbuf *pkt, UPDK_FAR *far, UPDK_QER *qer) {
                               // udppayloadlen should be raw + gtp header
 
     struct rte_ipv4_hdr *ipv4_hdr = rte_pktmbuf_mtod_offset(pkt, struct rte_ipv4_hdr *, 0);
+    memset(ipv4_hdr, 0, sizeof(*ipv4_hdr));
     onvm_pkt_fill_ipv4(ipv4_hdr, rte_cpu_to_be_32(g_n3_ip_be), rte_cpu_to_be_32(outerHeaderCreation->ipv4.s_addr),
                IPPROTO_UDP);
     ipv4_hdr->total_length = rte_cpu_to_be_16(payloadLen + sizeof(gtpv1_t) + sizeof(struct rte_udp_hdr) +
