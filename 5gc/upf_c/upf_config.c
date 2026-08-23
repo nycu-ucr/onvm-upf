@@ -168,6 +168,27 @@ Status UpfConfigParse() {
 
                     } while (YamlIterType(&pfcpList) == YAML_SEQUENCE_NODE);
                     
+                } else if (!strcmp(upfKey, "dataplane_ports")) {
+                    YamlIter portIter;
+                    YamlIterChild(&upfIter, &portIter);
+                    while (YamlIterNext(&portIter)) {
+                        const char *portKey = YamlIterGet(&portIter, GET_KEY);
+                        UTLT_Assert(portKey, return STATUS_ERROR, "The portKey is NULL");
+                        const char *portVal = YamlIterGet(&portIter, GET_VALUE);
+
+                        if (!strcmp(portKey, "access")) {
+                            Self()->accessPort = atoi(portVal);
+                        } else if (!strcmp(portKey, "core")) {
+                            Self()->corePort = atoi(portVal);
+                        } else if (!strcmp(portKey, "sgi")) {
+                            Self()->sgiPort = atoi(portVal);
+                        } else {
+                            UTLT_Warning("Unknown key \"%s\" of dataplane_ports", portKey);
+                        }
+                    }
+                    UTLT_Info("Dataplane ports: access=%d core=%d sgi=%d",
+                             Self()->accessPort, Self()->corePort, Self()->sgiPort);
+
                 } else if (!strcmp(upfKey, "dnn_list")) {
                     YamlIter dnnList, dnnIter;
                     YamlIterChild(&upfIter, &dnnList);

@@ -18,6 +18,13 @@ configuration:
     # [optional] gtpu.ifname
     # - ifname: gtpif
 
+  # Dataplane port mapping (must match UPF-U upf_u.yaml ports)
+  # NOTE: SGi follows CORE by convention (same physical port)
+  dataplane_ports:
+    access: 0
+    core: 1
+    sgi: 1
+
   dnn_list:
     - dnn: internet
       cidr: 60.60.0.0/24

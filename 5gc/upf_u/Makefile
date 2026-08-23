@@ -51,6 +51,7 @@ APP = upf_u_complete
 
 # all source are stored in SRCS-y
 SRCS-y := upf_u.c
+SRCS-y += upf_u_shaper.c
 
 ONVM= $(SRCDIR)/../../onvm
 

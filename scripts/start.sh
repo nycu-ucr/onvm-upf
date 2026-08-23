@@ -272,14 +272,35 @@ fi
 sudo rm -rf /mnt/huge/rtemap_*
 # watch out for variable expansion
 # shellcheck disable=SC2086
-# sudo ./build/onvm/onvm_mgr/onvm_mgr -l "$cpu" -n 4 --proc-type=primary ${virt_addr} -- -p ${ports} -n ${nf_cores} ${num_srvc} ${def_srvc} ${stats} ${stats_sleep_time} ${verbosity_level} ${ttl} ${packet_limit} ${shared_cpu_flag} ${jumbo_frames_flag}
-# ALLOW_LIST="${ONVM_ALLOW_LIST:---allow 0000:07:00.0 --allow 0000:0b:00.0}"
-# sudo ./build/onvm/onvm_mgr/onvm_mgr -l "$cpu" -n 4 --proc-type=primary ${ALLOW_LIST} ${virt_addr} -- -p ${ports} -n ${nf_cores} ${num_srvc} ${def_srvc} ${stats} ${stats_sleep_time} ${verbosity_level} ${ttl} ${packet_limit} ${shared_cpu_flag} ${jumbo_frames_flag}
-ACCESS_IFACE="${ONVM_AF_PACKET_ACCESS_IFACE:-br-AN}"
-CORE_IFACE="${ONVM_AF_PACKET_CORE_IFACE:-enp11s0}"
-VDEV_ARGS="--no-pci --vdev=net_af_packet0,iface=${ACCESS_IFACE} --vdev=net_af_packet1,iface=${CORE_IFACE}"
-echo "INFO: Using AF_PACKET access iface=${ACCESS_IFACE} core iface=${CORE_IFACE}"
-sudo ./build/onvm/onvm_mgr/onvm_mgr -l "$cpu" -n 4 --proc-type=primary ${VDEV_ARGS} ${virt_addr} -- -p ${ports} -n ${nf_cores} ${num_srvc} ${def_srvc} ${stats} ${stats_sleep_time} ${verbosity_level} ${ttl} ${packet_limit} ${shared_cpu_flag} ${jumbo_frames_flag}
+
+if [ -n "${ONVM_AF_PACKET_ACCESS_IFACE:-}" ]; then
+    # AF_PACKET mode (kernel ifaces / bridges): used on FABRIC and the
+    # single-node namespace testbed.
+    ACCESS_IFACE="${ONVM_AF_PACKET_ACCESS_IFACE}"
+    CORE_IFACE="${ONVM_AF_PACKET_CORE_IFACE:?ONVM_AF_PACKET_CORE_IFACE must be set with ONVM_AF_PACKET_ACCESS_IFACE}"
+    VDEV_ARGS="--no-pci --vdev=net_af_packet0,iface=${ACCESS_IFACE} --vdev=net_af_packet1,iface=${CORE_IFACE}"
+    echo "INFO: AF_PACKET mode: access=${ACCESS_IFACE} core=${CORE_IFACE}"
+    sudo ./build/onvm/onvm_mgr/onvm_mgr \
+        -l "$cpu" -n 4 --proc-type=primary \
+        ${VDEV_ARGS} \
+        ${virt_addr} \
+        -- -p ${ports} -n ${nf_cores} ${num_srvc} ${def_srvc} ${stats} ${stats_sleep_time} ${verbosity_level} ${ttl} ${packet_limit} ${shared_cpu_flag} ${jumbo_frames_flag}
+else
+    # PCI mode (DPDK PMD / bifurcated mlx5)
+    ALLOW_LIST="${ONVM_ALLOW_LIST:-0000:08:00.0 0000:09:00.0}"
+
+    allow_args=()
+    for dev in $ALLOW_LIST; do
+        allow_args+=(--allow "$dev")
+    done
+
+    sudo ./build/onvm/onvm_mgr/onvm_mgr \
+        -l "$cpu" -n 4 --proc-type=primary \
+        "${allow_args[@]}" \
+        ${virt_addr} \
+        -- -p ${ports} -n ${nf_cores} ${num_srvc} ${def_srvc} ${stats} ${stats_sleep_time} ${verbosity_level} ${ttl} ${packet_limit} ${shared_cpu_flag} ${jumbo_frames_flag}
+fi
+
 if [ "${stats}" = "-s web" ]
 then
     echo "Killing web stats running with PIDs: $ONVM_WEB_PID, $ONVM_WEB_PID2"

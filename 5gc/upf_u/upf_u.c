@@ -1,5 +1,5 @@
 /*
-# Copyright 2025 University of California, Riverside and National Yang Ming Chiao Tung University
+# Copyright 2026 University of California, Riverside and National Yang Ming Chiao Tung University
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -18,14 +18,11 @@
 
 #include <errno.h>
 #include <getopt.h>
-#include <inttypes.h>
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/queue.h>
-#include <time.h>
 #include <unistd.h>
 #include <stdbool.h>
 
@@ -35,6 +32,9 @@
 #include <rte_ether.h>
 #include <rte_mbuf.h>
 #include <rte_meter.h>
+#include <rte_malloc.h>
+#include <rte_ring.h>
+#include <rte_tcp.h>
 
 #include "gtp.h"
 #include "upf_context.h"
@@ -46,112 +46,31 @@
 
 #include "upf_events.h"
 #include "upf_cls_ctrl.h"
+#include "upf_sess_buf.h"
 
 #include "../classifiers/upf_cls_adapter.h"
 #include "../classifiers/classifier_wrapper.h"
 
+#include "upf_u_helper.h"
 #include "upf_u_config.h"
+#include "upf_u_arp.h"
+#include "upf_u_icmp.h"
+#include "upf_u_nat.h"
+#include "upf_u_shaper.h"
+#include "upf_u_trtcm.h"
 
 #define NF_TAG "upf_u"
 
-// #if 0
-// #define SELF_IP RTE_IPV4(10, 100, 200, 3)
-// #else
-// #define SELF_IP 33622538  // 10.10.1.2
+/* Used for buffering */
+#define INLINE_DRAIN_BATCH       8    /* pkts drained per INLINE (FORW)  */
+#define DRAIN_CHUNK             128   /* max pkts dequeued per drain call */
 
-// #endif
+uint64_t seid = 0;
+uint16_t pdrId = 0;
 
-// #define SRC_INTF_ACCESS 0
-// #define SRC_INTF_CORE 1
-// #define SRC_INTF_SGI_LAN 2
-// #define SRC_INTF_CP 3
-// #define SRC_INTF_NUM (SRC_INTF_CP + 1)
-#define FIX_BUFFER
-#define DEFAULT_TB_RATE 10         // (Mbps)
-#define DEFAULT_TB_DEPTH 10000  // Max proceed length
-#define DEFAULT_TB_TOKENS 10000
-#define APP_FLOWS_MAX 256
-#define IP_MASKED(BIGENDIINT, LEN) (BIGENDIINT & (0xFFFFFFFF << (32-LEN)))
-#define MAX_UE 256 // Max number of UEs
-#define MIN(x, y) (((x) < (y)) ? (x) : (y))
-#define MAX_OF_BUFFER_PACKET_SIZE 30000
-
-/* mask for 20-bit IPv6 flow label */
-#ifndef IPV6_FLOWLABEL_MASK
-#define IPV6_FLOWLABEL_MASK 0x000FFFFFu
-#endif
-
-
-static inline int UpfSendEvt1(uint16_t dest_sid, uint32_t type, uintptr_t a0) {
-    Event *e = (Event *)rte_calloc("upf_evt", 1, sizeof(*e), 0);
-    if (!e) return -1;
-    e->type = (uintptr_t)type;
-    e->argc = 1;
-    e->arg0 = a0;
-    int rc = onvm_nflib_send_msg_to_nf(dest_sid, e);
-    if (rc < 0) rte_free(e);
-    return rc;
-}
-
-static struct rte_ether_addr dn_eth;
-static struct rte_ether_addr cn_dn_eth;
-static struct rte_ether_addr cn_ue_eth;
-
-uint8_t DnMac[RTE_ETHER_ADDR_LEN];
-uint8_t AnMac[RTE_ETHER_ADDR_LEN];
-uint8_t DcAnMac[RTE_ETHER_ADDR_LEN];  // DC (secondary) gNB next-hop MAC
-uint32_t SELF_IP;
-uint32_t DcSelfIp = 0;        // secondary local UPF N3 IP for Option A bridge mode
-
-/* --- NR-DC downlink ECMP config --- */
-int      DcEnabled = 0;         // 1 = DC ECMP steering active
-uint32_t DcGnbIp   = 0;        // secondary gNB IP (network byte order)
-
-enum { IF_UNKNOWN = -1 };
-
-int16_t g_access_port = 0;
-int16_t g_core_port   = 0;
-int16_t g_sgi_port    = 0;
-
-static inline bool
-PacketTargetsLocalUpf(uint32_t dst_addr)
-{
-    if (dst_addr == (uint32_t)SELF_IP) {
-        return true;
-    }
-    if (DcSelfIp != 0 && dst_addr == DcSelfIp) {
-        return true;
-    }
-    return false;
-}
-
-
-struct rte_meter_trtcm_profile app_trtcm_profile;
-struct rte_meter_trtcm_profile app_flow_trtcm_profile;
-struct rte_meter_trtcm app_flows[APP_FLOWS_MAX];
-
-struct rte_mbuf *buffer[MAX_OF_BUFFER_PACKET_SIZE];
-uint32_t buffer_length = 0;
-
-/* trTCM */
-struct rte_meter_trtcm_params app_trtcm_params = {
-	.cir = 125000,    // bytes per secs
-	.pir = 625000,    // bytes per secs
-	.cbs = 2048,
-	.pbs = 2048
-};
-
-
-/* Flow Separation*/
-struct flow_entry {
-    uint32_t subnet;  // (Network & Mask_bits)
-    int flow_idx;     // maps to trTCM flows table
-    bool in_use;      // to track if the slot is occupied
-}typedef flow_entry_t;
-
-flow_entry_t iPFlows[APP_FLOWS_MAX];
-uint32_t iPFlowsLen = 0;
-uint32_t trTCMidx = 0;
+/* --- NR-DC downlink per-flow ECMP config (parsed in upf_u_config.c) --- */
+int      DcEnabled = 0;         /* 1 = DC path selection active */
+uint32_t DcGnbIp   = 0;         /* secondary gNB N3 IP (network byte order) */
 
 
 typedef struct {
@@ -164,7 +83,8 @@ typedef struct {
 static upf_cls_local_t g_cls_local = {0};
 
 // Flip to the latest published snapshot (called at burst boundary)
-static inline void UpfClsMaybeFlipAndAck(void) {
+static inline void
+UpfClsMaybeFlipAndAck(void) {
     if (likely(!g_cls_local.flip_pending))
         return;
 
@@ -180,7 +100,7 @@ static inline void UpfClsMaybeFlipAndAck(void) {
         }
 
         // Load pointer after seeing an even version
-        new_ptr = __atomic_load_n((void * const *)&g_upf_cls_ctrl->active, __ATOMIC_ACQUIRE);
+        new_ptr  = __atomic_load_n((void * const *)&g_upf_cls_ctrl->active, __ATOMIC_ACQUIRE);
 
         // Re-check version; must be the same even number
         v2 = __atomic_load_n(&g_upf_cls_ctrl->version, __ATOMIC_ACQUIRE);
@@ -197,15 +117,15 @@ static inline void UpfClsMaybeFlipAndAck(void) {
     }
 
     // Commit locally & ACK the exact stable version observed
-    g_cls_local.ptr = new_ptr;
-    g_cls_local.ver = v2;
+    g_cls_local.ptr  = new_ptr;
+    g_cls_local.ver  = v2;
     g_cls_local.flip_pending = 0;
 
     (void)UpfSendEvt1(UPF_C_SERVICE_ID, EVT_CLS_GC_ACK, (uintptr_t)v2);
 }
 
-
-/* static inline const UPDK_PDR *UpfLookupPdr(const ps_packet_t *key) {
+/* static inline const UPDK_PDR *
+UpfLookupPdr(const ps_packet_t *key) {
     const cls_handle_t *snap = (const cls_handle_t *)g_cls_local.ptr;
     if (unlikely(!snap)) return NULL;
 
@@ -217,7 +137,8 @@ static inline void UpfClsMaybeFlipAndAck(void) {
     return (const UPDK_PDR *)cookie;
 } */
 
-static inline uint16_t UpfClassifyGetPdrId(const ps_packet_t *key) {
+static inline uint16_t
+UpfClassifyGetPdrId(const ps_packet_t *key) {
     const cls_handle_t *snap = (const cls_handle_t *)g_cls_local.ptr;
     if (unlikely(!snap)) {
         UTLT_Warning("CLS classify: no snapshot yet (ver=%u) — dropping", g_cls_local.ver);
@@ -238,7 +159,8 @@ static inline uint16_t UpfClassifyGetPdrId(const ps_packet_t *key) {
     return (uint16_t)pdrId;
 }
 
-static inline const UPDK_PDR *UpfClassifyGetPdrPtr(const ps_packet_t *key) {
+static inline const UPDK_PDR *
+UpfClassifyGetPdrPtr(const ps_packet_t *key) {
     const cls_handle_t *snap = (const cls_handle_t *)g_cls_local.ptr;
     if (unlikely(!snap)) {
         UTLT_Warning("CLS classify: no snapshot yet (ver=%u) — dropping", g_cls_local.ver);
@@ -251,433 +173,10 @@ static inline const UPDK_PDR *UpfClassifyGetPdrPtr(const ps_packet_t *key) {
     return (const UPDK_PDR *)descriptor;
 }
 
-
-
-bool ftAddEntry(uint32_t subnet, int flow_idx) {
-    if (iPFlowsLen >= APP_FLOWS_MAX) {
-        printf("Error: Maximum flow entries reached.\n");
-        return false;
-    }
-
-    if (ftSearch(subnet) != -1) {
-        printf("Error: Subnet %u already exists.\n", subnet);
-        return false;
-    }
-
-    int index = hashFunc(subnet);
-    while (iPFlows[index].in_use) {         // Linear Probing
-        index = (index + 1) % APP_FLOWS_MAX;
-    }
-
-    // Insert the entry
-    iPFlows[index].subnet = subnet;
-    iPFlows[index].flow_idx = flow_idx;
-    iPFlows[index].in_use = true;
-    iPFlowsLen++;
-
-    return true;
+static inline uint64_t
+saturating_add_u64(uint64_t lhs, uint64_t rhs) {
+    return UINT64_MAX - lhs < rhs ? UINT64_MAX : lhs + rhs;
 }
-
-const char *ip4(uint32_t host_ip) {
-    static char buf[16];
-    struct in_addr a = { .s_addr = htonl(host_ip) };
-    return inet_ntop(AF_INET, &a, buf, sizeof(buf)) ? buf : "<err>";
-}
-
-uint32_t charStr2MaskedIP(char *str, uint32_t *prefix_val){
-    char ip_str[INET_ADDRSTRLEN];
-    uint32_t prefix_len, subnet;
-
-    sscanf(str, "%[^/]/%d", ip_str, &prefix_len);
-    struct in_addr ip_addr;
-    inet_pton(AF_INET, ip_str, &ip_addr);
-
-    if (prefix_val) *prefix_val = prefix_len;
-    return IP_MASKED(ip_addr.s_addr, prefix_len);
-}
-
-static inline int SourceInterfaceToPort(source_interface_t srcIf) {
-    switch (srcIf) {
-      case SRC_IF_ACCESS:   return g_access_port;
-      case SRC_IF_CORE:     return g_core_port;
-      case SRC_IF_SGI_LAN:  return g_sgi_port;
-      case SRC_IF_CP_FUNC:
-      case SRC_IF_LI_FUNC:
-      default:
-        return IF_UNKNOWN;
-    }
-}
-
-static inline void
-ConfigureQerFlows(UpfSession *session,
-                  const UPDK_PDR *pdr,
-                  uint8_t port,
-                  bool is_uplink)
-{
-    if (!session || !pdr || !session->qer_list) return;
-
-    int prefix_len = 0;
-    uint32_t fd_target = 0;
-    bool has_fd = false;
-
-    if (pdr->pdi.flags.sdfFilter && pdr->pdi.sdfFilter.flowDescription) {
-        const char *fd = pdr->pdi.sdfFilter.flowDescription;
-        const char *ip_str = strstr(fd, "from");
-        if (ip_str) {
-            ip_str += 5; // skip "from "
-            const char *end_ptr = strchr(ip_str, ' ');
-            size_t n = end_ptr ? (size_t)(end_ptr - ip_str) : strlen(ip_str);
-            if (n > 0 && n < 64) {
-                char tmp[64];
-                memcpy(tmp, ip_str, n);
-                tmp[n] = '\0';
-                if (strcmp(tmp, "any") != 0) {
-                    fd_target = charStr2MaskedIP(tmp, &prefix_len);
-                    has_fd = true;
-                }
-            }
-        }
-    }
-
-    uint32_t base = SourceInterfaceToPort(pdr->pdi.sourceInterface);
-    uint32_t key  = has_fd ? (base + fd_target) : base;
-
-    for (int i = 0; i < 2; i++) {
-        uint32_t qerId = pdr->qerId[i];
-        if (!qerId) continue;
-
-        for (list_node_t *node = session->qer_list->head; node; node = node->next) {
-            UpfQER *qer = (UpfQER *)node->val;
-            if (!qer || qer->qerId != qerId) continue;
-
-            /* int idx = ftSearch(key);
-            if (idx >= 0) {
-                UTLT_Info("QER flow already exists: key=%u idx=%d (is_uplink=%d)", key, idx, (int)is_uplink);
-                continue; // nothing to configure
-            }
-
-            if (qer->flags.maximumBitrate) {
-                UTLT_Info("QER ID: %u key: %u", qerId, key);
-            } */
-
-            // only add on miss, and only if MBR exists
-            if (ftSearch(key) < 0 && qer->flags.maximumBitrate) {
-                UTLT_Info("QER ID: %u key: %u", qerId, key);
-
-                struct rte_meter_trtcm_params trtcm_params = app_trtcm_params;
-
-                uint32_t mbr = is_uplink ? qer->maximumBitrate.ul : qer->maximumBitrate.dl;
-                trtcm_params.pir = mbr * 1000 / 8;
-
-                if (qer->flags.guaranteedBitrate) {
-                    uint32_t gbr = is_uplink ? qer->guaranteedBitrate.ul : qer->guaranteedBitrate.dl;
-                    trtcm_params.cir = gbr * 1000 / 8;
-                } else {
-                    trtcm_params.cir = is_uplink ? 0 : 1;
-                }
-
-                if (!ftAddEntry(key, trTCMidx)) {
-                    UTLT_Warning("FT add failed");
-                }
-                UTLT_Info("Successfully add %u(%d) %u", key, hashFunc(key), trTCMidx);
-
-                // Match config profile to what color-check later uses:
-                // DL + SDF present → app_flow_trtcm_profile; else app_trtcm_profile
-                if (!is_uplink && has_fd) {
-                    rte_meter_trtcm_profile_config(&app_flow_trtcm_profile, &trtcm_params);
-                    rte_meter_trtcm_config(&app_flows[trTCMidx], &app_flow_trtcm_profile);
-                } else {
-                    rte_meter_trtcm_profile_config(&app_trtcm_profile, &trtcm_params);
-                    rte_meter_trtcm_config(&app_flows[trTCMidx], &app_trtcm_profile);
-                }
-
-                if (is_uplink) {
-                    UTLT_Info("Find MBR (UL: %lu) in QERs", qer->maximumBitrate.ul);
-                    if (qer->flags.guaranteedBitrate)
-                        UTLT_Info("Find GBR (UL: %lu) in QERs", qer->guaranteedBitrate.ul);
-                } else {
-                    UTLT_Info("Find MBR (DL: %lu) in QERs", qer->maximumBitrate.dl);
-                    if (qer->flags.guaranteedBitrate)
-                        UTLT_Info("Find GBR (DL: %lu) in QERs", qer->guaranteedBitrate.dl);
-                }
-
-                UTLT_Info("TRTCM params: %d %d %d %d\n",
-                          trtcm_params.cir, trtcm_params.pir,
-                          trtcm_params.cbs, trtcm_params.pbs);
-
-                trTCMidx++;
-            }
-        }
-    }
-}
-
-char *
-convertToIpAddress(uint32_t big_endian_value) {
-    static char ip_string[16];
-
-    uint8_t ip_address[4];
-    ip_address[0] = (big_endian_value >> 24) & 0xFF;
-    ip_address[1] = (big_endian_value >> 16) & 0xFF;
-    ip_address[2] = (big_endian_value >> 8) & 0xFF;
-    ip_address[3] = big_endian_value & 0xFF;
-
-    sprintf(ip_string, "%d.%d.%d.%d", ip_address[3], ip_address[2], ip_address[1], ip_address[0]);
-
-    return ip_string;
-}
-
-int
-parseIpv4Address(const char *addrStr) {
-    const char *p = addrStr;
-    char *endp;
-
-    unsigned long a = strtoul(p, &endp, 10);
-    if (*endp != '.')
-        return -1;
-    unsigned long b = strtoul(p = endp + 1, &endp, 10);
-    if (*endp != '.')
-        return -1;
-    unsigned long c = strtoul(p = endp + 1, &endp, 10);
-    if (*endp != '.')
-        return -1;
-    unsigned long d = strtoul(p = endp + 1, &endp, 10);
-
-    SELF_IP = (uint32_t)((d << 24) | (c << 16) | (b << 8) | a);
-    UTLT_Info("IP Address: %s -> %d\n", addrStr, SELF_IP);
-    return 0;
-}
-
-static inline source_interface_t PortToSourceInterface(uint8_t port) {
-    if ((int)port == g_access_port)  return SRC_IF_ACCESS;
-    if ((int)port == g_core_port)    return SRC_IF_CORE;
-    if ((int)port == g_sgi_port)     return SRC_IF_SGI_LAN;
-    UTLT_Warning("PortToSourceInterface: unknown port %u (ACCESS=%d CORE=%d SGI=%d) — defaulting to ACCESS",
-                 port, g_access_port, g_core_port, g_sgi_port);
-    return SRC_IF_ACCESS;
-}
-
-static int
-trtcmConfigFlowTables(void){
-    uint32_t i;
-    int rtn;
-    if (likely(app_flows[0].tc > 0))
-        return 0;
-    
-    // config trtcm profile
-    rtn = rte_meter_trtcm_profile_config(&app_trtcm_profile,
-		&app_trtcm_params);
-	if (rtn)
-		return rtn;
-        
-    // config flow meters with trtcm profiles
-    for (i=0; i<APP_FLOWS_MAX; i++){
-        rtn = rte_meter_trtcm_config(&app_flows[i], &app_trtcm_profile);
-        if (rtn)
-            return rtn;
-    }
-
-    UTLT_Info("Flow table configured.");
-    return 0;
-}
-
-static inline int
-trtcmColorHandle(uint32_t pkt_len, uint64_t time, uint8_t qfi, struct rte_meter_trtcm_profile *target_profile){
-    uint8_t out_color = 0;
-    // check configured flow
-    if (unlikely(app_trtcm_profile.cir_period == 0)){
-        UTLT_Info("flow cir_period set err");
-        return -1;
-    }
-    if (unlikely(app_trtcm_profile.pir_period == 0)) {
-        UTLT_Info("flow pir_period set err");    
-        return -1;
-    }
-    out_color = (uint8_t) rte_meter_trtcm_color_blind_check(&app_flows[qfi], 
-        target_profile, 
-        time, 
-        pkt_len);
-    return out_color;
-}
-
-static inline int
-trtcmPolicer(struct onvm_pkt_meta *meta, int color_result){
-    if (meta->action == ONVM_NF_ACTION_DROP) {
-        meta->flags = RTE_COLOR_RED;
-        UTLT_Info("TB not enough & traffic flow");
-        return 0;
-    }
-    switch (color_result){
-    case RTE_COLOR_RED:
-        UTLT_Info("\033[0;31mRED(%d)\033[0m, drop pkt", RTE_COLOR_RED);
-        meta->flags = RTE_COLOR_RED;
-        meta->action = ONVM_NF_ACTION_DROP;
-        break;
-    case RTE_COLOR_YELLOW:
-        UTLT_Info("\033[0;32mYELLOW(%d)\033[0m, best effort pkt fwd", RTE_COLOR_YELLOW);
-        meta->flags = RTE_COLOR_YELLOW;
-        meta->action = ONVM_NF_ACTION_DROP;
-        break;
-    case RTE_COLOR_GREEN:
-        UTLT_Info("\033[0;33mGREEEN(%d)\033[0m, guaranted pkt fwd.", RTE_COLOR_GREEN);
-        meta->flags = RTE_COLOR_GREEN;
-        meta->action = ONVM_NF_ACTION_OUT;
-        break;
-    default:
-        UTLT_Error("Unexpected trTCM color output.");
-        return 1;
-    }
-    return 0;
-}
-
-
-int hashFunc(uint32_t subnet) {
-    return subnet % APP_FLOWS_MAX;
-}
-
-int ftSearch(uint32_t subnet) {
-    int index = hashFunc(subnet);
-    int original_index = index;
-
-    while (iPFlows[index].in_use) {
-        if (iPFlows[index].subnet == subnet) {
-            return index;
-        }
-        index = (index + 1) % APP_FLOWS_MAX;  // Linear Probing
-        
-        if (index == original_index) {
-            break;
-        }
-    }
-
-    return -1;  // Not found
-}
-
-
-
-void ftInit() {
-    for (int i = 0; i < APP_FLOWS_MAX; i++) {
-        iPFlows[i].in_use = false;
-    }
-}
-
-/* Token Bucket */
-struct tb_config {
-    uint64_t tb_rate;    // rate at which tokens are generated (in MBps)
-    uint64_t tb_depth;   // depth of the token bucket (in bytes)
-    uint64_t tb_tokens;  // number of the tokens in the bucket at any given time (in bytes)
-    uint64_t last_cycle;
-    uint64_t cur_cycles;
-    uint16_t used;
-};
-
-struct ue_tb {
-    uint32_t ue_ip;
-    uint32_t ue_ambr;
-    uint32_t ue_gbr;
-    uint32_t ue_mbr;
-    struct tb_config ue_nqos_tb_params;
-    struct tb_config ue_qos_tb_params;
-};
-
-struct ue_tb ue_table[MAX_UE];
-
-void 
-initUeTable(){
-    for (int i = 0; i < MAX_UE; i++) {
-        ue_table[i].ue_ip = 0;
-        ue_table[i].ue_ambr = 0;
-        ue_table[i].ue_gbr = 0;
-        ue_table[i].ue_mbr = 0;
-
-        ue_table[i].ue_nqos_tb_params.tb_rate = 0;
-        ue_table[i].ue_nqos_tb_params.tb_depth = 0;
-        ue_table[i].ue_nqos_tb_params.tb_tokens = 0;
-        ue_table[i].ue_nqos_tb_params.last_cycle = rte_get_tsc_cycles();
-        ue_table[i].ue_nqos_tb_params.cur_cycles = rte_get_tsc_cycles();
-
-        ue_table[i].ue_qos_tb_params.tb_rate = 0;
-        ue_table[i].ue_qos_tb_params.tb_depth = 0;
-        ue_table[i].ue_qos_tb_params.tb_tokens = 0;
-        ue_table[i].ue_qos_tb_params.last_cycle = rte_get_tsc_cycles();
-        ue_table[i].ue_qos_tb_params.cur_cycles = rte_get_tsc_cycles();
-    }
-}
-
-uint32_t 
-findIndexByUeIpAddress(uint32_t ue_ip) {
-    int index = -1;
-    for (int i = 0; i < MAX_UE; i++) {
-        if (ue_table[i].ue_ip == ue_ip) {
-            index = i;
-        }
-    }
-    return index;
-}
-
-void
-addEntrybyUeIp(uint32_t ue_ip, uint32_t ue_ambr, uint32_t ue_gbr,uint32_t ue_mbr) {
-    for (int i = 0; i < MAX_UE; i++) {
-        if (ue_table[i].ue_ip == 0) { // find unused
-            ue_table[i].ue_ip = ue_ip;
-            ue_table[i].ue_ambr = ue_ambr;
-            ue_table[i].ue_gbr = ue_gbr;
-
-            uint32_t qos_rate = MIN((ue_gbr + (ue_ambr-ue_gbr)/2), ue_mbr);
-
-            ue_table[i].ue_qos_tb_params.tb_rate = qos_rate/1000;
-            ue_table[i].ue_qos_tb_params.tb_depth = qos_rate;
-            ue_table[i].ue_qos_tb_params.tb_tokens = qos_rate;
-            ue_table[i].ue_qos_tb_params.last_cycle = rte_get_tsc_cycles();
-            ue_table[i].ue_qos_tb_params.cur_cycles = rte_get_tsc_cycles(); 
-            UTLT_Info("QoS Rate: %d", qos_rate);
-
-            uint32_t nqos_rate = ue_ambr - qos_rate;
-
-            ue_table[i].ue_nqos_tb_params.tb_rate = nqos_rate/1000;
-            ue_table[i].ue_nqos_tb_params.tb_depth = nqos_rate;
-            ue_table[i].ue_nqos_tb_params.tb_tokens = nqos_rate;
-            ue_table[i].ue_nqos_tb_params.last_cycle = rte_get_tsc_cycles();
-            ue_table[i].ue_nqos_tb_params.cur_cycles = rte_get_tsc_cycles();
-            UTLT_Info("non QoS Rate: %d", nqos_rate); 
-
-
-            break;
-        }
-    }
-    return;
-}
-
-void 
-updateTokenbyIndex(int index) {
-    if (index > -1) {
-        uint64_t cur_cycles;
-        uint64_t elapsed_cycles;
-        uint64_t tokens_produced;
-
-        cur_cycles = rte_get_tsc_cycles();
-        elapsed_cycles = cur_cycles - ue_table[index].ue_nqos_tb_params.last_cycle;
-
-        tokens_produced = (elapsed_cycles * ue_table[index].ue_nqos_tb_params.tb_rate * 125000) / rte_get_tsc_hz();
-        ue_table[index].ue_nqos_tb_params.tb_tokens += tokens_produced;
-        if (ue_table[index].ue_nqos_tb_params.tb_tokens > ue_table[index].ue_nqos_tb_params.tb_depth)
-            ue_table[index].ue_nqos_tb_params.tb_tokens = ue_table[index].ue_nqos_tb_params.tb_depth;
-        ue_table[index].ue_nqos_tb_params.last_cycle = cur_cycles;
-
-        elapsed_cycles = cur_cycles - ue_table[index].ue_qos_tb_params.last_cycle;
-        tokens_produced = (elapsed_cycles * ue_table[index].ue_qos_tb_params.tb_rate * 125000) / rte_get_tsc_hz();
-        ue_table[index].ue_qos_tb_params.tb_tokens += tokens_produced;
-        if (ue_table[index].ue_qos_tb_params.tb_tokens > ue_table[index].ue_qos_tb_params.tb_depth)
-            ue_table[index].ue_qos_tb_params.tb_tokens = ue_table[index].ue_qos_tb_params.tb_depth;
-        ue_table[index].ue_qos_tb_params.last_cycle = cur_cycles;
-
-        return;
-    }
-    UTLT_Error("UE IP not found in the table");
-    return;
-}
-
-uint64_t seid = 0;
-uint16_t pdrId = 0;
 
 UPDK_PDR *
 GetPdrByUeIpAddress(struct rte_mbuf *pkt, uint32_t ue_ip)
@@ -728,142 +227,38 @@ GetPdrByUeIpAddress(struct rte_mbuf *pkt, uint32_t ue_ip)
     key.source_if = SRC_IF_CORE;
     key.is_uplink = false;
 
-    // printf("DBG2: srcIf=%u (port=%u)\n", key.source_if, pkt->port);
-
-    /* UTLT_Debug("DL key → teid=%u UE_IP=%s/%u sport=%u dport=%u proto=%u "
-               "spi=%u flow_label=%u ni=0x%08x qfi=%u srcIf=%u",
-        key.teid,
-        ip4(key.ue_ip),
-        key.src_port, key.dst_port,
-        key.proto,
-        key.spi,
-        key.flow_label,
-        key.ni_hash,
-        key.qfi,
-        (unsigned)key.source_if
-    ); */
-
-    /* uint16_t pdr_id = UpfClassifyGetPdrId(&key);
-    if (pdr_id == 0) {
-        UTLT_Error("Couldn't classify the packet to a PDR");
-        return NULL;
-    } */
-
+    /* ── 2) PartitionSort classifier ────────────────────────── */
     const UPDK_PDR *pdr = UpfClassifyGetPdrPtr(&key);
     if (!pdr) {
         UTLT_Error("Couldn't classify the packet to a PDR");
         return NULL;
     }
 
-    UpfSession *session = UpfSessionFindByUeIP(ue_ip);
-    if (session) {
-        ConfigureQerFlows(session, pdr, pkt->port, false);
-    }
+    ConfigureQerFlows(pdr, false);
     return pdr;
 }
 
-static inline const char *
-ip4_to_buf(uint32_t be_addr, char buf[16]) {
-  inet_ntop(AF_INET, &be_addr, buf, 16);
-  return buf;
-}
+UPDK_PDR *
+GetPdrByTeid(struct rte_mbuf *pkt, const gtp_parse_result_t *gtp_info) {
+    // Locate inner IP header using pre-computed offset
+    size_t inner_offset = sizeof(struct rte_ether_hdr) + gtp_info->outer_hdr_len;
 
-static inline const char *
-mac_to_buf(const uint8_t *mac, char buf[18]) {
-    snprintf(buf, 18, "%02x:%02x:%02x:%02x:%02x:%02x",
-             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
-    return buf;
-}
-
-static void dump_gtpu(const uint8_t *start, size_t len, size_t gtp_off) {
-    printf("---- GTPU Dump (offset %zu, %zu bytes) ----\n", gtp_off, len);
-    for (size_t i = 0; i < len; i++) {
-        if (i % 16 == 0) printf("\n%04zu : ", i);
-        printf("%02x ", start[i]);
-    }
-    printf("\n------------------------------------------\n");
-}
-
-UPDK_PDR *GetPdrByTeid(struct rte_mbuf *pkt, uint32_t td) {
-    char o_src[16], o_dst[16], i_src[16], i_dst[16], ue_s[16], dn_s[16];
     uint16_t data_len = rte_pktmbuf_data_len(pkt);
+    if (data_len < inner_offset + sizeof(struct rte_ipv4_hdr)) return NULL;
 
-    // Outer IPv4
-    struct rte_ipv4_hdr *outer4 = onvm_pkt_ipv4_hdr(pkt);
-    if (!outer4) return NULL;
-    UTLT_Debug("Outer IPv4 src=%s dst=%s totlen=%u",
-               ip4_to_buf(outer4->src_addr, o_src),
-               ip4_to_buf(outer4->dst_addr, o_dst),
-               data_len);
+    struct rte_ipv4_hdr *inner4 = rte_pktmbuf_mtod_offset(pkt, struct rte_ipv4_hdr *, inner_offset);
 
-    // Outer UDP
-    struct rte_udp_hdr *outerU = onvm_pkt_udp_hdr(pkt);
-    if (!outerU) return NULL;
-    if (outerU->dst_port != rte_cpu_to_be_16(2152)) return NULL;
+    // Verify it looks like IPv4
+    if ((inner4->version_ihl >> 4) != 4) return NULL;
 
-    // TEID extraction
-    uint32_t teid = get_teid_gtp_packet(pkt, outerU);
-    UTLT_Debug("Extracted TEID (host order): %u", teid);
-
-    // GTP-U header length + QFI
-    uint8_t qfi = 0;
-    uint16_t payload_offset = get_gtpu_header_len_with_qfi(pkt, &qfi);
-    UTLT_Debug("Computed GTP-U payload_offset=%u QFI=%u", payload_offset, qfi);
-
-    // Base pointer to GTP header
-    uint8_t *base = rte_pktmbuf_mtod(pkt, uint8_t *) +
-                    sizeof(struct rte_ether_hdr) +
-                    ((outer4->version_ihl & 0x0F) * 4) +
-                    sizeof(*outerU);
-
-    // Dump for verification
-    size_t dbg_len = (data_len > 64) ? 64 : data_len;
-    // dump_gtpu(base, dbg_len, (size_t)(base - rte_pktmbuf_mtod(pkt, uint8_t *)));
-
-    // Fallback: verify payload start looks like IPv4, else scan nearby
-    uint8_t *inner_ptr = base + payload_offset;
-
-    if ((inner_ptr[0] >> 4) != 4 || (inner_ptr[0] & 0x0F) < 5) {
-        UTLT_Info("Non-IPv4 start at offset %u (0x%02x), scanning for IPv4...",
-                     payload_offset, inner_ptr[0]);
-        int found = 0;
-        for (int delta = -4; delta <= 4; delta++) {
-            if ((int)payload_offset + delta < 0) continue;
-            uint8_t *cand = base + payload_offset + delta;
-            if ((cand[0] >> 4) == 4 && (cand[0] & 0x0F) >= 5) {
-                UTLT_Info("Adjusted payload_offset from %u to %u",
-                             payload_offset, payload_offset + delta);
-                payload_offset += delta;
-                inner_ptr = cand;
-                found = 1;
-                break;
-            }
-        }
-        if (!found) {
-            UTLT_Error("Failed to locate a valid IPv4 header near offset %u", payload_offset);
-            return NULL;
-        }
-    }
-
-    // Inner IPv4
-    if (data_len < (inner_ptr - rte_pktmbuf_mtod(pkt, uint8_t *)) + sizeof(struct rte_ipv4_hdr))
-        return NULL;
-    struct rte_ipv4_hdr *inner4 = (struct rte_ipv4_hdr *)inner_ptr;
     uint8_t inner_ihl = (inner4->version_ihl & 0x0F) * 4;
+    struct rte_udp_hdr *innerU = rte_pktmbuf_mtod_offset(pkt, struct rte_udp_hdr *,
+        inner_offset + inner_ihl);
 
-    // Inner UDP
-    if (data_len < (inner_ptr - rte_pktmbuf_mtod(pkt, uint8_t *)) + inner_ihl + sizeof(struct rte_udp_hdr))
-        return NULL;
-    struct rte_udp_hdr *innerU = (struct rte_udp_hdr *)(inner_ptr + inner_ihl);
-
-    UTLT_Debug("Inner IPv4 src=%s dst=%s proto=%u QFI=%u",
-               ip4_to_buf(inner4->src_addr, i_src),
-               ip4_to_buf(inner4->dst_addr, i_dst),
-               inner4->next_proto_id, qfi);
-
-    // Build classifier key
+    // Build classifier key using pre-parsed values
     ps_packet_t key = {0};
-    key.teid      = teid;
+    key.teid      = gtp_info->teid;
+    key.qfi       = gtp_info->qfi;
     key.ue_ip     = rte_be_to_cpu_32(inner4->src_addr);
     key.src_ip    = key.ue_ip;
     key.dst_ip    = rte_be_to_cpu_32(inner4->dst_addr);
@@ -871,106 +266,139 @@ UPDK_PDR *GetPdrByTeid(struct rte_mbuf *pkt, uint32_t td) {
     key.dst_port  = rte_be_to_cpu_16(innerU->dst_port);
     key.proto     = inner4->next_proto_id;
     key.tos_tc    = inner4->type_of_service;
-    key.qfi       = qfi;
     key.source_if = SRC_IF_ACCESS;
     key.is_uplink = true;
 
-    //  printf(
-    // "DBG→Classifier Key:\n"
-    // "    teid        = %u\n"
-    // "    ue_ip       = %s\n"
-    // "    src_ip      = %s\n"
-    // "    dst_ip      = %s\n"
-    // "    src_port    = %u\n"
-    // "    dst_port    = %u\n"
-    // "    proto       = %u\n"
-    // "    tos_tc      = %u\n"
-    // "    spi         = %u\n"
-    // "    flow_label  = %u\n"
-    // "    ni_hash     = 0x%08x\n"
-    // "    qfi         = %u\n"
-    // "    source_if   = %u\n"
-    // "    is_uplink   = %s\n",
-    // key.teid,
-    // ip4_to_buf(htonl(key.ue_ip), ue_s),
-    // ip4_to_buf(htonl(key.src_ip), o_dst),   // reuse buffers or add new ones
-    // ip4_to_buf(htonl(key.dst_ip), dn_s),
-    // key.src_port,
-    // key.dst_port,
-    // key.proto,
-    // key.tos_tc,
-    // key.spi,
-    // key.flow_label,
-    // key.ni_hash,
-    // key.qfi,
-    // key.source_if,
-    // key.is_uplink ? "true" : "false");
-
-
-    /* uint16_t pdr_id = UpfClassifyGetPdrId(&key);
-    if (pdr_id == 0) {
-        UTLT_Error("Couldn't classify the packet to a PDR");
-        return NULL;
-    } */
-
-    // printf("PDR ID from Classifier = %" PRIu16 "\n", pdr_id);
-
+    /* ── PartitionSort classifier ──────────────────────────── */
     const UPDK_PDR *pdr = UpfClassifyGetPdrPtr(&key);
     if (!pdr) {
         UTLT_Error("Couldn't classify the packet to a PDR");
         return NULL;
     }
 
-    UpfSession *session = UpfSessionFindByTeid(td);
-    if (session) {
-        ConfigureQerFlows(session, pdr, pkt->port, true);
-    }
+    ConfigureQerFlows(pdr, true);
 
     return pdr;
 }
 
-void *
-GetQerByUEIpAddress(uint32_t ue_ip, char *IP) {
-    if (findIndexByUeIpAddress(ue_ip) == -1) {        
-        UpfSession *session = UpfSessionFindByUeIP(ue_ip);
-        UTLT_Assert(session, return NULL, "session not found error");
-        UTLT_Assert(session->pdr_list, return NULL, "PDR list not initialized");
-        UTLT_Assert(session->pdr_list->len, return NULL, "PDR list contains 0 rules");
+static inline void
+AccumulateQerDlRates(const UPDK_QER *q, uint64_t *ambr64,
+                     uint64_t *gbr64, uint64_t *mbr64,
+                     bool *has_gbr_qer)
+{
+    if (!q || !q->flags.maximumBitrate)
+        return;
 
-        list_node_t *pnode = session->pdr_list->head;
-        list_node_t *qnode = NULL;
-        UpfPDR *pdr = NULL, *target_pdr = NULL;
-        uint32_t ambr = 0;
-        uint32_t gbr = 0;
-        uint32_t mbr = 0;
-
-        while (pnode) {
-            pdr = (UpfPDR *)pnode->val;
-            pnode = pnode->next;
-            for (int i =0;i<2;i++){
-                if (!pdr->qerId[i]) continue;
-                UpfQER * qer = UpfQERFindByID(session, pdr->qerId[i]);
-
-                if (ambr < qer->maximumBitrate.dl) {
-                    ambr = qer->maximumBitrate.dl;
-                }
-                if (qer->flags.guaranteedBitrate && qer->flags.maximumBitrate) {
-                    gbr = qer->guaranteedBitrate.dl;
-                    mbr = qer->maximumBitrate.dl;
-                }
-            }
-        }
-        if (ambr) {
-            UTLT_Warning("Add UE IP: %s, AMBR: %u GBR: %u, MBR: %u" , IP, ambr, gbr, mbr);
-            addEntrybyUeIp(ue_ip, ambr, gbr, mbr);
-            return NULL;
-        }
+    if (q->flags.guaranteedBitrate) {
+        *has_gbr_qer = true;
+        *gbr64 = saturating_add_u64(*gbr64, q->guaranteedBitrate.dl);
+        *mbr64 = saturating_add_u64(*mbr64, q->maximumBitrate.dl);
+        return;
     }
-    else {
-        UTLT_Trace("The UE IP already exists in the table");
-        return NULL;
-    }
+
+    if (q->maximumBitrate.dl > *ambr64)
+        *ambr64 = q->maximumBitrate.dl;
 }
+
+static inline bool
+GetQerRatesFromSession(UpfSession *session, uint64_t *ambr64,
+                       uint64_t *gbr64, uint64_t *mbr64,
+                       bool *has_gbr_qer)
+{
+    list_iterator_t *it;
+    list_node_t *node;
+    bool found = false;
+
+    if (!session || !session->qer_list)
+        return false;
+
+    it = list_iterator_new(session->qer_list, LIST_HEAD);
+    if (!it)
+        return false;
+
+    while ((node = list_iterator_next(it)) != NULL) {
+        const UPDK_QER *q = (const UPDK_QER *)node->val;
+        if (!q || !q->flags.maximumBitrate)
+            continue;
+
+        found = true;
+        AccumulateQerDlRates(q, ambr64, gbr64, mbr64, has_gbr_qer);
+    }
+
+    list_iterator_destroy(it);
+    return found;
+}
+
+static inline bool
+GetQerRatesFromPdr(const UPDK_PDR *pdr, uint64_t *ambr64,
+                   uint64_t *gbr64, uint64_t *mbr64,
+                   bool *has_gbr_qer)
+{
+    bool found = false;
+
+    if (!pdr || pdr->qer_count == 0)
+        return false;
+
+    int n = (int)pdr->qer_count;
+    if (n > 2) n = 2; /* safety; struct currently supports 2 */
+
+    for (int i = 0; i < n; i++) {
+        const UPDK_QER *q = pdr->qers[i];
+        if (!q || !q->flags.maximumBitrate)
+            continue;
+
+        found = true;
+        AccumulateQerDlRates(q, ambr64, gbr64, mbr64, has_gbr_qer);
+    }
+
+    return found;
+}
+
+/* Populate UE table from the owning session when possible. The session-level
+ * non-GBR QER carries AMBR; GBR-bearing QERs carry QoS flow GBR/MBR. */
+static inline int
+GetQerByUEIpAddressFromPdr(uint32_t ue_ip, UpfSession *session,
+                           const UPDK_PDR *pdr, const char *ip_str)
+{
+    if ((!session || !session->qer_list) && (!pdr || pdr->qer_count == 0)) {
+        UTLT_Trace("UE %s: No PDR or PDR has no QERs, skip UE table entry",
+                   ip_str ? ip_str : "<unknown>");
+        return -1;
+    }
+
+    uint64_t ambr64 = 0;
+    uint64_t gbr64  = 0;
+    uint64_t mbr64  = 0;
+    bool has_gbr_qer = false;
+
+    if (!GetQerRatesFromSession(session, &ambr64, &gbr64, &mbr64,
+                                &has_gbr_qer)) {
+        GetQerRatesFromPdr(pdr, &ambr64, &gbr64, &mbr64, &has_gbr_qer);
+    }
+    if (ambr64 == 0 && mbr64 > 0)
+        ambr64 = mbr64;
+
+    if (ambr64 == 0) {
+        UTLT_Trace("UE %s: no DL MBR across PDR QERs, skip UE table entry",
+                   ip_str ? ip_str : "<unknown>");
+        return -1;
+    }
+
+    /* Clamp PFCP 64-bit rates into 32-bit UE table fields */
+    uint32_t ambr = (ambr64 > UINT32_MAX) ? UINT32_MAX : (uint32_t)ambr64;
+    uint32_t gbr  = (gbr64  > UINT32_MAX) ? UINT32_MAX : (uint32_t)gbr64;
+    uint32_t mbr  = (mbr64  > UINT32_MAX) ? UINT32_MAX : (uint32_t)mbr64;
+
+    if (!has_gbr_qer)
+        mbr = 0;
+    if (mbr && gbr > mbr) gbr = mbr;
+
+    UTLT_Warning("Add UE IP: %s, AMBR: %u GBR: %u, MBR: %u",
+                 ip_str ? ip_str : "<unknown>", ambr, gbr, mbr);
+
+    return addEntrybyUeIp(ue_ip, ambr, gbr, mbr);
+}
+
 
 void
 Encap(struct rte_mbuf *pkt, UPDK_FAR *far, UPDK_QER *qer) {
@@ -1013,29 +441,16 @@ Encap(struct rte_mbuf *pkt, UPDK_FAR *far, UPDK_QER *qer) {
                               // udppayloadlen should be raw + gtp header
 
     struct rte_ipv4_hdr *ipv4_hdr = rte_pktmbuf_mtod_offset(pkt, struct rte_ipv4_hdr *, 0);
-    /* SELF_IP and outerHeaderCreation->ipv4.s_addr are both kept in packet/network
-       representation elsewhere in this code. onvm_pkt_fill_ipv4() expects host-order
-       inputs and converts them internally, so convert back before filling. */
-    uint32_t outer_src_nbo = (uint32_t)SELF_IP;
-    if (DcSelfIp != 0 && outerHeaderCreation->ipv4.s_addr == DcGnbIp) {
-        outer_src_nbo = DcSelfIp;
-    }
-    uint32_t outer_src_host = rte_be_to_cpu_32(outer_src_nbo);
-    uint32_t outer_dst_host = rte_be_to_cpu_32(outerHeaderCreation->ipv4.s_addr);
-    char outer_src_ip[16], outer_dst_ip[16];
-    UTLT_Info("Encap outer IPv4 src=%s dst=%s teid=%u raw_dst=0x%08x",
-              ip4_to_buf(rte_cpu_to_be_32(outer_src_host), outer_src_ip),
-              ip4_to_buf(rte_cpu_to_be_32(outer_dst_host), outer_dst_ip),
-              outerHeaderCreation->teid,
-              outerHeaderCreation->ipv4.s_addr);
-    onvm_pkt_fill_ipv4(ipv4_hdr, outer_src_host, outer_dst_host, IPPROTO_UDP);
+    onvm_pkt_fill_ipv4(ipv4_hdr, rte_cpu_to_be_32(g_n3_ip_be), rte_cpu_to_be_32(outerHeaderCreation->ipv4.s_addr),
+               IPPROTO_UDP);
     ipv4_hdr->total_length = rte_cpu_to_be_16(payloadLen + sizeof(gtpv1_t) + sizeof(struct rte_udp_hdr) +
                           sizeof(struct rte_ipv4_hdr));  // raw+gtp8+udp8+ip20
     ipv4_hdr->hdr_checksum = rte_ipv4_cksum(ipv4_hdr);
 }
 
 static int
-HandlePacketWithFar(struct rte_mbuf *pkt, UPDK_FAR *far, UPDK_QER *qer, struct onvm_pkt_meta *meta) {
+HandlePacketWithFar(struct rte_mbuf *pkt, UPDK_FAR *far, UPDK_QER *qer, 
+                    uint16_t out_port, struct onvm_pkt_meta *meta) {
     int buff = 0;
 #define FAR_ACTION_MASK 0x07
     if (far->flags.applyAction) {
@@ -1060,17 +475,14 @@ HandlePacketWithFar(struct rte_mbuf *pkt, UPDK_FAR *far, UPDK_QER *qer, struct o
                         }
                     }
                 }
-                meta->destination = pkt->port ^ 1;
+                // meta->destination = pkt->port ^ 1;
+                meta->destination = out_port;
                 meta->action = ONVM_NF_ACTION_OUT;
                 break;
             case UPDK_FAR_APPLY_ACTION_BUFF:
-                meta->destination = pkt->port ^ 1;
+                /* UL should never hit BUFF; DL uses per-session rings.
+                 * If we get here unexpectedly, just drop the packet. */
                 meta->action = ONVM_NF_ACTION_DROP;
-                if (buffer_length < MAX_OF_BUFFER_PACKET_SIZE) {
-                    Encap(pkt, far, qer);
-                    buffer[buffer_length++] = pkt;
-                    buff = 1;
-                }
                 break;
             default:
                 UTLT_Error("Unspec apply action[%u] in FAR[%u]", far->applyAction, far->farId);
@@ -1097,8 +509,45 @@ HandlePacketWithFar(struct rte_mbuf *pkt, UPDK_FAR *far, UPDK_QER *qer, struct o
     return buff;
 }
 
-/* --- NR-DC 4-tuple hash for per-flow ECMP --- */
+/* Per-session drain helper
+ * Dequeue up to max_pkts from session ring, set meta OUT, and TX.
+ * Returns the number of packets actually transmitted. */
+static uint32_t
+drain_session_batch(int sess_idx, uint32_t max_pkts, struct onvm_nf *nf) {
+    UpfSessBuf *sb = &g_sess_buf[sess_idx];
+    if (!sb->ring_created || !sb->ring)
+        return 0;
 
+    struct onvm_configuration *onvm_config = onvm_nflib_get_onvm_config();
+    struct rte_mbuf *drain_buf[DRAIN_CHUNK];
+    uint32_t total = 0;
+
+    while (total < max_pkts) {
+        uint32_t want = max_pkts - total;
+        if (want > DRAIN_CHUNK) want = DRAIN_CHUNK;
+        uint32_t n = rte_ring_sc_dequeue_burst(sb->ring,
+                        (void **)drain_buf, want, NULL);
+        if (n == 0) break;
+
+        /* Restore action to OUT so onvm_pkt_process_tx_batch sends them */
+        for (uint32_t j = 0; j < n; j++) {
+            struct onvm_pkt_meta *m =
+                onvm_get_pkt_meta(drain_buf[j],
+                                  onvm_config->dynfield_offset);
+            m->action = ONVM_NF_ACTION_OUT;
+        }
+
+        onvm_pkt_process_tx_batch(nf->nf_tx_mgr, drain_buf,
+                                  onvm_config->dynfield_offset, n, nf);
+        onvm_pkt_flush_all_nfs(nf->nf_tx_mgr, nf);
+        total += n;
+    }
+    if (rte_ring_count(sb->ring) == 0)
+        sb->touched = 0;
+    return total;
+}
+
+/* --- NR-DC: 4-tuple hash for per-flow DL ECMP --- */
 static inline uint32_t
 dc_hash_four_tuple(const struct rte_ipv4_hdr *iph, uint16_t pkt_len)
 {
@@ -1121,85 +570,129 @@ dc_hash_four_tuple(const struct rte_ipv4_hdr *iph, uint16_t pkt_len)
     return src_ip ^ dst_ip ^ ((uint32_t)src_port << 16) ^ (uint32_t)dst_port;
 }
 
-static inline void
-AttachL2Header(struct rte_mbuf *pkt, bool is_dl, const uint8_t *dl_dst_mac) {
-    // Prepend ethernet header
-    struct rte_ether_hdr *eth_hdr =
-        (struct rte_ether_hdr *)rte_pktmbuf_prepend(pkt, (uint16_t)sizeof(struct rte_ether_hdr));
-
-    // next hop's mac address
-    if (is_dl == true) {
-        rte_ether_addr_copy(&cn_ue_eth, &eth_hdr->src_addr);
-        memcpy(eth_hdr->dst_addr.addr_bytes, dl_dst_mac, RTE_ETHER_ADDR_LEN);
-    } else {
-        rte_ether_addr_copy(&cn_dn_eth, &eth_hdr->src_addr);
-        rte_ether_addr_copy(&dn_eth, &eth_hdr->dst_addr);
-    }
-
-    char src_mac[18], dst_mac[18];
-    UTLT_Info("AttachL2Header is_dl=%d src_mac=%s dst_mac=%s",
-              is_dl ? 1 : 0,
-              mac_to_buf(eth_hdr->src_addr.addr_bytes, src_mac),
-              mac_to_buf(eth_hdr->dst_addr.addr_bytes, dst_mac));
-
-    eth_hdr->ether_type = rte_cpu_to_be_16(RTE_ETHER_TYPE_IPV4);
-}
-
 static int
 packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm_nf_local_ctx *nf_local_ctx) {
     if (pkt == NULL || meta == NULL) {
         return 0;
     }
+
+    /* Get Ethernet header */
+    struct rte_ether_hdr *eth = onvm_pkt_ether_hdr(pkt);
+    if (!eth) {
+        meta->action = ONVM_NF_ACTION_DROP;
+        return 0;
+    }
+
+    /* Handle ARP packets */
+    if (rte_be_to_cpu_16(eth->ether_type) == RTE_ETHER_TYPE_ARP) {
+        handle_arp_packet(pkt, meta, nf_local_ctx);
+        return 0;
+    }
+
+    /* Handle local ICMP echo request to UPF-U itself */
+    if (handle_local_icmp_echo(pkt, meta, nf_local_ctx)) {
+        return 0;
+    }
+
     uint32_t cal_pktlen = 0;
+    bool cal_pktlen_valid = false;
     UTLT_Trace("Get packet\n");
     UTLT_Info("Handle PKT from port: %d [len: %d]", pkt->port, pkt->pkt_len);
-    cal_pktlen = pkt->pkt_len - sizeof(struct rte_ether_hdr) - sizeof(struct rte_ipv4_hdr) - sizeof(struct rte_udp_hdr);
 
     bool is_dl = false;
     meta->action = ONVM_NF_ACTION_DROP;
-    struct rte_ipv4_hdr *iph = onvm_pkt_ipv4_hdr(pkt);
 
+    /* Get IPv4 header */
+    struct rte_ipv4_hdr *iph = onvm_pkt_ipv4_hdr(pkt);
     if (iph == NULL) {
         UTLT_Info("Not IP packet, ignore it\n");
         return 0;
     }
+    cal_pktlen_valid =
+        upf_u_shaper_dl_packet_len(pkt, iph, &cal_pktlen);
 
     // Flip to a newly published snapshot if a REQ was received
     UpfClsMaybeFlipAndAck();
 
     UPDK_PDR *pdr = NULL;
+    gtp_parse_result_t gtp_info = {0};
+    int ue_idx = -1;
+    UpfSession *owner_session = NULL;
+    uint32_t ue_key = 0;
+    struct upf_u_shaper_flow_key dl_flow_key = {0};
 
-    char *src_address = convertToIpAddress(iph->src_addr);
+    /* char *src_address = convertToIpAddressString(iph->src_addr);
     UTLT_Info("Src IP is %s\n", src_address);
-    char *dst_address = convertToIpAddress(iph->dst_addr);
-    UTLT_Info("Dst IP is %s\n", dst_address);
+    char *dst_address = convertToIpAddressString(iph->dst_addr);
+    UTLT_Info("Dst IP is %s\n", dst_address); */
 
-    if (PacketTargetsLocalUpf(iph->dst_addr)) {
+    if (iph->dst_addr == g_n3_ip_be) {  //
         UTLT_Info("It is uplink\n");
 
         struct rte_udp_hdr *udp_header = onvm_pkt_udp_hdr(pkt);
         if (udp_header == NULL) {
             return 0;
         }
-        // invariant(dst_port == GTPV1_PORT);
-        // extract TEID from
-        // Step 2: Get PDR rule
-        uint32_t teid = get_teid_gtp_packet(pkt, udp_header);
-        pdr = GetPdrByTeid(pkt, teid);
+
+        if (parse_gtpu_once(pkt, &gtp_info) < 0 || !gtp_info.valid) {
+            return 0;
+        }
+        pdr = GetPdrByTeid(pkt, &gtp_info);
 
     } else {
-        UTLT_Info("It is downlink, dst is %s\n", convertToIpAddress(iph->dst_addr));
+        UTLT_Trace("DL ingress: port=%u dst=%s proto=%u",
+                   pkt->port,
+                   convertToIpAddressString(iph->dst_addr),
+                   iph->next_proto_id);
+
+        if (pkt->port == g_n6_port && g_nat_enabled) {
+            int dnat_rc = nat_apply_dnat(iph);
+            UTLT_Trace("DL NAT: rc=%d post-dnat dst=%s proto=%u",
+                       dnat_rc,
+                       convertToIpAddressString(iph->dst_addr),
+                       iph->next_proto_id);
+            if (dnat_rc < 0 && iph->dst_addr == g_nat_public_ip_be) {
+                UTLT_Warning("NAT DNAT miss for public packet %s:%u",
+                             convertToIpAddressString(iph->dst_addr),
+                             nat_dst_port(iph));
+                meta->action = ONVM_NF_ACTION_DROP;
+                return 0;
+            }
+        }
+
         pdr = GetPdrByUeIpAddress(pkt, rte_cpu_to_be_32(iph->dst_addr));
-        GetQerByUEIpAddress(rte_cpu_to_be_32(iph->dst_addr), convertToIpAddress(iph->dst_addr));
         is_dl = true;
     }
 
     if (!pdr) {
-        UTLT_Error("no PDR found for %s, skip\n", convertToIpAddress(iph->dst_addr));
-        // TODO(vivek): what to do?
+        UTLT_Error("no PDR found for %s, skip\n", convertToIpAddressString(iph->dst_addr));
+        meta->action = ONVM_NF_ACTION_DROP;
         return 0;
     }
     UTLT_Info("Got PDR ID is %u\n", pdr->pdrId);
+
+    if (is_dl) {
+        ue_key = rte_cpu_to_be_32(iph->dst_addr);
+        if (!cal_pktlen_valid) {
+            UTLT_Warning("Invalid DL IPv4/L4 length for UE %s, drop",
+                         convertToIpAddressString(iph->dst_addr));
+            meta->action = ONVM_NF_ACTION_DROP;
+            return 0;
+        }
+        owner_session = UpfSessionFindByUeIP(ue_key);
+        ue_idx = findIndexByUeIpAddress(ue_key);
+        if (ue_idx < 0) {
+            ue_idx = GetQerByUEIpAddressFromPdr(ue_key, owner_session, pdr,
+                                                convertToIpAddressString(iph->dst_addr));
+        }
+        if (!upf_u_shaper_build_dl_flow_key(pkt, pdr, ue_key, pdr->has_fd,
+                                            &dl_flow_key)) {
+            UTLT_Error("Failed to build DL shaper flow key");
+            meta->action = ONVM_NF_ACTION_DROP;
+            return 0;
+        }
+    }
+
     rte_pktmbuf_adj(pkt, sizeof(struct rte_ether_hdr));
 
     UPDK_FAR *far;
@@ -1211,16 +704,9 @@ packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm_nf_
     }
 
     if (pdr->flags.outerHeaderRemoval) {
-        uint16_t outerHeaderLen = 0;
         switch (pdr->outerHeaderRemoval) {
             case OUTER_HEADER_REMOVAL_GTP_IP4: {
-                outerHeaderLen = sizeof(struct rte_ipv4_hdr) + sizeof(struct rte_udp_hdr);
-
-                // get gtp_header length
-                uint16_t gtp_length = get_gtpu_header_len(pkt);
-                outerHeaderLen += gtp_length;
-
-                rte_pktmbuf_adj(pkt, outerHeaderLen);
+                rte_pktmbuf_adj(pkt, gtp_info.outer_hdr_len);
             } break;
             case OUTER_HEADER_REMOVAL_GTP_IP6:
             case OUTER_HEADER_REMOVAL_UDP_IP4:
@@ -1235,125 +721,283 @@ packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm_nf_
         }
     }
 
-    int status = 0, color_result = 0;
-
-    /* --- Session-local downlink path selection --- */
-    const uint8_t *dl_dst_mac = AnMac;  // default: master gNB MAC
-    UPDK_FAR dl_far_copy;               // stack-local FAR with selected path endpoint
-
-    if (is_dl && DcEnabled) {
-        UpfSession *session = UpfSessionFindByUeIP(rte_cpu_to_be_32(iph->dst_addr));
-        if (session) {
-            struct rte_ipv4_hdr *inner_iph = rte_pktmbuf_mtod(pkt, struct rte_ipv4_hdr *);
-            uint16_t inner_len = pkt->data_len;
-            uint32_t path_hash = dc_hash_four_tuple(inner_iph, inner_len);
-            far = UpfSessionSelectDlFarByHash(session, far, path_hash, &dl_far_copy);
-        }
-    }
-
-    /* Derive L2 destination MAC from the FAR's actual outer IP destination.
-     * This ensures the MAC always matches the outer IP regardless of which
-     * PDR was matched or what the ECMP hash decided. */
-    if (is_dl && DcEnabled && DcGnbIp != 0 &&
-        far->flags.forwardingParameters &&
-        far->forwardingParameters.flags.outerHeaderCreation &&
-        far->forwardingParameters.outerHeaderCreation.ipv4.s_addr == DcGnbIp) {
-        dl_dst_mac = DcAnMac;
-    }
-
-    if (is_dl && far->flags.forwardingParameters &&
-        far->forwardingParameters.flags.outerHeaderCreation) {
-        uint32_t final_outer_dst = far->forwardingParameters.outerHeaderCreation.ipv4.s_addr;
-        const char *final_path = "default gNB";
-        char final_outer_dst_ip[16];
-
-        if (DcEnabled && DcGnbIp != 0 && final_outer_dst == DcGnbIp) {
-            final_path = "secondary gNB";
-        } else if ((uint32_t)SELF_IP != 0) {
-            final_path = "master gNB";
-        }
-
-        UTLT_Info("DC final path: %s outer_dst=%s teid=%u",
-                  final_path,
-                  ip4_to_buf(final_outer_dst, final_outer_dst_ip),
-                  far->forwardingParameters.outerHeaderCreation.teid);
-    }
-
-    status = HandlePacketWithFar(pkt, far, pdr->qer, meta);
-    if (meta->action == ONVM_NF_ACTION_DROP) {
-        UTLT_Info("Action is drop\n");
-    } else if (meta->action == ONVM_NF_ACTION_OUT) {
-        UTLT_Info("Action is out\n");
-    } else {
-        UTLT_Trace("Action is unknown\n");
-    }
-    AttachL2Header(pkt, is_dl, dl_dst_mac);
-    if (meta->action == ONVM_NF_ACTION_OUT && is_dl) {
-        // check if the UE IP exists in the table and update the token
-        int index = findIndexByUeIpAddress(rte_cpu_to_be_32(iph->dst_addr));
-        if (index != -1) {
-            UTLT_Trace("Update token for UE IP: %s", convertToIpAddress(iph->dst_addr));
-            updateTokenbyIndex(index);
-        }
-        else {
-            UTLT_Error("No UE IP found in the table");
-            return status;
-        }
-
-        // Step 1. trTCM (QoS flow)
-        int key, fd_target, prefix_len;
-        bool isQos = false;
-        uint64_t curr_time = rte_get_tsc_cycles();
-        struct rte_meter_trtcm_profile *trtcm_profile = NULL;
-
-        char *ip_str = strstr(pdr->pdi.sdfFilter.flowDescription, "from");
-        if (ip_str != NULL) {
-            ip_str += 5; // Skip "from "
-            char *end_ptr = strchr(ip_str, ' ');
-            if (end_ptr != NULL) {
-                *end_ptr = '\0'; // Null-terminate the extracted IP
-            }
-        }
-
-        if (ip_str != NULL && strcmp(ip_str, "any") != 0) {
-            isQos = true;
-            fd_target = charStr2MaskedIP(ip_str, &prefix_len);
-            trtcm_profile = &app_flow_trtcm_profile;
-            key = (pdr->pdi.flags.sdfFilter) ? SourceInterfaceToPort(pdr->pdi.sourceInterface) + fd_target : SourceInterfaceToPort(pdr->pdi.sourceInterface);
-            color_result = trtcmColorHandle(cal_pktlen, curr_time, ftSearch(key), trtcm_profile);
-            if (trtcmPolicer(meta, color_result) > 0)
-                UTLT_Error("trTCM Policer error");
-        }
-        
-        // Step 2. bucket (QoS flow)
-        if (isQos) {
-            if (meta->flags == RTE_COLOR_RED) {
-                meta->action = ONVM_NF_ACTION_DROP;
-            }
-            if (meta->flags == RTE_COLOR_GREEN) {
-                ue_table[index].ue_qos_tb_params.tb_tokens -= cal_pktlen;
-                meta->action = ONVM_NF_ACTION_OUT;
-            }
-            if (meta->flags == RTE_COLOR_YELLOW) {
-                while (ue_table[index].ue_qos_tb_params.tb_tokens < cal_pktlen) {
-                    updateTokenbyIndex(index);
-                    usleep(1);
+    if (is_dl) {
+        /* ── NR-DC: per-flow DL path selection via the session DL-path
+         * cache. Swapping `far` here is the entire DC delta: the encap
+         * below reads the selected FAR's outerHeaderCreation, and
+         * attach_l2_or_arp resolves the matching next-hop MAC by ARP. ── */
+        UpfFAR dl_far_copy;
+        if (DcEnabled) {
+            UpfSession *dc_session =
+                UpfSessionFindByUeIP(rte_cpu_to_be_32(iph->dst_addr));
+            if (dc_session) {
+                struct rte_ipv4_hdr *inner_iph =
+                    rte_pktmbuf_mtod(pkt, struct rte_ipv4_hdr *);
+                uint32_t path_hash =
+                    dc_hash_four_tuple(inner_iph, pkt->data_len);
+                far = UpfSessionSelectDlFarByHash(dc_session, far,
+                                                  path_hash, &dl_far_copy);
+                if (far->flags.forwardingParameters &&
+                    far->forwardingParameters.flags.outerHeaderCreation) {
+                    UTLT_Trace("DC final path: %s teid=%u",
+                               (DcGnbIp != 0 &&
+                                far->forwardingParameters.outerHeaderCreation.ipv4.s_addr == DcGnbIp)
+                                   ? "secondary gNB" : "master gNB",
+                               far->forwardingParameters.outerHeaderCreation.teid);
                 }
-                ue_table[index].ue_qos_tb_params.tb_tokens -= cal_pktlen;
-                meta->action = ONVM_NF_ACTION_OUT;      
             }
         }
-        // Step 2. bucket (non QoS flow)
-        else {
-            while (ue_table[index].ue_nqos_tb_params.tb_tokens < cal_pktlen) {
-                updateTokenbyIndex(index);
-                usleep(1);
-            }
-            ue_table[index].ue_nqos_tb_params.tb_tokens -= cal_pktlen;
-            meta->action = ONVM_NF_ACTION_OUT;
+
+        /* ── DL: split BUFF vs FORW ─────────────────────────── */
+        uint8_t far_action = far->applyAction & FAR_ACTION_MASK;
+        struct onvm_nf *nf = nf_local_ctx->nf;
+        int32_t sess_idx = pdr->session_index;
+
+        /* DROP → just let the framework free the pkt */
+        if (far_action == UPDK_FAR_APPLY_ACTION_DROP) {
+            meta->action = ONVM_NF_ACTION_DROP;
+            goto dl_nocp;
         }
+         /* Validate session ring */
+        if (sess_idx < 0 || sess_idx >= SESS_BUF_MAX_USERS) {
+            meta->action = ONVM_NF_ACTION_DROP;
+            goto dl_nocp;
+        }
+        UpfSessBuf *sb = &g_sess_buf[sess_idx];
+        if (!sb->ring_created || !sb->ring) {
+            meta->action = ONVM_NF_ACTION_DROP;
+            goto dl_nocp;
+        }
+
+        /* Encap (GTP-U outer header) */
+        if (far->flags.forwardingParameters &&
+            far->forwardingParameters.flags.outerHeaderCreation) {
+            UPDK_OuterHeaderCreation *ohc =
+                &far->forwardingParameters.outerHeaderCreation;
+            if (ohc->description ==
+                UPDK_OUTER_HEADER_CREATION_DESCRIPTION_GTPU_UDP_IPV4)
+                Encap(pkt, far, pdr->qer);
+        }
+
+        uint32_t gnb_n3_ip_be = g_nat_enabled 
+            ? g_an_peer_n3_ip_be
+            : far->forwardingParameters.outerHeaderCreation.ipv4.s_addr;
+        UTLT_Trace("gNB N3 IP: %s\n", convertToIpAddressString(gnb_n3_ip_be));
+
+        // Regardless of BUFF vs FORW, we need to attach L2 (or ARP) header
+        // before sending to N3 port.
+        if (attach_l2_or_arp(pkt, g_n3_port, g_n3_ip_be, gnb_n3_ip_be,
+                            nf_local_ctx->nf) < 0) {
+            meta->action = ONVM_NF_ACTION_DROP;   /* or buffer */
+            return 0;
+        }
+        meta->destination = g_n3_port; // DL always goes to N3 port after FAR processing (may be modified by QoS policing below)
+
+        if (far_action == UPDK_FAR_APPLY_ACTION_BUFF) {
+            /* Buffer-only: prepare packet for later TX, enqueue, then DROP */
+            sb->is_buffering = 1;
+
+            /* Enqueue into session ring.
+             * Bump refcnt so the framework's rte_pktmbuf_free (DROP below)
+             * only decrements 2→1 — the ring holds the other reference. */
+            rte_mbuf_refcnt_update(pkt, 1);
+            if (rte_ring_sp_enqueue(sb->ring, pkt) != 0) {
+                rte_mbuf_refcnt_update(pkt, -1);
+                meta->action = ONVM_NF_ACTION_DROP;
+                goto dl_nocp;
+            }
+
+            sb->touched = 1;
+            meta->action = ONVM_NF_ACTION_DROP;
+            goto dl_nocp;
+        }
+
+        /* QoS shaping — FORW only, after GTP-U/L2 TX prep is complete.
+         * Over-token packets wait in bounded per-flow FIFOs; only red,
+         * invalid, or queue-overflow packets drop. */
+        if (far_action == UPDK_FAR_APPLY_ACTION_FORW) {
+            if (ue_idx < 0) {
+                UTLT_Error("No UE IP found in the table");
+                meta->action = ONVM_NF_ACTION_DROP;
+                goto dl_nocp;
+            }
+
+            int color_result = 0;
+            bool isQos = false;
+            uint64_t curr_time = rte_get_tsc_cycles();
+
+            if (pdr->has_fd) {
+                isQos = true;
+                int ft_idx = ftSearch(pdr->meter_key);
+                struct rte_meter_trtcm_profile *trtcm_profile;
+                if (unlikely(ft_idx < 0 || ft_idx >= (int)APP_FLOWS_MAX)) {
+                    UTLT_Warning("DL QoS: no trTCM flow for meter_key=%u (ft_idx=%d) pdr=%u seid=%lu; dropping",
+                                 pdr->meter_key, ft_idx, pdr->pdrId, seid);
+                    meta->flags = RTE_COLOR_RED;
+                    meta->action = ONVM_NF_ACTION_DROP;
+                    goto dl_nocp;
+                }
+                trtcm_profile = trtcmProfileForFlow(ft_idx);
+                if (unlikely(trtcm_profile == NULL)) {
+                    UTLT_Warning("DL QoS: no trTCM profile for meter_key=%u ft_idx=%d pdr=%u seid=%lu; dropping",
+                                 pdr->meter_key, ft_idx, pdr->pdrId, seid);
+                    meta->flags = RTE_COLOR_RED;
+                    meta->action = ONVM_NF_ACTION_DROP;
+                    goto dl_nocp;
+                }
+                color_result = trtcmColorHandle(cal_pktlen, curr_time,
+                                                ft_idx, trtcm_profile);
+                if (unlikely(color_result < 0)) {
+                    meta->flags = RTE_COLOR_RED;
+                    meta->action = ONVM_NF_ACTION_DROP;
+                    goto dl_nocp;
+                }
+                // set the meta action to out for now, and trtcmPolicer will update it to drop if color is red
+                meta->action = ONVM_NF_ACTION_OUT;
+                if (trtcmPolicer(meta, color_result) > 0)
+                    UTLT_Error("trTCM Policer error");
+            }
+
+            if (isQos) {
+                if (meta->flags == RTE_COLOR_RED) {
+                    upf_u_shaper_drop_red(meta);
+                    goto dl_nocp;
+                }
+                if (meta->flags == RTE_COLOR_GREEN ||
+                    meta->flags == RTE_COLOR_YELLOW) {
+                    enum upf_u_shaper_pkt_color color =
+                        (meta->flags == RTE_COLOR_GREEN) ?
+                        UPF_U_SHAPER_COLOR_GREEN :
+                        UPF_U_SHAPER_COLOR_YELLOW;
+                    enum upf_u_shaper_decision decision =
+                        upf_u_shaper_shape_or_enqueue(
+                            ue_idx, &dl_flow_key, true, color, pkt,
+                            cal_pktlen, meta);
+                    if (decision != UPF_U_SHAPER_PASS)
+                        goto dl_nocp;
+                }
+            } else {
+                enum upf_u_shaper_decision decision =
+                    upf_u_shaper_shape_or_enqueue(
+                        ue_idx, &dl_flow_key, false,
+                        UPF_U_SHAPER_COLOR_NQOS, pkt, cal_pktlen, meta);
+                if (decision != UPF_U_SHAPER_PASS)
+                    goto dl_nocp;
+            }
+        }
+
+        /* Non-BUFF (typically FORW): drain any previously queued packets,
+         * then forward the current packet immediately (no enqueue). */
+        sb->is_buffering = 0;
+        if (sb->touched)
+            drain_session_batch(sess_idx, INLINE_DRAIN_BATCH, nf);
+
+        meta->action = ONVM_NF_ACTION_OUT;
+
+        goto dl_nocp;
+
+    dl_nocp:
+        if (far->applyAction & UPDK_FAR_APPLY_ACTION_NOCP) {
+            Event *msg = (Event *)rte_calloc(NULL, 1, sizeof(Event), 0);
+            msg->type = UPF_EVENT_SESSION_REPORT;
+            msg->arg0 = seid;
+            msg->arg1 = pdrId;
+            UTLT_Debug("Send to upf-c, namely service id is 2\n");
+            onvm_nflib_send_msg_to_nf(2, msg);
+        } 
+        return 0;
+    } else {
+        /* ── UL: original HandlePacketWithFar path (unchanged) ── */
+        int status = HandlePacketWithFar(pkt, far, pdr->qer, g_n6_port, meta);
+
+        /* Get Inner IPv4 header */
+        struct rte_ipv4_hdr *inner_iph = rte_pktmbuf_mtod(pkt, struct rte_ipv4_hdr *);
+        if (inner_iph == NULL) {
+            UTLT_Warning("Inner packet is NULL, drop it\n");
+            meta->action = ONVM_NF_ACTION_DROP;
+            return 0;
+        }
+
+        if ((inner_iph->version_ihl >> 4) != 4) {
+            UTLT_Warning("Inner packet is not IPv4, drop it\n");
+            meta->action = ONVM_NF_ACTION_DROP;
+            return 0;
+        }
+
+        if (g_nat_enabled && meta->action == ONVM_NF_ACTION_OUT) {
+            char src_buf[16];
+            char dst_buf[16];
+            UTLT_Trace("UL ingress: port=%u src=%s dst=%s proto=%u",
+                       pkt->port,
+                       ipv4_to_buf(inner_iph->src_addr, src_buf),
+                       ipv4_to_buf(inner_iph->dst_addr, dst_buf),
+                       inner_iph->next_proto_id);
+            if (nat_apply_snat(inner_iph) < 0) {
+                meta->action = ONVM_NF_ACTION_DROP;
+                return 0;
+            }
+            UTLT_Trace("UL NAT: post-snat src=%s dst=%s proto=%u",
+                       ipv4_to_buf(inner_iph->src_addr, src_buf),
+                       ipv4_to_buf(inner_iph->dst_addr, dst_buf),
+                       inner_iph->next_proto_id);
+        }
+
+        if (meta->action == ONVM_NF_ACTION_OUT) {
+            /* Get the DN server IP address */
+            uint32_t dn_server_ip_be = inner_iph->dst_addr;
+            UTLT_Trace("DN server IP: %s\n", convertToIpAddressString(dn_server_ip_be));
+
+            /* UL QoS policing (flow-level): applies when CP provided SDF (has_fd)
+             * and per-flow QER contains MBR/GBR. For UDP tests, you must check
+             * server-side throughput/loss or use TCP to observe the cap. */
+            if (pdr && pdr->has_fd && pdr->qer && pdr->qer->flags.maximumBitrate) {
+                uint32_t dst_ip_host = rte_be_to_cpu_32(dn_server_ip_be);
+                if (!pdr->has_fd_to || (dst_ip_host & pdr->fd_to_mask) == pdr->fd_to_net) {
+                    int ft_idx = ftSearch(pdr->meter_key);
+                    if (unlikely(ft_idx < 0 || ft_idx >= (int)APP_FLOWS_MAX)) {
+                        UTLT_Warning("UL QoS: no trTCM flow for meter_key=%u (ft_idx=%d) pdr=%u seid=%lu; dropping",
+                                    pdr->meter_key, ft_idx, pdr->pdrId, seid);
+                        meta->flags = RTE_COLOR_RED;
+                        meta->action = ONVM_NF_ACTION_DROP;
+                        return 0;
+                    }
+
+                    uint64_t curr_time = rte_get_tsc_cycles();
+                    struct rte_meter_trtcm_profile *trtcm_profile =
+                        trtcmProfileForFlow(ft_idx);
+                    if (unlikely(trtcm_profile == NULL)) {
+                        UTLT_Warning("UL QoS: no trTCM profile for meter_key=%u ft_idx=%d pdr=%u seid=%lu; dropping",
+                                    pdr->meter_key, ft_idx, pdr->pdrId, seid);
+                        meta->flags = RTE_COLOR_RED;
+                        meta->action = ONVM_NF_ACTION_DROP;
+                        return 0;
+                    }
+                    int color_result = trtcmColorHandle(pkt->pkt_len, curr_time,
+                                                        ft_idx, trtcm_profile);
+                    if (unlikely(color_result < 0)) {
+                        meta->flags = RTE_COLOR_RED;
+                        meta->action = ONVM_NF_ACTION_DROP;
+                        return 0;
+                    }
+                    if (trtcmPolicer(meta, color_result) > 0)
+                        UTLT_Error("UL trTCM Policer error");
+
+                    if (meta->action == ONVM_NF_ACTION_DROP)
+                        return 0;
+                }
+            }
+
+            /* Attach L2 (or ARP) header for the N6-bound packet */
+            dn_server_ip_be = g_nat_enabled ? g_dn_peer_n6_ip_be : dn_server_ip_be;
+
+            if (attach_l2_or_arp(pkt, g_n6_port, g_n6_ip_be, dn_server_ip_be,
+                                nf_local_ctx->nf) < 0) {
+                meta->action = ONVM_NF_ACTION_DROP;
+                return 0;
+            }
+        }
+        return status;
     }
-    return status;
 }
 
 void
@@ -1377,64 +1021,44 @@ msg_handler(void *msg_data, struct onvm_nf_local_ctx *nf_local_ctx) {
         return;
     }
 
-
-    struct onvm_nf *nf = nf_local_ctx->nf;
-
-    if (buffer_length <= 0) {
-        if (e) rte_free(e);
+    /* EVENT drain: CP tells us BUFF→FORW for a specific session */
+    if (e && (uint32_t)e->type == UPF_EVENT_CLEAR_AND_DRAIN) {
+        struct onvm_nf *nf = nf_local_ctx->nf;
+        int sess_idx = (int)(uintptr_t)e->arg0;
+        if (sess_idx >= 0 && sess_idx < SESS_BUF_MAX_USERS) {
+            g_sess_buf[sess_idx].is_buffering = 0;
+            uint32_t n = drain_session_batch(sess_idx, UINT32_MAX, nf);
+            UTLT_Debug("EVENT drain: sess %d, sent %u pkts\n", sess_idx, n);
+        }
+        rte_free(e);
         return;
     }
 
-    // struct onvm_pkt_meta *meta;
-//#ifdef FIX_BUFFER
-//    for (i = 0; i < buffer_length; i++) {
-        // TODO: (@vivek fix it)
-//        Encap(buffer[i]);
-//        AttachL2Header(buffer[i], 1); // 1 == Downlink packet
-//        meta = onvm_get_pkt_meta(buffer[i]);
-//        meta = ONVM_NF_ACTION_OUT;
-//    }
-//#endif
-
-    struct onvm_configuration *onvm_config = onvm_nflib_get_onvm_config();
-    if (onvm_config == NULL) {
-        fprintf(stderr, "Error: onvm_nflib_get_onvm_config() returned NULL\n");
-        exit(EXIT_FAILURE);
-    }
-    onvm_pkt_process_tx_batch(nf->nf_tx_mgr, buffer, onvm_config->dynfield_offset, buffer_length, nf);
-    onvm_pkt_flush_all_nfs(nf->nf_tx_mgr, nf);
-    UTLT_Debug("Sending out %u packets\n", buffer_length);
-    buffer_length = 0;
     if (e) rte_free(e);
 }
 
-uint64_t last_p = NULL;
+static uint64_t last_p = 0;
 
-static int 
+static int
 callback_handler(struct onvm_nf_local_ctx *nf_local_ctx) {
-    if (unlikely(!last_p)) last_p = rte_get_tsc_cycles();
-    uint64_t cur_p = rte_get_tsc_cycles(), before;
     struct onvm_nf *nf;
-    struct onvm_pkt_meta *meta;
-    struct packet_buf *out_buf;
+    uint64_t cur_p;
+
+    if (unlikely(nf_local_ctx == NULL || nf_local_ctx->nf == NULL))
+        return 0;
+
     nf = nf_local_ctx->nf;
+    if (unlikely(!last_p)) last_p = rte_get_tsc_cycles();
+    cur_p = rte_get_tsc_cycles();
 
-    // if (buffer_length > 0){
-    //     for (int i = 0; i < buffer_length; i++) {
-    //         meta = onvm_get_pkt_meta(buffer[i]);
-    //         meta->action = ONVM_NF_ACTION_OUT;
-    //     }
-    //     onvm_pkt_process_tx_batch(nf->nf_tx_mgr, buffer, buffer_length, nf);
-    //     onvm_pkt_enqueue_tx_thread(nf->nf_tx_mgr->to_tx_buf, nf);
-    //     UTLT_Debug("Sending out %u packets\n", buffer_length);
-    //     buffer_length = 0;
-    // } 
+    upf_u_shaper_drain(nf);
 
-    if (unlikely((cur_p - last_p)/(double)rte_get_timer_hz() > 1)){
+    if (unlikely(cur_p - last_p > rte_get_timer_hz())) {
         last_p = cur_p;
         UTLT_Debug("Stats perform: ");
         UTLT_Debug("act out: %d", nf->stats.act_out);
         UTLT_Debug("buffered: %d", nf->stats.tx_buffer);
+        upf_u_shaper_log_stats();
     }
 
     return 0;
@@ -1445,15 +1069,14 @@ main(int argc, char *argv[]) {
     int arg_offset;
     struct onvm_nf_local_ctx *nf_local_ctx;
     struct onvm_nf_function_table *nf_function_table;
-    // Use info while debugging dataplane path issues.
-    UTLT_SetLogLevel("info");
+    UTLT_SetLogLevel("warning"); // temporary default before config is loaded
 
     nf_local_ctx = onvm_nflib_init_nf_local_ctx();
     onvm_nflib_start_signal_handler(nf_local_ctx, NULL);
     nf_function_table = onvm_nflib_init_nf_function_table();
     nf_function_table->pkt_handler = &packet_handler;
     nf_function_table->msg_handler = &msg_handler;
-    // nf_function_table->user_actions = &callback_handler;
+    nf_function_table->user_actions = &callback_handler;
 
     if ((arg_offset = onvm_nflib_init(argc, argv, NF_TAG, nf_local_ctx, nf_function_table)) < 0) {
         onvm_nflib_stop(nf_local_ctx);
@@ -1465,48 +1088,61 @@ main(int argc, char *argv[]) {
         }
     }
 
+    /* Initialize dynamic field offset */
+    struct onvm_configuration *onvm_config = onvm_nflib_get_onvm_config();
+    nf_local_ctx->nf->dynfield_offset = onvm_config->dynfield_offset;
+
     const char *config_path = "config/upf_u.yaml";
 
     if (argc > arg_offset + 1) {
         config_path = argv[arg_offset + 1];
     }
+
     printf("[UPF-U] Using config: %s\n", config_path);
-    UpfU_LoadAndParseConfig(config_path);
+    if (UpfU_LoadAndParseConfig(config_path) != 0) {
+        rte_exit(EXIT_FAILURE, "Failed to load/parse UPF-U YAML config.\n");
+    }
+
+    UTLT_SetLogLevel(g_log_level);
+    printf("[UPF-U] Log level: %s\n", g_log_level);
 
     if (UpfClsCtrlInit() < 0) {
         rte_exit(EXIT_FAILURE, "CLS_CTRL memzone init failed\n");
     }
 
-    int ret;
-    ret = rte_eth_macaddr_get(g_access_port, &cn_ue_eth);
-    if (ret < 0)
-        rte_exit(EXIT_FAILURE, "Cannot get MAC address: err=%d, port=%d\n", ret, g_access_port);
-    ret = rte_eth_macaddr_get(g_core_port, &cn_dn_eth);
-    if (ret < 0)
-        rte_exit(EXIT_FAILURE, "Cannot get MAC address: err=%d, port=%d\n", ret, g_core_port);
+    if (UpfSessBufInit() < 0) {
+        rte_exit(EXIT_FAILURE, "SESS_BUF memzone init failed\n");
+    }
 
-    /* UTLT_Info("[UPF-U][CONFIG] Port map: ACCESS=%d CORE=%d SGI=%d",
-          g_access_port, g_core_port, g_sgi_port); */
-
-    // 8c:dc:d4:ac:6c:7d
-    dn_eth.addr_bytes[0] = DnMac[0];
-    dn_eth.addr_bytes[1] = DnMac[1];
-    dn_eth.addr_bytes[2] = DnMac[2];
-    dn_eth.addr_bytes[3] = DnMac[3];
-    dn_eth.addr_bytes[4] = DnMac[4];
-    dn_eth.addr_bytes[5] = DnMac[5];
+    // Initialize L2 addresses, must be done after config is loaded (UpfU_LoadAndParseConfig)
+    init_l2_addrs();
 
     // trTCM
     trtcmConfigFlowTables();
     initUeTable();
+    ueHashInit();
 
     UpfSessionPoolInit();
     UeIpToUpfSessionMapInit();
     TeidToUpfSessionMapInit();
 
+    /* ARP module init */
+    if (upf_arp_init() < 0) {
+        rte_exit(EXIT_FAILURE, "failed to init ARP module\n");
+    }
+
+    /* NAT module init (only if enabled in config) */
+    if (g_nat_enabled) {
+        nat_init();
+    }
+
+    if (upf_u_shaper_init(nf_local_ctx->nf) < 0) {
+        rte_exit(EXIT_FAILURE, "Failed to init UPF-U shaper entry pool.\n");
+    }
+
     onvm_nflib_run(nf_local_ctx);
 
+    upf_u_shaper_cleanup();
     onvm_nflib_stop(nf_local_ctx);
-    printf("If we reach here, program is ending\n");
     return 0;
 }

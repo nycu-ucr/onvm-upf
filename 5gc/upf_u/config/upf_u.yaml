@@ -1,21 +1,29 @@
 info:
   version: 1.0.0
-  description: L25GC-plus UPF-U dataplane configuration
+  description: L25GC+ UPF-U Configuration
 
 configuration:
+  log_level: "warning"  # trace, debug, info, warning, error, fatal, panic
   dataplane:
-    dn_mac: "26:ac:e5:99:d5:44"
-    an_mac: "9e:dc:65:7b:19:7b"
-    dc_an_mac: "a6:81:4b:7c:8d:b8"       # DC (secondary) gNB next-hop MAC (node3 enp8s0)
-
-    # NR-DC downlink ECMP is disabled for single-gNB bring-up.
-    # Re-add the nrdc block only after validating basic master-gNB data plane.
-    nrdc:
-      dc_gnb_ip: "192.168.31.1"
-      dc_upf_ip: "192.168.31.2"
-
-    upf_ip: "192.168.21.2"
+    upf_n3_ip: "192.168.1.2"        # N3 interface IP address on the Core Network node
+    upf_n6_ip: "192.168.1.3"        # N6 interface IP address on the Core Network node
 
     ports:
-      access: 0                     # ACCESS_PORT
-      core: 1                       # CORE_PORT (SGi follows CORE)
+      n3_port: 0                     # NIC port used for N3 interface
+      n6_port: 1                     # NIC port used for N6 interface
+
+    # NR-DC downlink per-flow ECMP (optional). Presence of dc_gnb_ip enables
+    # DL path selection between the master and secondary gNB N3 endpoints.
+    # Next-hop MACs are resolved by ARP; no MAC configuration is needed.
+    # Enable only after the single-gNB (master) data plane is validated.
+    # nrdc:
+    #   dc_gnb_ip: "192.168.6.3"     # secondary gNB N3 IP
+
+  # NAT configuration (optional; incompatible with nrdc — NAT pins the N3 next hop)
+  nat:
+    enable: false # true/false or 1/0
+    an_peer_n3_ip: "192.168.1.1"    # N3 interface IP address on the UE/RAN node
+    dn_peer_n6_ip: "192.168.1.4"    # N6 interface IP address on the DN node
+    public_ip: "192.168.1.3"
+    port_min: 10000
+    port_max: 60000

@@ -126,6 +126,11 @@ typedef struct {
 
     // Config file
     const char      *configFilePath;
+
+    // Dataplane port mapping (mirrors UPF-U port config for SDF pre-compilation)
+    int             accessPort;          // Default : 0
+    int             corePort;            // Default : 1
+    int             sgiPort;             // Default : 1  (SGi follows CORE)
 } UpfContext;
 
 typedef struct _UpfUeIp {

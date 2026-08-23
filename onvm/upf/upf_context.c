@@ -1,6 +1,7 @@
 #define TRACE_MODULE _upf_context
 
 #include "upf_context.h"
+#include "upf_sess_buf.h"
 
 #include <string.h>
 #include <stdlib.h>
@@ -303,6 +304,9 @@ Status UpfContextInit() {
     // defined in utlt_3gpptypes instead of GTP_V1_PORT defined in GTP_PATH;
     self.gtpv1Port = GTPV1_U_UDP_PORT;
     self.pfcpPort = PFCP_UDP_PORT;
+    self.accessPort = 0;
+    self.corePort   = 1;
+    self.sgiPort    = 1;  // SGi follows CORE by convention
     strcpy(self.envParams->virtualDevice->deviceID, self.gtpDevNamePrefix);
 
     // Init Resource
@@ -571,6 +575,11 @@ UpfSession *UpfSessionAdd(PfcpUeIpAddr *ueIp,
     UTLT_Assert(InsertUEIPtoSessionMap(session->ueIpv4.addr4.s_addr, session) == STATUS_OK,
                 UpfSessionRemove(session); return NULL, "Unable to create Downlink data for UE IP (%u)", ueIp->addr4.s_addr);
 
+    /* Create per-session DL buffer ring (eager: before any packets arrive) */
+    if (g_sess_buf && UpfSessBufRingCreate(session->index) < 0) {
+        UTLT_Warning("SessBuf ring create failed for session index %d", session->index);
+    }
+
     g_sessionIdPool++;
     return session;
 }
@@ -578,8 +587,15 @@ UpfSession *UpfSessionAdd(PfcpUeIpAddr *ueIp,
 Status UpfSessionRemove(UpfSession *session) {
     UTLT_Assert(session, return STATUS_ERROR, "session error");
 
+    /* Destroy per-session DL buffer ring before freeing the session */
+    if (g_sess_buf) {
+        UpfSessBufRingDestroy(session->index);
+    }
+
+    /* NR-DC: clear the session DL-path cache */
     memset(&session->dl_paths, 0, sizeof(session->dl_paths));
 
+    /* Note: guard polarity fixed (upstream had `!session->far_list`) */
     if (session->far_list) {
         list_destroy(session->far_list);
     }

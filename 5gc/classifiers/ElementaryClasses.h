@@ -26,7 +26,14 @@
 #define POINT_SIZE_BITS 32
 
 typedef uint32_t Point;
-typedef std::vector<Point> Packet;
+
+static constexpr int CLS_PACKET_DIM  = 14;   /* = PDI_MAX_FLD */
+static constexpr int CLS_FIELD_DEPTH = 4;
+
+typedef std::array<Point, CLS_PACKET_DIM> Packet;
+using FieldOrder = std::array<int, CLS_FIELD_DEPTH>;
+
+static constexpr FieldOrder CLS_FIELD_ORDER = {10, 9, 0, 1};
 
 struct Rule
 {

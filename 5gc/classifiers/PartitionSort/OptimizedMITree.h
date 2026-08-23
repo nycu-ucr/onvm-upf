@@ -22,7 +22,7 @@ public:
 		numRules = 0;
 		root = RBTreeCreate();
 		// fieldOrder = rules.GetFieldOrdering();
-		fieldOrder = {10, 9, 0, 1};
+		fieldOrder = CLS_FIELD_ORDER;
 		maxPriority = -1;
 		for (const auto& r : rules.GetRule()) {
 			bool priorityChange;
@@ -30,7 +30,7 @@ public:
 		}
 		
 	}
-	OptimizedMITree(const std::vector<int>& fieldOrder) : fieldOrder(fieldOrder){
+	OptimizedMITree(const FieldOrder& fieldOrder) : fieldOrder(fieldOrder){
 		root = RBTreeCreate();
 		numRules = 0; 
 		maxPriority = -1;
@@ -57,13 +57,13 @@ public:
 			// (skip 8 FLOW_LABEL since we don’t populate it)
 		}; */
 
-		fieldOrder = {10, 9, 0, 1};
+		fieldOrder = CLS_FIELD_ORDER;
 		maxPriority = -1;
 	}
 	OptimizedMITree() {
 		numRules = 0;
 		root = RBTreeCreate();
-		fieldOrder = {10, 9, 0, 1};
+		fieldOrder = CLS_FIELD_ORDER;
 		maxPriority = -1;
 	}
 	~OptimizedMITree() {
@@ -175,7 +175,7 @@ public:
 
 		// fieldOrder = result.second;
 
-		fieldOrder = {10, 9, 0, 1};
+		fieldOrder = CLS_FIELD_ORDER;
 
 		for (const auto & r : serialized_rules) {
 			Insertion(r);
@@ -201,10 +201,11 @@ private:
 	rb_red_blk_tree * root;
 	int counter = 0;
 	int numRules =0;
-	std::vector<int> fieldOrder;
+	FieldOrder fieldOrder;
 	std::multiset<int> priorityContainer;
 	int maxPriority = -1;
-	bool IsIdenticalVector(const std::vector<int>& lhs, const std::vector<int>& rhs) {
+	bool IsIdenticalVector(const FieldOrder& lhs, const std::vector<int>& rhs) {
+		if (lhs.size() != rhs.size()) return false;
 		for (size_t i = 0; i < lhs.size(); i++) {
 			if (lhs[i] != rhs[i]) return false;
 		}
@@ -216,7 +217,7 @@ private:
 
 		RBTreeDestroy(root);
 		numRules = 0; 
-		fieldOrder.clear();
+		fieldOrder = CLS_FIELD_ORDER;
 		priorityContainer.clear();
 		maxPriority = -1;
 		root = RBTreeCreate();

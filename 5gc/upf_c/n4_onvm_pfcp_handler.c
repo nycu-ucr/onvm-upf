@@ -127,14 +127,16 @@ static inline void PdrFreeUpTo(uint32_t ack_ver) {
  *   - version odd  => writer in progress
  *   - version even => stable, usable
  * Returns the new even version. If retired_out != NULL, *retired_out gets
- * the previously active pointer.
+ * the previously active pointer. If retired_hash_out != NULL, it gets the
+ * previously active hash bypass table.
  */
-static inline uint32_t upf_cls_publish(void *new_snap, void **retired_out) {
+static inline uint32_t upf_cls_publish(void *new_snap,
+                                        void **retired_out) {
     /* start = prev + 1 (odd) signals "writer active" */
     uint32_t start = __atomic_load_n(&g_upf_cls_ctrl->version, __ATOMIC_RELAXED) + 1u;
     __atomic_store_n(&g_upf_cls_ctrl->version, start, __ATOMIC_RELEASE);
 
-    /* Swap the pointer (get old for GC), then close the seqlock with even */
+    /* Swap pointer (get old for GC) */
     void *old = __atomic_exchange_n(&g_upf_cls_ctrl->active, new_snap, __ATOMIC_ACQ_REL);
 
     /* publish even version = start + 1 */
@@ -346,10 +348,10 @@ void UpfClsOnAckFree(uint32_t ver) {
 
     // Atomic exchange to NULL to make it double-free proof
     void *to_free = __atomic_exchange_n(&g_cls_retired_snapshot, NULL, __ATOMIC_ACQ_REL);
-    if (!to_free) return;  // already freed
-
-    UTLT_Debug("CLS GC: ACK ver=%u, freeing retired snapshot %p", ver, to_free);
-    cls_destroy((cls_handle_t*)to_free);
+    if (to_free) {
+        UTLT_Debug("CLS GC: ACK ver=%u, freeing retired snapshot %p", ver, to_free);
+        cls_destroy((cls_handle_t*)to_free);
+    }
 
     // Optional: clear version (release) so duplicate ACKs are cheap no-ops
     __atomic_store_n(&g_cls_retired_version, 0, __ATOMIC_RELEASE);
@@ -366,6 +368,115 @@ void UpfClsOnAckFree(uint32_t ver) {
  * PDR: "_ConvertCreatePDRTlvToRule", "_ConvertUpdatePDRTlvToRule"
  * FAR: "_ConvertCreateFARTlvToRule", "_ConvertUpdateFARTlvToRule"
  */
+
+/* ---------- helpers shared by Create / Update PDR ---------- */
+
+/* Pre-compile the flowDescription string into meter_key / fd_target / has_fd
+ * so UPF-U never has to do strstr/sscanf in the per-packet path. */
+static void
+UpfPdrPrecompileSdf(UpfPDR *pdr, int access_port, int core_port, int sgi_port)
+{
+    pdr->has_fd   = 0;
+    pdr->fd_target = 0;
+    pdr->meter_key = 0;
+    pdr->has_fd_to = 0;
+    pdr->fd_to_net = 0;
+    pdr->fd_to_mask = 0;
+
+    if (!pdr->pdi.flags.sdfFilter || !pdr->pdi.sdfFilter.flowDescription[0])
+        return;
+
+    const char *fd = pdr->pdi.sdfFilter.flowDescription;
+    const char *from = strstr(fd, "from");
+    if (!from) return;
+
+    from += 5; /* skip "from " */
+    const char *end = strchr(from, ' ');
+    size_t n = end ? (size_t)(end - from) : strlen(from);
+    if (n == 0 || n >= 64) return;
+
+    char tmp[64];
+    memcpy(tmp, from, n);
+    tmp[n] = '\0';
+
+    if (strcmp(tmp, "any") == 0)
+        return;
+
+    /* Parse IP/prefix → masked network address */
+    char ip_str[INET_ADDRSTRLEN];
+    uint32_t prefix_len = 0;
+    sscanf(tmp, "%[^/]/%u", ip_str, &prefix_len);
+    struct in_addr ip_addr;
+    inet_pton(AF_INET, ip_str, &ip_addr);
+    uint32_t masked = ip_addr.s_addr & htonl(prefix_len == 0 ? 0u : (0xFFFFFFFFu << (32 - prefix_len)));
+
+    pdr->fd_target = masked;
+    pdr->has_fd    = 1;
+
+    /* Compute meter_key = SourceInterfaceToPort(srcIf) + fd_target */
+    int base = 0;
+    switch (pdr->pdi.sourceInterface) {
+        case 0: base = access_port; break;  /* SRC_IF_ACCESS */
+        case 1: base = core_port;   break;  /* SRC_IF_CORE   */
+        case 2: base = sgi_port;    break;  /* SRC_IF_SGI_LAN */
+        default: base = -1;         break;
+    }
+    pdr->meter_key = (uint32_t)base + masked;
+
+    // Precompute "to <IP/prefix>"
+    const char *to = strstr(fd, "to ");
+    if (to) {
+        to += 3; /* skip "to " */
+        const char *to_end = strchr(to, ' ');
+        size_t tn = to_end ? (size_t)(to_end - to) : strlen(to);
+        if (tn > 0 && tn < sizeof(tmp)) {
+            memcpy(tmp, to, tn);
+            tmp[tn] = '\0';
+
+            if (strcmp(tmp, "any") != 0 && strcmp(tmp, "assigned") != 0) {
+                char ip_str_to[INET_ADDRSTRLEN] = {0};
+                uint32_t prefix_to = 32;
+                if (sscanf(tmp, "%[^/]/%u", ip_str_to, &prefix_to) >= 1) {
+                    if (prefix_to > 32) prefix_to = 32;
+                    struct in_addr to_addr;
+                    if (inet_pton(AF_INET, ip_str_to, &to_addr) == 1) {
+                        uint32_t rule_ip_host = ntohl(to_addr.s_addr);
+                        uint32_t mask = (prefix_to == 0) ? 0u : (0xFFFFFFFFu << (32 - prefix_to));
+                        pdr->fd_to_mask = mask;
+                        pdr->fd_to_net  = (rule_ip_host & mask);
+                        pdr->has_fd_to  = 1;
+                    }
+                }
+            }
+        }
+    }
+
+    UTLT_Debug("PrecompileSdf: fd='%s' fd_target=0x%08x meter_key=%u has_fd=%u",
+              fd, masked, pdr->meter_key, pdr->has_fd);
+    UTLT_Debug("PrecompileULSdf: fd='%s' fd_to_net=0x%08x fd_to_mask=0x%08x has_fd_to=%u",
+              fd, pdr->fd_to_net, pdr->fd_to_mask, pdr->has_fd_to);
+}
+
+/* Pick the QER that carries QFI for GTP-U encapsulation.
+ * Per 3GPP, the per-flow QER (not session-AMBR) has qosFlowIdentifier.
+ * Fallback to qers[0] if none has the flag. */
+static void
+UpfPdrSelectQfiQer(UpfPDR *pdr)
+{
+    pdr->qer = NULL;
+    for (int i = 0; i < pdr->qer_count && i < 2; i++) {
+        if (pdr->qers[i] && pdr->qers[i]->flags.qosFlowIdentifier) {
+            pdr->qer = pdr->qers[i];
+            UTLT_Debug("PDR[%u] QFI-bearing QER selected: qerId=%u QFI=%u",
+                       pdr->pdrId, pdr->qer->qerId,
+                       pdr->qer->qosFlowIdentifier & 0x3F);
+            return;
+        }
+    }
+    /* fallback: pick first QER (legacy behavior) */
+    if (pdr->qer_count > 0)
+        pdr->qer = pdr->qers[0];
+}
 
 Status _ConvertCreatePDRTlvToRule(UpfPDR *upfPdr, CreatePDR *createPdr) {
     UTLT_Assert(upfPdr && createPdr, return STATUS_ERROR,
@@ -593,9 +704,26 @@ Status UpfN4HandleCreatePdr(UpfSession *session, CreatePDR *createPdr) {
         //     upfPdr->qer = UpfQERFindByID(s1, upfPdr->qerId);
         //     UTLT_Assert(upfPdr->qer, rte_free(upfPdr); return STATUS_ERROR, "QER ID[%u] does NOT exist in UPF Context", upfPdr->qerId);
         // }
-        upfPdr->qer = UpfQERFindByID(session, upfPdr->qerId[0]);
-        UTLT_Assert(upfPdr->qer, rte_free(upfPdr); return STATUS_ERROR, "QER ID[%u] does NOT exist in UPF Context", upfPdr->qerId[0]);
+        upfPdr->qer_count = 0;
+        upfPdr->qers[0] = upfPdr->qers[1] = NULL;
+
+        for (int i = 0; i < 2; i++) {
+            uint32_t id = upfPdr->qerId[i];
+            if (!id) continue;
+
+            UpfQER *q = UpfQERFindByID(session, id);
+            UTLT_Assert(q, rte_free(upfPdr); return STATUS_ERROR, "QER ID[%u] does NOT exist in UPF Context", id);
+
+            upfPdr->qers[upfPdr->qer_count++] = q;   // packed list
+        }
+        UpfPdrSelectQfiQer(upfPdr);
     }
+
+    /* Pre-compile SDF flowDescription into meter_key/fd_target/has_fd */
+    UpfPdrPrecompileSdf(upfPdr, Self()->accessPort, Self()->corePort, Self()->sgiPort);
+
+    /* Pre-compute session index for O(1) buffer lookup in UPF-U */
+    upfPdr->session_index = session->index;
 
     // Register PDR to Session
     UTLT_Assert(UpfPDRRegisterToSession(session, upfPdr) == STATUS_OK,
@@ -1035,15 +1163,33 @@ Status _ConvertUpdatePDRTlvToRule(UpfPDR *upfPdr, UpdatePDR *updatePDR) {
         }
     }
 
+    // if (updatePDR->qERID.presence) {
+    //     // TODO: Need to handle multiple QER
+    //     /*
+    //         upfPdr->flags.qerId = 1;
+    //     upfPdr->qerId = ntohl(*((uint32_t *)updatePDR->qERID.value));
+    //     UTLT_Debug("PDR QER ID: %u", upfPdr->qerId);
+    //     */
+    //     UTLT_Warning("UPF do NOT support QER yet");
+    // }
+
+
     if (updatePDR->qERID.presence) {
-        // TODO: Need to handle multiple QER
-        /*
-            upfPdr->flags.qerId = 1;
-        upfPdr->qerId = ntohl(*((uint32_t *)updatePDR->qERID.value));
-        UTLT_Debug("PDR QER ID: %u", upfPdr->qerId);
-        */
-        UTLT_Warning("UPF do NOT support QER yet");
+        upfPdr->flags.qerId = 1;
+        uint32_t new_id = ntohl(*((uint32_t *)updatePDR->qERID.value));
+
+        if (upfPdr->qerId[0] == new_id || upfPdr->qerId[1] == new_id) {
+            /* already associated -> no change */
+        } else if (upfPdr->qerId[0] == 0) {
+            upfPdr->qerId[0] = new_id;
+        } else if (upfPdr->qerId[1] == 0) {
+            upfPdr->qerId[1] = new_id;
+        } else {
+            UTLT_Warning("UpdatePDR: ignore QERID=%u; PDR[%u] already has QERIDs (%u,%u)",
+                        new_id, upfPdr->pdrId, upfPdr->qerId[0], upfPdr->qerId[1]);
+        }
     }
+
 
     if (updatePDR->activatePredefinedRules.presence) {
         // TODO: Need to support
@@ -1075,6 +1221,34 @@ Status UpfN4HandleUpdatePdr(UpfSession *session, UpdatePDR *updatePdr) {
         upfPdr->far = UpfFARFindByID(session, upfPdr->farId);
         UTLT_Assert(upfPdr->far, return STATUS_ERROR, "FAR ID[%u] does NOT exist in UPF Context", upfPdr->farId);
     }
+
+    if (upfPdr->flags.qerId) {
+        UpfQER  *new_qers[2] = { NULL, NULL };
+        uint8_t  new_cnt = 0;
+
+        for (int i = 0; i < 2; i++) {
+            uint32_t id = upfPdr->qerId[i];
+            if (!id) continue;
+
+            UpfQER *q = UpfQERFindByID(session, id);
+            UTLT_Assert(q, return STATUS_ERROR,
+                    "QER ID[%u] does NOT exist in UPF Context", id);
+
+            if (new_cnt < 2) new_qers[new_cnt++] = q;  // packed list
+        }
+
+        /* Commit only after all lookups succeeded */
+        upfPdr->qers[0] = new_qers[0];
+        upfPdr->qers[1] = new_qers[1];
+        upfPdr->qer_count = new_cnt;
+        UpfPdrSelectQfiQer(upfPdr);
+    }
+
+    /* Re-compile SDF flowDescription (PDI may have been updated) */
+    UpfPdrPrecompileSdf(upfPdr, Self()->accessPort, Self()->corePort, Self()->sgiPort);
+
+    /* Pre-compute session index for O(1) buffer lookup in UPF-U */
+    upfPdr->session_index = session->index;
 
 #ifdef CHECK
     // Register PDR to Session
@@ -1203,9 +1377,18 @@ Status UpfN4HandleUpdateFar(UpfSession *session, UpdateFAR *updateFar) {
     UTLT_Assert(_ConvertUpdateFARTlvToRule(upfFar, updateFar) == STATUS_OK,
         return STATUS_ERROR, "Convert FAR TLV To Rule is failed");
 
+    /* NR-DC: refresh the session DL-path cache from the updated FAR */
     if (UpfSessionUpsertDlPathFromFar(session, upfFar) != STATUS_OK) {
         UTLT_Warning("DL path cache update failed during FAR update (session=%d far=%u)",
                      session->index, upfFar->farId);
+    }
+
+    /* Send drain event AFTER the FAR is updated in shared memory, so
+     * UPF-U sees the new FORW action when it processes drained packets. */
+    if ((oldAction & PFCP_FAR_APPLY_ACTION_BUFF) &&
+        (upfFar->applyAction & PFCP_FAR_APPLY_ACTION_FORW)) {
+         UpfSendEvt1(UPF_U_SERVICE_ID, UPF_EVENT_CLEAR_AND_DRAIN,
+                     (uintptr_t)session->index);
     }
 
 #if HANDLE_BUFFER

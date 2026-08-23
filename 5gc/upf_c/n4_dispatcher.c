@@ -82,7 +82,7 @@ void UpfDispatcher(const Event *event) {
 
             UTLT_Assert(recvBufBlk, return, "recv buffer no data");
             bufBlk = BufblkAlloc(1, sizeof(PfcpMessage));
-            UTLT_Assert(bufBlk, return, "create buffer error");
+            UTLT_Assert(bufBlk, BufblkFree(recvBufBlk); return, "create buffer error");
             pfcpMessage = bufBlk->buf;
             UTLT_Assert(pfcpMessage, goto freeBuf, "pfcpMessage assigned error");
 
@@ -172,6 +172,7 @@ void UpfDispatcher(const Event *event) {
             freeBuf:
                 PfcpStructFree(pfcpMessage);
                 BufblkFree(bufBlk);
+                BufblkFree(recvBufBlk);
             break;
         }
         case UPF_EVENT_N4_T3_RESPONSE:

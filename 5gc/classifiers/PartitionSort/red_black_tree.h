@@ -343,15 +343,15 @@ FOR RB tree light weight node
 **/
 rb_red_blk_tree* RBTreeCreate();
 
-rb_red_blk_node * RBTreeInsertWithPathCompression(rb_red_blk_tree* tree, const std::vector<box>& key, unsigned int level, const std::vector<int>& fieldOrder, int priority, uintptr_t descriptor=0);
-void RBTreeDeleteWithPathCompression(rb_red_blk_tree*& tree, const std::vector<box>& key, int level, const std::vector<int>& fieldOrder, int priority, uintptr_t descriptor, bool& JustDeletedTree);
-std::vector<std::pair<rb_red_blk_tree*, rb_red_blk_node *>> RBFindNodeSequence(rb_red_blk_tree* tree, const std::vector<box>& key, int level, const std::vector<int>& fieldOrder);
+rb_red_blk_node * RBTreeInsertWithPathCompression(rb_red_blk_tree* tree, const std::vector<box>& key, unsigned int level, const FieldOrder& fieldOrder, int priority, uintptr_t descriptor=0);
+void RBTreeDeleteWithPathCompression(rb_red_blk_tree*& tree, const std::vector<box>& key, int level, const FieldOrder& fieldOrder, int priority, uintptr_t descriptor, bool& JustDeletedTree);
+std::vector<std::pair<rb_red_blk_tree*, rb_red_blk_node *>> RBFindNodeSequence(rb_red_blk_tree* tree, const std::vector<box>& key, int level, const FieldOrder& fieldOrder);
 
-bool TreeInsertWithPathCompressionHelp(rb_red_blk_tree* tree, rb_red_blk_node* z, const std::vector<box>& b, int level, const std::vector<int>& fieldOrder, int priority, uintptr_t descriptor, rb_red_blk_node*& out_ptr);
-int RBExactQueryPriority(rb_red_blk_tree*  tree, const Packet& q, int level, const std::vector<int>& fieldOrder, int priority_so_far); 
-bool TreeInsertHelp(rb_red_blk_tree* tree, rb_red_blk_node* z, const std::vector<box>& b, int level, const std::vector<int>& fieldOrder, int priority, uintptr_t descriptor, rb_red_blk_node*& out_ptr);
-rb_red_blk_node * RBTreeInsert(rb_red_blk_tree* tree, const std::vector<box>& key, int level, const std::vector<int>& fieldOrder, int priority=0, uintptr_t descriptor=0);
-bool RBTreeCanInsert(rb_red_blk_tree* tree, const std::vector<box>& z, int level, const std::vector<int>& fieldOrder);
+bool TreeInsertWithPathCompressionHelp(rb_red_blk_tree* tree, rb_red_blk_node* z, const std::vector<box>& b, int level, const FieldOrder& fieldOrder, int priority, uintptr_t descriptor, rb_red_blk_node*& out_ptr);
+int RBExactQueryPriority(rb_red_blk_tree*  tree, const Packet& q, int level, const FieldOrder& fieldOrder, int priority_so_far); 
+bool TreeInsertHelp(rb_red_blk_tree* tree, rb_red_blk_node* z, const std::vector<box>& b, int level, const FieldOrder& fieldOrder, int priority, uintptr_t descriptor, rb_red_blk_node*& out_ptr);
+rb_red_blk_node * RBTreeInsert(rb_red_blk_tree* tree, const std::vector<box>& key, int level, const FieldOrder& fieldOrder, int priority=0, uintptr_t descriptor=0);
+bool RBTreeCanInsert(rb_red_blk_tree* tree, const std::vector<box>& z, int level, const FieldOrder& fieldOrder);
 void RBTreePrint(rb_red_blk_tree*);
 void RBDelete(rb_red_blk_tree* , rb_red_blk_node* );
 void RBTreeDestroy(rb_red_blk_tree*);
@@ -359,19 +359,19 @@ rb_red_blk_node* TreePredecessor(rb_red_blk_tree*,rb_red_blk_node*);
 rb_red_blk_node* TreeSuccessor(rb_red_blk_tree*,rb_red_blk_node*);
 
 
-void RBSerializeIntoRulesRecursion(rb_red_blk_tree * tree, rb_red_blk_node* node, int level, const std::vector<int>& fieldOrder, std::vector<box>& boxes_so_far, std::vector<Rule>& rules_so_far);
+void RBSerializeIntoRulesRecursion(rb_red_blk_tree * tree, rb_red_blk_node* node, int level, const FieldOrder& fieldOrder, std::vector<box>& boxes_so_far, std::vector<Rule>& rules_so_far);
 
-std::vector<Rule> RBSerializeIntoRules(rb_red_blk_tree* tree, const std::vector<int>& fieldOrder);
+std::vector<Rule> RBSerializeIntoRules(rb_red_blk_tree* tree, const FieldOrder& fieldOrder);
 
-int RBExactQuery(rb_red_blk_tree* tree, const Packet& q, int level, const std::vector<int>& fieldOrder);
+int RBExactQuery(rb_red_blk_tree* tree, const Packet& q, int level, const FieldOrder& fieldOrder);
 stk_stack * RBEnumerate(rb_red_blk_tree* tree,void* low, void* high);
 void NullFunction(void*);
 
-int RBExactQueryIterative(rb_red_blk_tree*  tree, const Packet& q, const std::vector<int>& fieldOrder);
+int RBExactQueryIterative(rb_red_blk_tree*  tree, const Packet& q, const FieldOrder& fieldOrder);
 
-MatchResult RBExactQueryIterativeMod(rb_red_blk_tree*  tree, const Packet& q, const std::vector<int>& fieldOrder);
+MatchResult RBExactQueryIterativeMod(rb_red_blk_tree*  tree, const Packet& q, const FieldOrder& fieldOrder);
 
-int  CalculateMemoryConsumptionRecursion(rb_red_blk_tree * treenode, rb_red_blk_node * node, int level, const std::vector<int>& fieldOrder);
-int CalculateMemoryConsumption(rb_red_blk_tree* tree, const std::vector<int>& fieldOrder);
+int  CalculateMemoryConsumptionRecursion(rb_red_blk_tree * treenode, rb_red_blk_node * node, int level, const FieldOrder& fieldOrder);
+int CalculateMemoryConsumption(rb_red_blk_tree* tree, const FieldOrder& fieldOrder);
 
 #endif

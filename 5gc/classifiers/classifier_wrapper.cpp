@@ -91,7 +91,7 @@ static Rule to_cpp_rule(const pdr_t *in) {
 }
 
 static Packet to_cpp_pkt(const ps_packet_t *p) {
-    Packet P(PDI_MAX_FLD);
+    Packet P = {};
     P[0]  = p->ue_ip;
     P[1]  = p->src_ip;
     P[2]  = p->dst_ip;
