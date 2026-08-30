@@ -113,6 +113,17 @@ typedef struct __attribute__((packed)) hw_offload_msg {
     uint64_t  gbr_ul;          /* Guaranteed Bit Rate uplink   (kbps)     */
     uint64_t  gbr_dl;          /* Guaranteed Bit Rate downlink (kbps)     */
 
+    /* ── QER identity ────────────────────────────────────────────────── */
+    uint64_t  hw_qer_id;       /* globally unique QoS-flow handle minted
+                                * by UPF-C at CreateQER (identity is the
+                                * pair (SEID, PFCP qer_id) — the PFCP id
+                                * alone repeats across sessions).  The DPU
+                                * keys the shared meter and the shaper
+                                * slot on (hw_qer_id, direction); for a
+                                * non-GBR PDR this is the session QER's
+                                * handle.  0 = no QER identity (per-rule
+                                * legacy behaviour).                     */
+
 } hw_offload_msg_t;
 
 /* Magic value for quick validation */

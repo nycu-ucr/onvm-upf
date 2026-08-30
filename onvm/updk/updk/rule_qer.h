@@ -80,6 +80,11 @@ typedef struct {
     uint8_t reflectiveQos;
     // RQI (reflectiveQos & 0x01)
 
+    // Globally unique QoS-flow handle minted by UPF-C at CreateQER and
+    // relayed to the DPU on every hw_offload message (the PFCP qerId is
+    // unique only inside its session).  0 = not yet assigned.
+    uint64_t hw_qer_id;
+
 } UPDK_QER;
 
 /**

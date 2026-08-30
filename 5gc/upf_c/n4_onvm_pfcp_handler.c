@@ -713,7 +713,7 @@ Status UpfN4HandleCreatePdr(UpfSession *session, CreatePDR *createPdr) {
     /* Proactively push the PDR to DPU silicon via Host Agent.
      * Non-fatal: if the Host Agent is not running or the DPU is
      * unavailable, the software fallback (UPF-U) handles the traffic. */
-    upf_build_and_send_hw_offload(upfPdr);
+    upf_build_and_send_hw_offload(session, upfPdr);
 
     return STATUS_OK;
 }
@@ -951,7 +951,14 @@ Status UpfN4HandleCreateQer(UpfSession *session, CreateQER *createQer) {
 
     UTLT_Assert(_ConvertCreateQERTlvToRule(upfQer, createQer) == STATUS_OK,
         return STATUS_ERROR, "Convert Create QER TLV To Rule is failed");
-    
+
+    /* Mint the globally unique QoS-flow handle for this (SEID, qerId).
+     * Relayed to the DPU on every hw_offload message so all PDRs of one
+     * QoS flow share one meter and one shaper slot there. */
+    upfQer->hw_qer_id = hw_offload_next_qer_id();
+    UTLT_Debug("QER[%u] hw_qer_id=%lu", qerID,
+               (unsigned long)upfQer->hw_qer_id);
+
     // Register QER to Session
     // need to implement this function
     UTLT_Assert(UpfQERRegisterToSession(session, upfQer),
@@ -1239,7 +1246,7 @@ Status UpfN4HandleUpdatePdr(UpfSession *session, UpdatePDR *updatePdr) {
     if (upfPdr->hw_rule_id != 0) {
         if (upfPdr->far &&
             (upfPdr->far->applyAction & UPDK_FAR_APPLY_ACTION_FORW)) {
-            upf_send_hw_offload_update_pdr(upfPdr);
+            upf_send_hw_offload_update_pdr(session, upfPdr);
         } else {
             if (upf_send_hw_offload_delete(upfPdr->hw_rule_id) == 0)
                 upfPdr->hw_rule_id = 0;
@@ -1395,7 +1402,8 @@ Status UpfN4HandleUpdateFar(UpfSession *session, UpdateFAR *updateFar) {
                     continue;
                 }
                 if (p->hw_rule_id != 0) {
-                    int rc = upf_send_hw_offload_update_far(p, upfFar);
+                    int rc = upf_send_hw_offload_update_far(session, p,
+                                                            upfFar);
                     /* DROP deletes the HW rule on DPU — clear hw_rule_id so
                      * a later UpdateFAR(FORW) won't reference a stale rule.
                      * Only clear on send success; if send fails, DPU still
@@ -1407,7 +1415,7 @@ Status UpfN4HandleUpdateFar(UpfSession *session, UpdateFAR *updateFar) {
                     /* DROP→FORW recovery: hw_rule_id was cleared by a prior
                      * DROP.  Re-offload the PDR to restore HW acceleration.
                      * Non-fatal: if re-offload fails, SW fallback handles it. */
-                    upf_build_and_send_hw_offload(p);
+                    upf_build_and_send_hw_offload(session, p);
                 }
             }
         }
@@ -1566,14 +1574,30 @@ Status UpfN4HandleUpdateQer(UpfSession *session, UpdateQER *updateQer) {
         return STATUS_ERROR, "Convert FAR TLV To Rule is failed");
 
     /* ── HW offload: notify DPU of QER rate change for every
-     *    offloaded PDR that references this QER ─────────────────── */
+     *    offloaded PDR that references this QER — and, when the changed
+     *    QER could have moved the session-AMBR derivation, for every
+     *    offloaded non-GBR PDR of the session too: their enforcement
+     *    rides the session tier, and hardware enforces the rate but
+     *    never maintains it — UPF-C is the only party that sees the
+     *    PFCP event.  Each message re-derives the session QER and the
+     *    DPU answers with one shared-meter set_cfg.
+     *
+     *    The gate is "carries a maximum rate", NOT "is a candidate right
+     *    now".  _ConvertUpdateQERTlvToRule only ever sets presence flags
+     *    and never clears them, so a QER holding an MBR is either the
+     *    current candidate or one that just stopped being it by GAINING
+     *    a guaranteed rate — and that second case moves the derivation
+     *    for every indirectly-stamped PDR just as much as the first. ── */
     {
+        int ambr_candidate_touched = upfQer->flags.maximumBitrate;
         list_iterator_t *it = list_iterator_new(session->pdr_list, LIST_HEAD);
         list_node_t *n;
         while (it && (n = list_iterator_next(it))) {
             UpfPDR *p = (UpfPDR *)n->val;
-            if (p && p->hw_rule_id != 0 && p->qer == upfQer)
-                upf_send_hw_offload_update_qer(p);
+            if (p && p->hw_rule_id != 0 &&
+                (p->qer == upfQer ||
+                 (ambr_candidate_touched && !upf_pdr_is_gbr(p))))
+                upf_send_hw_offload_update_qer(session, p);
         }
         if (it) list_iterator_destroy(it);
     }
@@ -1664,31 +1688,52 @@ Status UpfN4HandleRemoveQer(UpfSession *session, uint32_t nQERID) {
     UTLT_Assert(session, return STATUS_ERROR,
                 "session not found");
 
-    /* ── HW offload: if any offloaded PDR uses this QER,
-     *    send a QER update with zero rates so the DPU drops
-     *    the meter (traffic becomes unmetered, not stale) ──── */
+    /* Resolve the QER before it leaves the list — UpfQERFindByID searches
+     * qer_list.  Deregistration only unlinks the node, so the object
+     * stays valid for the pointer comparison below. */
+    UpfQER *removedQer = UpfQERFindByID(session, qerID);
+
+    // Deregister QER to Session
+    UTLT_Assert(UpfQERDeregisterToSessionByID(session, qerID) == STATUS_OK,
+                return STATUS_ERROR,
+                "UpfQERDeregisterToSession failed");
+
+    /* ── HW offload: one transition per affected PDR ───────────────────
+     * Deregistration happens FIRST so the session-AMBR derivation can no
+     * longer pick the QER being removed; then a single pass drops the
+     * direct references and re-sends.  Doing it the other way — zeroing
+     * the rates while the QER is still listed, then refreshing after —
+     * would put every directly-referencing PDR through two hardware
+     * transitions (old meter → unmetered → Session-AMBR), leaving a
+     * transient unmetered window and a second chance to fail.
+     *
+     * The refresh covers every offloaded non-GBR PDR, not just the ones
+     * that referenced this QER: a non-GBR PDR is stamped with the
+     * DERIVED session QER rather than its own p->qer, so it is invisible
+     * to a direct-reference test yet still points at a meter identity
+     * that may have just disappeared.  Each message re-derives against
+     * the remaining set, and sends zero rates (detaching the meter) when
+     * nothing qualifies any more.
+     *
+     * Consequence worth knowing: a PDR whose own QER was the one removed
+     * now falls back to Session-AMBR where it previously became
+     * unmetered.  For non-GBR traffic that is the more correct of the
+     * two, but it is a change in behaviour. */
     {
-        UpfQER *qer = UpfQERFindByID(session, qerID);
         list_iterator_t *it = list_iterator_new(session->pdr_list, LIST_HEAD);
         list_node_t *n;
         while (it && (n = list_iterator_next(it))) {
             UpfPDR *p = (UpfPDR *)n->val;
-            if (p && p->hw_rule_id != 0 && p->qer == qer) {
-                /* Clear qer pointer BEFORE sending the update so that
-                 * upf_send_hw_offload_update_qer() reads NULL rates
-                 * and sends zeros to the DPU → DPU detaches the meter.
-                 * This is intentional: zero rates = "unmetered". */
+            if (!p || p->hw_rule_id == 0)
+                continue;
+            if (p->qer == removedQer)
                 p->qer = NULL;
-                upf_send_hw_offload_update_qer(p);
-            }
+            if (!upf_pdr_is_gbr(p))
+                upf_send_hw_offload_update_qer(session, p);
         }
         if (it) list_iterator_destroy(it);
     }
 
-    // Deregister QER to Session
-    UTLT_Assert(UpfQERDeregisterToSessionByID(session, qerID) == STATUS_OK,
-                return STATUS_ERROR, 
-                "UpfQERDeregisterToSession failed");
     return STATUS_OK;
 }
 

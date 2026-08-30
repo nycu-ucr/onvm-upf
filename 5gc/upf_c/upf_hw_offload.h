@@ -143,6 +143,105 @@ static inline uint32_t hw_offload_next_rule_id(void) {
     return id ? id : 1;  /* 0 is reserved for "not offloaded" */
 }
 
+/* ── hw_qer_id generator (atomic, 64-bit, never wraps) ──────────────
+ * Minted at CreateQER and stored on the QER object.  The enforcement
+ * identity is one QoS flow in one direction — (SEID, PFCP qer_id) —
+ * for which this is the globally unique handle: the PFCP qer_id alone
+ * repeats across sessions, so two UEs would collide on one enforcement
+ * instance.  The DPU keys its shared meter and shaper slot on
+ * (hw_qer_id, direction).  0 = "no QER identity". */
+static rte_atomic64_t g_hw_qer_id_gen = RTE_ATOMIC64_INIT(0);
+
+static inline uint64_t hw_offload_next_qer_id(void) {
+    return (uint64_t)rte_atomic64_add_return(&g_hw_qer_id_gen, 1);
+}
+
+/* ── Session-QER derivation (per direction) ─────────────────────────
+ * PFCP carries no Session-AMBR IE; the SMF expresses it as a QER.  Take
+ * a QER with a maximum bit rate present and a guaranteed bit rate
+ * absent as the session QER, largest maximum rate (in this direction)
+ * winning if several match.  Assumption on record: no flow-level
+ * non-GBR QER carries a maximum rate larger than the session's own —
+ * the chosen id and rate are logged so the question is answerable from
+ * a run. */
+static inline UpfQER *
+upf_session_qer_for_dir(UpfSession *session, uint8_t direction)
+{
+    if (!session || !session->qer_list)
+        return NULL;
+
+    UpfQER *best = NULL;
+    uint64_t best_mbr = 0;
+    list_iterator_t *it = list_iterator_new(session->qer_list, LIST_HEAD);
+    list_node_t *n;
+    while (it && (n = list_iterator_next(it))) {
+        UpfQER *q = (UpfQER *)n->val;
+        if (!q || !q->flags.maximumBitrate || q->flags.guaranteedBitrate)
+            continue;
+        uint64_t mbr = (direction == HW_DIR_UPLINK)
+                     ? q->maximumBitrate.ul : q->maximumBitrate.dl;
+        if (mbr > best_mbr) {
+            best_mbr = mbr;
+            best = q;
+        }
+    }
+    if (it) list_iterator_destroy(it);
+
+    if (best)
+        UTLT_Debug("hw_offload: session QER derived (%s): qerId=%u "
+                   "hw_qer_id=%lu mbr=%lu kbps",
+                   direction == HW_DIR_UPLINK ? "UL" : "DL",
+                   best->qerId, (unsigned long)best->hw_qer_id,
+                   (unsigned long)best_mbr);
+    return best;
+}
+
+/* Does this PDR belong to the GBR tier (its resolved QER carries a
+ * nonzero guaranteed rate)? */
+static inline int
+upf_pdr_is_gbr(const UPDK_PDR *pdr)
+{
+    return pdr && pdr->qer && pdr->qer->flags.guaranteedBitrate &&
+           (pdr->qer->guaranteedBitrate.ul || pdr->qer->guaranteedBitrate.dl);
+}
+
+/* ── QER identity + rate stamping ───────────────────────────────────
+ * One resolution used by every sender so all messages of a QoS flow
+ * carry the same identity and rates:
+ *   GBR PDR      → the flow QER's hw_qer_id and its MBR/GBR.
+ *   non-GBR PDR  → the session QER's hw_qer_id and its MBR (gbr=0) —
+ *                  UpfPdrSelectQfiQer resolves at most one QER per PDR
+ *                  and discards the session QER whenever a flow-level
+ *                  QER is present, so the DPU cannot recover the
+ *                  binding on its own.  Falls back to the flow QER's
+ *                  own identity/rates when no session QER exists.
+ * session == NULL suppresses the session-QER derivation (used by the
+ * RemoveQER path, which intentionally sends zero rates to detach). */
+static inline void
+upf_stamp_qer_identity(UpfSession *session, const UPDK_PDR *pdr,
+                       uint8_t direction, hw_offload_msg_t *msg)
+{
+    const UPDK_QER *qer = pdr ? pdr->qer : NULL;
+
+    if (!upf_pdr_is_gbr(pdr)) {
+        UpfQER *sq = upf_session_qer_for_dir(session, direction);
+        if (sq)
+            qer = sq;
+    }
+    if (!qer)
+        return;   /* no QER at all → no meter, hw_qer_id stays 0 */
+
+    msg->hw_qer_id = qer->hw_qer_id;
+    if (qer->flags.maximumBitrate) {
+        msg->mbr_ul = qer->maximumBitrate.ul;
+        msg->mbr_dl = qer->maximumBitrate.dl;
+    }
+    if (qer->flags.guaranteedBitrate) {
+        msg->gbr_ul = qer->guaranteedBitrate.ul;
+        msg->gbr_dl = qer->guaranteedBitrate.dl;
+    }
+}
+
 
 /* ═══════════════════════════════════════════════════════════════════
  *  upf_build_and_send_hw_offload() — called from UpfN4HandleCreatePdr
@@ -152,7 +251,7 @@ static inline uint32_t hw_offload_next_rule_id(void) {
  *  Only sends for FORWARD rules with a valid TEID (UL) or UE-IP (DL).
  * ═══════════════════════════════════════════════════════════════════ */
 static inline int
-upf_build_and_send_hw_offload(UPDK_PDR *pdr)
+upf_build_and_send_hw_offload(UpfSession *session, UPDK_PDR *pdr)
 {
     /* ── Guard: only offload FORWARD rules ─────────────────────────── */
     if (!pdr || !pdr->far)
@@ -254,21 +353,12 @@ upf_build_and_send_hw_offload(UPDK_PDR *pdr)
         msg->ohc_ipv4 = ohc->ipv4;           /* NBO */
     }
 
-    /* ── QER: bit-rates ────────────────────────────────────────────── */
-    /* Use pdr->qer (resolved by UpfPdrSelectQfiQer): the per-flow QER
-     * that carries qosFlowIdentifier, with fallback to qers[0].
-     * This is the same QER used for encap_qfi above. */
-    if (pdr->qer) {
-        const UPDK_QER *qer = pdr->qer;
-        if (qer->flags.maximumBitrate) {
-            msg->mbr_ul = qer->maximumBitrate.ul;
-            msg->mbr_dl = qer->maximumBitrate.dl;
-        }
-        if (qer->flags.guaranteedBitrate) {
-            msg->gbr_ul = qer->guaranteedBitrate.ul;
-            msg->gbr_dl = qer->guaranteedBitrate.dl;
-        }
-    }
+    /* ── QER: identity + bit-rates ─────────────────────────────────── */
+    /* GBR PDR: pdr->qer (resolved by UpfPdrSelectQfiQer — the same QER
+     * used for encap_qfi above).  Non-GBR PDR: the derived session QER's
+     * identity and MBR ride instead, so all of the session's non-GBR
+     * PDRs share one DPU meter. */
+    upf_stamp_qer_identity(session, pdr, direction, msg);
 
     uint16_t pdr_id = msg->pdr_id;
     uint32_t hw_rule_id = msg->hw_rule_id;
@@ -338,7 +428,8 @@ upf_send_hw_offload_delete(uint32_t hw_rule_id)
  *  Iterates through pdr_list externally; this sends for ONE PDR.
  * ═══════════════════════════════════════════════════════════════════ */
 static inline int
-upf_send_hw_offload_update_far(UPDK_PDR *pdr, const UPDK_FAR *far)
+upf_send_hw_offload_update_far(UpfSession *session, UPDK_PDR *pdr,
+                               const UPDK_FAR *far)
 {
     if (!pdr || pdr->hw_rule_id == 0 || !far)
         return 0;
@@ -390,6 +481,12 @@ upf_send_hw_offload_update_far(UPDK_PDR *pdr, const UPDK_FAR *far)
         msg->ohc_ipv4 = ohc->ipv4;
     }
 
+    /* QER identity + rates — carry MBR/GBR on the BUFF/FORW message so
+     * the DPU buffer allocator has a per-flow cold-start seed at BUFF
+     * entry (no DPU-side QoS cache needed).  Mirrors
+     * upf_send_hw_offload_update_qer. */
+    upf_stamp_qer_identity(session, pdr, msg->direction, msg);
+
     int rc = onvm_nflib_send_msg_to_nf(HOST_AGENT_SERVICE_ID, msg);
     if (rc < 0) {
         UTLT_Warning("hw_offload_update_far: send failed (rc=%d) "
@@ -407,9 +504,12 @@ upf_send_hw_offload_update_far(UPDK_PDR *pdr, const UPDK_FAR *far)
 /* ═══════════════════════════════════════════════════════════════════
  *  upf_send_hw_offload_update_qer() — send HW_OP_UPDATE_QER
  *  Re-reads the QER pointer already resolved in the PDR.
+ *  session == NULL suppresses the session-QER derivation so a PDR whose
+ *  qer was intentionally cleared (RemoveQER) sends zero rates → the DPU
+ *  detaches the meter.
  * ═══════════════════════════════════════════════════════════════════ */
 static inline int
-upf_send_hw_offload_update_qer(UPDK_PDR *pdr)
+upf_send_hw_offload_update_qer(UpfSession *session, UPDK_PDR *pdr)
 {
     if (!pdr || pdr->hw_rule_id == 0)
         return 0;
@@ -435,18 +535,8 @@ upf_send_hw_offload_update_qer(UPDK_PDR *pdr)
     else
         msg->direction = HW_DIR_DOWNLINK;
 
-    /* QER rates */
-    if (pdr->qer) {
-        const UPDK_QER *qer = pdr->qer;
-        if (qer->flags.maximumBitrate) {
-            msg->mbr_ul = qer->maximumBitrate.ul;
-            msg->mbr_dl = qer->maximumBitrate.dl;
-        }
-        if (qer->flags.guaranteedBitrate) {
-            msg->gbr_ul = qer->guaranteedBitrate.ul;
-            msg->gbr_dl = qer->guaranteedBitrate.dl;
-        }
-    }
+    /* QER identity + rates */
+    upf_stamp_qer_identity(session, pdr, msg->direction, msg);
 
     int rc = onvm_nflib_send_msg_to_nf(HOST_AGENT_SERVICE_ID, msg);
     if (rc < 0) {
@@ -467,7 +557,7 @@ upf_send_hw_offload_update_qer(UPDK_PDR *pdr)
  *  Reuses the existing hw_rule_id so the DPU can delete + reinsert.
  * ═══════════════════════════════════════════════════════════════════ */
 static inline int
-upf_send_hw_offload_update_pdr(UPDK_PDR *pdr)
+upf_send_hw_offload_update_pdr(UpfSession *session, UPDK_PDR *pdr)
 {
     if (!pdr || pdr->hw_rule_id == 0)
         return 0;
@@ -570,18 +660,8 @@ upf_send_hw_offload_update_pdr(UPDK_PDR *pdr)
         msg->ohc_ipv4 = ohc->ipv4;
     }
 
-    /* QER rates */
-    if (pdr->qer) {
-        const UPDK_QER *qer = pdr->qer;
-        if (qer->flags.maximumBitrate) {
-            msg->mbr_ul = qer->maximumBitrate.ul;
-            msg->mbr_dl = qer->maximumBitrate.dl;
-        }
-        if (qer->flags.guaranteedBitrate) {
-            msg->gbr_ul = qer->guaranteedBitrate.ul;
-            msg->gbr_dl = qer->guaranteedBitrate.dl;
-        }
-    }
+    /* QER identity + rates */
+    upf_stamp_qer_identity(session, pdr, direction, msg);
 
     int rc = onvm_nflib_send_msg_to_nf(HOST_AGENT_SERVICE_ID, msg);
     if (rc < 0) {
